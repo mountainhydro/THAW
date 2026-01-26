@@ -1,0 +1,10 @@
+{
+  "project_id": "asdf",
+  "weekday": "Monday",
+  "time_of_day": "00:00",
+  "frequency": "Weekly",
+  "month_day": null,
+  "aoi_path": "C:\\Users\\fugger\\Documents\\Lake_detection\\THAW\\config\\aoi.geojson",
+  "service_account": "asdf",
+  "cron": "0 0 * * 1"
+}
