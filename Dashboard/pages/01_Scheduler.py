@@ -20,9 +20,6 @@ from streamlit_folium import st_folium
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 
-
-
-
 # ============================================================
 # PAGE CONFIG
 # ============================================================
@@ -230,7 +227,7 @@ def run_headless(config_path, output_container):
 
 # --- Trigger Logic ---
 if run_now_clicked:
-    cfg_path = write_now_config()
+    config_path = write_now_config()
     
     # 1. Create a placeholder in the UI for the logs
     status_container = st.empty()
@@ -238,7 +235,7 @@ if run_now_clicked:
 
     # 2. Define the command (the -u flag is the 'Live' switch)
     script_path = os.path.join(gee_dir, "lakedetection_headless.py")
-    cmd = [sys.executable, "-u", script_path, cfg_path]
+    cmd = [sys.executable, "-u", script_path, config_path]
 
     # 3. Start the process
     process = subprocess.Popen(
@@ -271,6 +268,8 @@ if run_now_clicked:
 # ============================================================
 # SIDEBAR — SCHEDULER INPUTS
 # ============================================================
+import subprocess
+
 st.sidebar.title("Scheduler")
 if "frequency_changed" not in st.session_state:
     st.session_state.frequency_changed = False
@@ -278,6 +277,7 @@ if "frequency_changed" not in st.session_state:
 def mark_frequency_changed():
     st.session_state.frequency_changed = True
 
+# Frequency selection
 frequency = st.sidebar.selectbox(
     "Run Frequency",
     ["Daily", "Weekly", "Monthly"],
@@ -299,32 +299,11 @@ if frequency == "Monthly":
         max_value=31,
         value=1
     )
-
-time_options = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0,30)]
+time_options = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0,15,30,45)]
 time_of_day = st.sidebar.selectbox("Time of day", time_options)
 
-
 # ============================================================
-# CRON CONVERSION
-# ============================================================
-hour, minute = time_of_day.split(":")
-if frequency == "Daily":
-    cron = f"{int(minute)} {int(hour)} * * *"
-    schedule_summary = f"Daily at {time_of_day}"
-elif frequency == "Weekly":
-    weekday_map = {"Monday":1,"Tuesday":2,"Wednesday":3,"Thursday":4,"Friday":5,"Saturday":6,"Sunday":0}
-    cron = f"{int(minute)} {int(hour)} * * {weekday_map[weekday]}"
-    schedule_summary = f"Weekly on {weekday} at {time_of_day}"
-else:  # Monthly
-    cron = f"{int(minute)} {int(hour)} {month_day} * *"
-    schedule_summary = f"Monthly on day {month_day} at {time_of_day}"
-
-st.sidebar.markdown("### Schedule Summary")
-st.sidebar.info(schedule_summary)
-
-
-# ============================================================
-# SIDEBAR VALIDATION MESSAGES for scheduler
+# VALIDATION
 # ============================================================
 missing = []
 if not project_id:
@@ -340,11 +319,9 @@ if missing:
         st.sidebar.warning(msg)
 
 if not st.session_state.frequency_changed:
-    st.sidebar.warning("Please adjust Schedule frequency or confirm (Daily).")
-
-if not missing and st.session_state.frequency_changed:
+    st.sidebar.warning("Please adjust schedule frequency or confirm (Daily).")
+else:
     st.sidebar.success("All required inputs provided.")
-
 
 # ============================================================
 # SCHEDULE JOB BUTTON
@@ -356,25 +333,103 @@ all_inputs_ready = (
     st.session_state.frequency_changed
 )
 
-if st.sidebar.button("🗓️ Schedule job", disabled=not all_inputs_ready):
-    # Save AOI
+if st.sidebar.button("📅 Schedule job", disabled=not all_inputs_ready):
+    # --- Save AOI ---
     aoi_path = os.path.join(config_dir, "aoi.geojson")
     with open(aoi_path, "w") as f:
         json.dump({"type":"FeatureCollection","features":[{"type":"Feature","geometry":aoi_geojson}]}, f, indent=2)
 
-    # Save job config
+    # --- Save job config ---
     job_cfg = {
+        "run_date": "today",  # <-- today
+        "aoi_geojson": aoi_path,                         # path to AOI
         "project_id": project_id,
-        "service_account": service_account_path,
-        "frequency": frequency,
-        "weekday": weekday,
-        "month_day": month_day,
-        "time_of_day": time_of_day,
-        "cron": cron,
-        "aoi_path": aoi_path
-    }
-    job_cfg_path = os.path.join(config_dir, "job_config.json")
-    with open(job_cfg_path, "w") as f:
+        "service_account_path": service_account_path,
+        "output_root": output_dir
+        }
+    config_path = os.path.join(config_dir, "job_config.json")
+    with open(config_path, "w") as f:
         json.dump(job_cfg, f, indent=2)
+
+    # --- Windows Scheduler Setup ---
+    python_exe = sys.executable
+    script_path = os.path.join(root_dir, "GEE", "lakedetection_headless.py")
+
+    # Define task name
+    task_name_map = {"Daily": "LakeDetection_Daily", "Weekly": "LakeDetection_Weekly", "Monthly": "LakeDetection_Monthly"}
+    task_name = task_name_map[frequency]
+
+    # Build the schtasks command
+    if frequency == "Weekly":
+        weekday_map = {
+            "Monday": "MON","Tuesday": "TUE","Wednesday": "WED",
+            "Thursday": "THU","Friday": "FRI","Saturday": "SAT","Sunday": "SUN"
+        }
+        sch_weekday = weekday_map.get(weekday, "MON")
+        sch_cmd = f'schtasks /Create /SC WEEKLY /D {sch_weekday} /TN "{task_name}" /TR "{python_exe} {script_path} {config_path}" /ST {time_of_day} /F'
+    elif frequency == "Daily":
+        sch_cmd = f'schtasks /Create /SC DAILY /TN "{task_name}" /TR "{python_exe} {script_path} {config_path}" /ST {time_of_day} /F'
+    else:  # Monthly
+        sch_cmd = f'schtasks /Create /SC MONTHLY /D {month_day} /TN "{task_name}" /TR "{python_exe} {script_path} {config_path}" /ST {time_of_day} /F'
+
+    # --- Execute Scheduler Command ---
+    try:
+        os.system(sch_cmd)
+        st.sidebar.success(f"Scheduled job '{task_name}' successfully")
+        st.sidebar.info(f"It will run automatically {frequency} on {weekday} at {time_of_day}")
+    except Exception as e:
+        st.sidebar.error(f"Failed to schedule job: {e}")
         
-    subprocess.Popen([f"sys.executable","lakedetection_headless.py", job_cfg_path], cwd=root_dir)
+# -*- coding: utf-8 -*-
+
+
+import streamlit as st
+import subprocess
+
+TASK_PREFIX = "LakeDetection"
+
+# --------------------------------------
+# List all LakeDetection tasks
+# --------------------------------------
+st.subheader("Existing Tasks")
+
+try:
+    cmd = 'schtasks /Query /FO LIST'
+    output = subprocess.check_output(cmd, shell=True, text=True)
+except subprocess.CalledProcessError:
+    st.error("Failed to query scheduled tasks.")
+    st.stop()
+
+# Parse tasks
+tasks = []
+current_task = {}
+for line in output.splitlines():
+    if line.strip() == "":
+        if current_task:
+            if TASK_PREFIX in current_task.get("TaskName", ""):
+                tasks.append(current_task)
+            current_task = {}
+        continue
+    if ":" in line:
+        key, val = line.split(":", 1)
+        current_task[key.strip()] = val.strip()
+# Add last task
+if current_task and TASK_PREFIX in current_task.get("TaskName", ""):
+    tasks.append(current_task)
+
+if not tasks:
+    st.info(f"No scheduled tasks found for '{TASK_PREFIX}'.")
+else:
+    for t in tasks:
+        st.markdown(f"**{t.get('TaskName','')}**")
+        st.write(f"Next Run Time: {t.get('Next Run Time','')}")
+        st.write(f"Status: {t.get('Status','')}")
+        st.write(f"Last Run Time: {t.get('Last Run Time','')}")
+        if st.button(f"🗑️ Delete {t.get('TaskName','')}", key=t.get('TaskName','')):
+            delete_cmd = f'schtasks /Delete /TN "{t.get("TaskName")}" /F'
+            try:
+                subprocess.run(delete_cmd, shell=True, check=True)
+                st.success(f"Task {t.get('TaskName')} deleted!")
+            except subprocess.CalledProcessError:
+                st.error(f"Failed to delete {t.get('TaskName')}")
+            st.rerun()

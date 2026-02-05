@@ -413,6 +413,7 @@ Map
 
 map_path = os.path.abspath('my_map.html')
 Map.save(map_path)
+Map
 webbrowser.open('file://' + map_path)
 
 
