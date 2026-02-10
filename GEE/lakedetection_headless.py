@@ -11,23 +11,28 @@ import time
 import os
 import io
 import json
-import subprocess
 import glob
 import sys
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
+from rio_cogeo.cogeo import cog_translate
+from rio_cogeo.profiles import cog_profiles
 
 # ============================================================
 # 0. CORE FUNCTIONS
 # ============================================================
-
-
 def build_drive_service(service_account_path):
     SCOPES = ['https://www.googleapis.com/auth/drive']
     credentials = service_account.Credentials.from_service_account_file(
         service_account_path, scopes=SCOPES)
-    return build('drive', 'v3', credentials=credentials)
+    return build(
+        'drive', 
+        'v3', 
+        credentials=credentials, 
+        cache_discovery=False, 
+        static_discovery=False  # <--- Add this line
+    )
 
 def get_radar_mask(image, dem):
     theta_i = image.select('angle')
@@ -80,12 +85,11 @@ def get_historical_collection(s1, orbit_pass, doy, window, yearsBack, reference_
         seasonal_list.append(imgs)
     return ee.ImageCollection(ee.List(seasonal_list).flatten())
 
-def export_and_download(images_to_export, reference_date, aoi, drive_service, output_root):
+def export_and_download(images_to_export, reference_date, aoi, drive_service, output_root, timestamp):
     date_str = reference_date.strftime("%Y-%m-%d")
     local_dir = os.path.join(output_root, f'Outputs_{date_str}')
     os.makedirs(local_dir, exist_ok=True)
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     task_list = []
 
     for name, img in images_to_export.items():
@@ -125,11 +129,45 @@ def export_and_download(images_to_export, reference_date, aoi, drive_service, ou
     return local_dir
 
 def convert_to_cog(folder):
+
+
+    # Define the COG profile (Web-optimized compression)
+    dst_profile = cog_profiles.get("deflate")
+
     for tif in glob.glob(os.path.join(folder, "*.tif")):
-        if "_cog.tif" in tif: continue
-        cog = tif.replace(".tif", "_cog.tif")
-        subprocess.run(["gdal_translate", tif, cog, "-of", "COG", "-co", "COMPRESS=LZW"],capture_output=False)
-        #print(f"COG created: {cog}")
+        # Skip if it's already a COG or not a standard TIF
+        if tif.endswith("_cog.tif"): 
+            continue
+        
+        output_cog = tif.replace(".tif", "_cog.tif")
+        
+        print(f"Converting to COG: {os.path.basename(tif)}...", flush=True)
+        try:
+            cog_translate(
+                tif, 
+                output_cog, 
+                dst_profile, 
+                in_memory=False, 
+                quiet=True
+            )
+            # Optional: Delete the original non-cog TIF to save space
+            # os.remove(tif) 
+        except Exception as e:
+            print(f"Failed to convert {tif}: {e}", flush=True)
+            
+class Logger(object):
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "a", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
 
 # ============================================================
 # 1. MAIN PROCESSING PIPELINE
@@ -142,6 +180,26 @@ def run_pipeline(config_path):
     # Initialize GEE
     ee.Initialize(project=cfg.get("project_id"))
 
+    ###### LOGGING OUTPUTS 
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    
+    # Extract date for folder naming
+    if cfg["run_date"] == "today":
+        ref_date = datetime.datetime.now()
+    else:
+        ref_date = datetime.datetime.strptime(cfg["run_date"], "%Y-%m-%d")
+    doy = ref_date.timetuple().tm_yday
+    
+    date_str = ref_date.strftime("%Y-%m-%d")
+    local_dir = os.path.join(cfg["output_root"], f'Outputs_{date_str}')
+    os.makedirs(local_dir, exist_ok=True)
+
+    # Redirect all prints/errors to file
+    log_file = os.path.join(local_dir, f"pipeline_log_{timestamp}.txt")
+    sys.stdout = Logger(log_file)
+    sys.stderr = sys.stdout
+    #######
+
     # Setup AOI and Terrain
     with open(cfg["aoi_geojson"]) as f:
         aoi_data = json.load(f)
@@ -151,13 +209,6 @@ def run_pipeline(config_path):
     elev = srtm.select('elevation')
     slope = ee.Terrain.slope(elev.focal_median(4))
     terrain_mask = elev.gt(3000).And(slope.focal_min(8).lt(6)).clip(aoi)
-
-    # Dates
-    if cfg["run_date"] == "today":
-        ref_date = datetime.today().date().isoformat()
-    else:
-        ref_date = datetime.datetime.strptime(cfg["run_date"], "%Y-%m-%d")
-    doy = ref_date.timetuple().tm_yday
 
     daysBack = 90
     start = ref_date-datetime.timedelta(days=daysBack)
@@ -261,7 +312,7 @@ def run_pipeline(config_path):
         "mean_diff": masked_diff.toFloat()
     }
 
-    local_path = export_and_download(exports, ref_date, aoi, drive_service, cfg["output_root"])
+    local_path = export_and_download(exports, ref_date, aoi, drive_service, cfg["output_root"], timestamp)
     convert_to_cog(local_path)
 
     return "Processing successful"

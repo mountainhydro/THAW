@@ -2,3 +2,19 @@ Outputs_*/
 Outputs/
 config/
 temp/
+
+
+# 1. Ignore all standard libraries in site-packages
+python_portable/Lib/site-packages/*
+
+# 2. Re-allow pip and its metadata
+!python_portable/Lib/site-packages/pip/
+!python_portable/Lib/site-packages/pip-*/
+!python_portable/Lib/site-packages/pip/**
+!python_portable/Lib/site-packages/pip-*/**
+
+# 4. Re-allow any specific extensions if needed, otherwise leave as above
+
+# 5. Global cleanup for compiled code
+**/__pycache__/
+*.pyc

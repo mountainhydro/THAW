@@ -1,435 +1,267 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Wed Jan 21 14:12:29 2026
-@author: Fugger
-"""
-
 import os
 import glob
 import json
 import subprocess
-import threading
 import sys
-import time
+import rasterio
+from rasterio.warp import transform_bounds
 from datetime import datetime, date as dt_date
 import streamlit as st
-from localtileserver import TileClient
 import folium
 from folium.plugins import Draw
 from streamlit_folium import st_folium
-from streamlit.runtime.scriptrunner import add_script_run_ctx
 
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__)) 
+DASH_DIR = os.path.dirname(CURRENT_DIR)                 
+ROOT_DIR = os.path.dirname(DASH_DIR)                    
+TEMP_DIR = os.path.join(ROOT_DIR, "temp")
+CRED_FILE = os.path.join(TEMP_DIR, "gee_credentials.txt")
+GEE_DIR = os.path.join(ROOT_DIR, "GEE")
+OUTPUT_DIR = os.path.join(ROOT_DIR, "Outputs")
+CONFIG_DIR = os.path.join(ROOT_DIR, "config")
+os.makedirs(CONFIG_DIR, exist_ok=True)
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
-st.set_page_config(layout="wide", page_title="Sentinel-1 Water Monitor")
+def load_gee_creds():
+    if os.path.exists(CRED_FILE):
+        with open(CRED_FILE, "r") as f:
+            lines = [line.strip() for line in f.readlines()]
+            if len(lines) >= 2:
+                return lines[0], lines[1]
+    return None, None
 
+project_id, service_account_path = load_gee_creds()
 
-# ============================================================
-# PATH SETUP (relative, robust)
-# ============================================================
-pages_dir = os.path.dirname(os.path.abspath(__file__))      # pages
-dash_dir = os.path.dirname(pages_dir)                       # Dashboard
-root_dir = os.path.dirname(dash_dir)                        # THAW
-gee_dir = f"{root_dir}\GEE"
+st.set_page_config(layout="wide", page_title="Job Scheduler")
 
-output_dir = os.path.join(root_dir, "Outputs")
-config_dir = os.path.join(root_dir, "config")
-os.makedirs(config_dir, exist_ok=True)
+if not project_id:
+    st.error("**No Credentials Found.** Please go to the **Home** page and log in first.")
+    st.stop()
 
-
-# ============================================================
-# SIDEBAR — GEE CREDENTIALS
-# ============================================================
-st.sidebar.title("Job configuration")
-project_id = st.sidebar.text_input("GEE Project ID")
-service_account_path = st.sidebar.text_input(
-    "Service account JSON path",
-    placeholder=r"C:\Users\...\service-account.json"
-)
-
-
-# ============================================================
-# FIND LATEST OUTPUT FOLDER (Outputs_YYYY-MM-DD)
-# ============================================================
-output_folders = glob.glob(os.path.join(output_dir, "Outputs_*"))
+output_folders = glob.glob(os.path.join(OUTPUT_DIR, "Outputs_*"))
 dated_folders = []
-
 for f in output_folders:
-    name = os.path.basename(f)
     try:
-        folder_date = datetime.strptime(name.replace("Outputs_", ""), "%Y-%m-%d")
+        folder_date = datetime.strptime(os.path.basename(f).replace("Outputs_", ""), "%Y-%m-%d")
         dated_folders.append((f, folder_date))
-    except ValueError:
-        continue
+    except: continue
 
 dated_folders.sort(key=lambda x: x[1], reverse=True)
 latest_folder = dated_folders[0][0] if dated_folders else None
 tif_files = glob.glob(os.path.join(latest_folder, "*_cog.tif")) if latest_folder else []
 
+st.title("Sentinel-1 SAR Water Monitor")
+st.success(f"Connected to Project: `{project_id}`")
 
-# ============================================================
-# MAP SETUP
-# ============================================================
+center = [28.3, 85.6]
+fit_bounds = None
 if tif_files:
-    first_tc = TileClient(tif_files[0])
-    bounds = first_tc.bounds()
-    center = [(bounds[0] + bounds[1]) / 2, (bounds[2] + bounds[3]) / 2] if bounds else [28.3, 85.6]
-else:
-    center = [28.3, 85.6]
+    try:
+        with rasterio.open(tif_files[0]) as src:
+            wgs_bounds = transform_bounds(src.crs, 'EPSG:4326', *src.bounds)
+            center = [(wgs_bounds[1] + wgs_bounds[3]) / 2, (wgs_bounds[0] + wgs_bounds[2]) / 2]
+            fit_bounds = [[wgs_bounds[1], wgs_bounds[0]], [wgs_bounds[3], wgs_bounds[2]]]
+    except: pass
 
 m = folium.Map(location=center, zoom_start=10)
-folium.TileLayer(
-    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-    name="Satellite",
-    attr="© Esri, Maxar, Earthstar Geographics"
-).add_to(m)
+folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", 
+                  name="Satellite", attr="Esri").add_to(m)
 
-Draw(
-    export=True,
-    draw_options={
-        "polygon": True,
-        "rectangle": True,
-        "polyline": False,
-        "circle": False,
-        "circlemarker": False,
-        "marker": False
-    },
-    edit_options={"edit": True, "remove": True}
-).add_to(m)
-folium.LayerControl().add_to(m)
+if fit_bounds:
+    m.fit_bounds(fit_bounds)
 
-draw_data = st_folium(m, width=900, height=700)
+Draw(export=True, draw_options={"polyline":False, "circle":False, "marker":False}).add_to(m)
+draw_data = st_folium(m, width=900, height=550)
 
-
-# ============================================================
-# AOI EXTRACTION
-# ============================================================
 aoi_geojson = None
 if draw_data and draw_data.get("all_drawings"):
     aoi_geojson = draw_data["all_drawings"][0]["geometry"]
     coords = aoi_geojson.get("coordinates", [[]])[0]
-    flat_coords = []
-    for lon, lat in coords:
-        flat_coords.append(f"{lon:.5f}")
-        flat_coords.append(f"{lat:.5f}")
-    st.sidebar.info("AOI selected: " + ", ".join(flat_coords))
+    flat_coords = [f"{lon:.5f}, {lat:.5f}" for lon, lat in coords[:3]]
+    st.sidebar.info("AOI selected: " + " | ".join(flat_coords) + "...")
 
-aoi_path = os.path.join(config_dir, "aoi.geojson")
-with open(aoi_path, "w") as f:
-    json.dump({
-        "type": "FeatureCollection",
-        "features": [{"type": "Feature", "geometry": aoi_geojson}]
-    }, f, indent=2)
+st.sidebar.header("▶ Manual Run")
+run_date = st.sidebar.date_input("Processing Date", value=dt_date.today(), max_value=dt_date.today())
 
-# ============================================================
-# SELECT RUN DATE (DEFAULT TODAY)
-# ============================================================
-run_date = st.sidebar.date_input(
-    "Run date",
-    value=dt_date.today(),
-    max_value=dt_date.today()
-)
-if run_date == dt_date.today():
-    st.sidebar.caption("📅 Today selected")
-
-
-# ============================================================
-# SIDEBAR VALIDATION MESSAGES for "Run Now"
-# ============================================================
-missing_now = []
-if not project_id:
-    missing_now.append("Please select a GEE project")
-if not service_account_path:
-    missing_now.append("Please provide a service account JSON path")
 if not aoi_geojson:
-    missing_now.append("Please draw an AOI on the map")
-if missing_now:
-    st.sidebar.markdown("### Required inputs")
-    for msg in missing_now:
-        st.sidebar.warning(msg)
+    st.sidebar.warning("Please draw an AOI on the map to run a manual job.")
 
+run_now_clicked = st.sidebar.button("Run job now", disabled=not aoi_geojson)
+st.sidebar.markdown("---")
 
-# ============================================================
-# RUN NOW BUTTON
-# ============================================================
-all_inputs_ready_now = (
-    project_id and
-    service_account_path and
-    os.path.exists(service_account_path) and
-    aoi_geojson is not None
-)
-
-run_now_clicked = st.sidebar.button(
-    "▶ Run job now",
-    disabled=not all_inputs_ready_now
-)
-
-
-# ============================================================
-# WRITE CONFIG AND LAUNCH HEADLESS SCRIPT
-# ============================================================
-def write_now_config():
-    cfg = {
-        "run_date": run_date.isoformat(),
-        "aoi_geojson": aoi_path,  # <-- path to file
-        "project_id": project_id,
-        "service_account_path": service_account_path,
-        "output_root": output_dir
-    }
-    
-    config_path = os.path.join(config_dir, "now_config.json")
-    with open(config_path, "w") as f:
-        json.dump(cfg, f, indent=2)
-    return config_path
-
-def run_headless(config_path, output_container):
-    # Ensure gee_dir is correctly defined in your script scope
-    script_path = os.path.join(gee_dir, "lakedetection_headless.py")
-    
-    # -u is critical: it tells the python subprocess to not buffer the output
-    cmd = [sys.executable, "-u", script_path, config_path]
-    
-    process = subprocess.Popen(
-        cmd, 
-        stdout=subprocess.PIPE, 
-        stderr=subprocess.STDOUT, 
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1  # Line-buffered
-    )
-
-    full_log = ""
-    
-    # Continuously read the output
-    while True:
-        line = process.stdout.readline()
-        
-        # If no more output and process is done, break
-        if not line and process.poll() is not None:
-            break
-            
-        if line:
-            full_log += line
-            # Overwrite the empty container with the code block
-            # This provides the 'live streaming' effect
-            output_container.code(full_log)
-        
-    process.wait()
-    
-    if process.returncode == 0:
-        output_container.success("Job finished successfully! Please check Output Preview page")
-    else:
-        # If it failed, the full_log will already contain the error traceback
-        output_container.error(f"Job failed with return code {process.returncode}")
-
-# --- Trigger Logic ---
-if run_now_clicked:
-    config_path = write_now_config()
-    
-    # 1. Create a placeholder in the UI for the logs
-    status_container = st.empty()
-    status_container.info("Initializing Subprocess...")
-
-    # 2. Define the command (the -u flag is the 'Live' switch)
-    script_path = os.path.join(gee_dir, "lakedetection_headless.py")
-    cmd = [sys.executable, "-u", script_path, config_path]
-
-    # 3. Start the process
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, # Redirect errors to the same pipe
-        text=True,
-        bufsize=1,                # Line-buffered
-        universal_newlines=True
-    )
-
-    full_log = ""
-
-    # 4. The "Live Listener" loop
-    # This loop keeps the Dashboard busy until the GEE script finishes
-    for line in iter(process.stdout.readline, ""):
-        full_log += line
-        # Every time a new line comes in, overwrite the code block
-        status_container.code(full_log)
-
-    process.stdout.close()
-    return_code = process.wait()
-
-    # 5. Final Status Update
-    if return_code == 0:
-        st.success("Processing Complete!")
-    else:
-        st.error(f"Process failed with return code {return_code}")
-
-# ============================================================
-# SIDEBAR — SCHEDULER INPUTS
-# ============================================================
-import subprocess
-
-st.sidebar.title("Scheduler")
+st.sidebar.header("📅 Scheduled Task")
 if "frequency_changed" not in st.session_state:
     st.session_state.frequency_changed = False
 
 def mark_frequency_changed():
     st.session_state.frequency_changed = True
 
-# Frequency selection
 frequency = st.sidebar.selectbox(
-    "Run Frequency",
-    ["Daily", "Weekly", "Monthly"],
-    key="frequency_select",
-    on_change=mark_frequency_changed
+    "Run Frequency", ["Daily", "Weekly", "Monthly"],
+    key="frequency_select", on_change=mark_frequency_changed
 )
 
 weekday = None
 month_day = None
 if frequency == "Weekly":
-    weekday = st.sidebar.selectbox(
-        "Weekday",
-        ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    )
+    weekday = st.sidebar.selectbox("Weekday", ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"])
 if frequency == "Monthly":
-    month_day = st.sidebar.number_input(
-        "Day of month",
-        min_value=1,
-        max_value=31,
-        value=1
-    )
+    month_day = st.sidebar.number_input("Day of month", 1, 31, 1)
+
 time_options = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0,15,30,45)]
 time_of_day = st.sidebar.selectbox("Time of day", time_options)
 
-# ============================================================
-# VALIDATION
-# ============================================================
-missing = []
-if not project_id:
-    missing.append("Please select a GEE project")
-if not service_account_path:
-    missing.append("Please provide a service account JSON path")
+missing_sch = []
 if not aoi_geojson:
-    missing.append("Please draw an AOI on the map")
-
-if missing:
-    st.sidebar.markdown("### Required inputs")
-    for msg in missing:
-        st.sidebar.warning(msg)
-
+    missing_sch.append("Please draw an AOI on the map")
 if not st.session_state.frequency_changed:
-    st.sidebar.warning("Please adjust schedule frequency or confirm (Daily).")
+    missing_sch.append("Please adjust/confirm frequency settings")
+
+if missing_sch:
+    st.sidebar.markdown("### Required for Scheduling")
+    for msg in missing_sch:
+        st.sidebar.warning(msg)
 else:
     st.sidebar.success("All required inputs provided.")
 
-# ============================================================
-# SCHEDULE JOB BUTTON
-# ============================================================
-all_inputs_ready = (
-    project_id and
-    service_account_path and
-    aoi_geojson and
-    st.session_state.frequency_changed
-)
+schedule_clicked = st.sidebar.button("Schedule job", disabled=len(missing_sch) > 0)
 
-if st.sidebar.button("📅 Schedule job", disabled=not all_inputs_ready):
-    # --- Save AOI ---
-    aoi_path = os.path.join(config_dir, "aoi.geojson")
-    with open(aoi_path, "w") as f:
-        json.dump({"type":"FeatureCollection","features":[{"type":"Feature","geometry":aoi_geojson}]}, f, indent=2)
+def write_job_config(is_manual=True):
+    aoi_p = os.path.join(CONFIG_DIR, "aoi.geojson")
+    with open(aoi_p, "w") as f:
+        json.dump({"type":"FeatureCollection","features":[{"type":"Feature","geometry":aoi_geojson}]}, f)
 
-    # --- Save job config ---
-    job_cfg = {
-        "run_date": "today",  # <-- today
-        "aoi_geojson": aoi_path,                         # path to AOI
+    cfg = {
+        "run_date": run_date.isoformat() if is_manual else "today",
+        "aoi_geojson": aoi_p,
         "project_id": project_id,
         "service_account_path": service_account_path,
-        "output_root": output_dir
-        }
-    config_path = os.path.join(config_dir, "job_config.json")
-    with open(config_path, "w") as f:
-        json.dump(job_cfg, f, indent=2)
+        "output_root": OUTPUT_DIR
+    }
+    
+    cfg_file = "now_config.json" if is_manual else "sch_config.json"
+    cfg_path = os.path.join(CONFIG_DIR, cfg_file)
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return cfg_path
 
-    # --- Windows Scheduler Setup ---
+if run_now_clicked:
+    cfg_p = write_job_config(is_manual=True)
+    status_container = st.empty()
+    script_p = os.path.join(GEE_DIR, "lakedetection_headless.py")
+    
+    process = subprocess.Popen([sys.executable, "-u", script_p, cfg_p], 
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    full_log = ""
+    for line in iter(process.stdout.readline, ""):
+        full_log += line
+        status_container.code(full_log)
+    
+    if process.wait() == 0: st.success("Manual run complete!")
+    else: st.error("Manual run failed.")
+
+if schedule_clicked:
+    cfg_p = write_job_config(is_manual=False)
+    script_p = os.path.join(GEE_DIR, "lakedetection_headless.py")
+    task_name = f"LakeDetection_{frequency}"
     python_exe = sys.executable
-    script_path = os.path.join(root_dir, "GEE", "lakedetection_headless.py")
+    
+    # Mapping for XML and Commands
+    day_map = {"Monday":"MON","Tuesday":"TUE","Wednesday":"WED","Thursday":"THU","Friday":"FRI","Saturday":"SAT","Sunday":"SUN"}
 
-    # Define task name
-    task_name_map = {"Daily": "LakeDetection_Daily", "Weekly": "LakeDetection_Weekly", "Monthly": "LakeDetection_Monthly"}
-    task_name = task_name_map[frequency]
-
-    # Build the schtasks command
+    # 1. Create the task normally first
     if frequency == "Weekly":
-        weekday_map = {
-            "Monday": "MON","Tuesday": "TUE","Wednesday": "WED",
-            "Thursday": "THU","Friday": "FRI","Saturday": "SAT","Sunday": "SUN"
-        }
-        sch_weekday = weekday_map.get(weekday, "MON")
-        sch_cmd = f'schtasks /Create /SC WEEKLY /D {sch_weekday} /TN "{task_name}" /TR "{python_exe} {script_path} {config_path}" /ST {time_of_day} /F'
+        sch_cmd = f'schtasks /Create /SC WEEKLY /D {day_map[weekday]} /TN "{task_name}" /TR "{python_exe} {script_p} {cfg_p}" /ST {time_of_day} /F'
     elif frequency == "Daily":
-        sch_cmd = f'schtasks /Create /SC DAILY /TN "{task_name}" /TR "{python_exe} {script_path} {config_path}" /ST {time_of_day} /F'
-    else:  # Monthly
-        sch_cmd = f'schtasks /Create /SC MONTHLY /D {month_day} /TN "{task_name}" /TR "{python_exe} {script_path} {config_path}" /ST {time_of_day} /F'
+        sch_cmd = f'schtasks /Create /SC DAILY /TN "{task_name}" /TR "{python_exe} {script_p} {cfg_p}" /ST {time_of_day} /F'
+    else:
+        sch_cmd = f'schtasks /Create /SC MONTHLY /D {month_day} /TN "{task_name}" /TR "{python_exe} {script_p} {cfg_p}" /ST {time_of_day} /F'
 
-    # --- Execute Scheduler Command ---
-    try:
-        os.system(sch_cmd)
-        st.sidebar.success(f"Scheduled job '{task_name}' successfully")
-        st.sidebar.info(f"It will run automatically {frequency} on {weekday} at {time_of_day}")
-    except Exception as e:
-        st.sidebar.error(f"Failed to schedule job: {e}")
+    # 2. Execute creation
+    if os.system(sch_cmd) == 0:
+        # 3. CRITICAL ADDITION: Modify the task to "Run as soon as possible if missed"
+        # This PowerShell command updates the existing task settings
+        powershell_fix = (
+            f'powershell -Command "$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable; '
+            f'Set-ScheduledTask -TaskName \\"{task_name}\\" -Settings $settings"'
+        )
         
-# -*- coding: utf-8 -*-
+        if os.system(powershell_fix) == 0:
+            st.sidebar.success(f"Scheduled '{task_name}' successfully! (Will run after restart if missed)")
+        else:
+            st.sidebar.warning("Task created, but 'Start When Available' setting failed. Check admin rights.")
+    else:
+        st.sidebar.error("Failed to schedule task.")
 
-
-import streamlit as st
-import subprocess
-
-TASK_PREFIX = "LakeDetection"
-
-# --------------------------------------
-# List all LakeDetection tasks
-# --------------------------------------
-st.subheader("Existing Tasks")
+st.divider()
+st.subheader("📋 Active Scheduled Tasks")
+st.caption("Note: Tasks missed while the computer is off will run after the system is turned back on.")
 
 try:
-    cmd = 'schtasks /Query /FO LIST'
-    output = subprocess.check_output(cmd, shell=True, text=True)
-except subprocess.CalledProcessError:
-    st.error("Failed to query scheduled tasks.")
-    st.stop()
+    # Query with Verbose and CSV format
+    output = subprocess.check_output(
+        'schtasks /Query /FO CSV /V', 
+        shell=True, 
+        text=True, 
+        encoding='cp1252', # Often safer for Windows system outputs
+        errors='replace'
+    )
+    
+    import csv
+    from io import StringIO
+    
+    # Read as list to handle indices directly
+    raw_data = list(csv.reader(StringIO(output)))
+    
+    if len(raw_data) < 2:
+        st.info("No scheduled tasks found.")
+    else:
+        # Standard schtasks /V /FO CSV indices:
+        # 0: HostName, 1: TaskName, 2: Next Run, 3: Status, 4: LogMode, 
+        # 5: Last Run, 6: Last Result, 7: Author, 8: Task To Run...
+        
+        # Filter for your tasks (index 1 is TaskName)
+        lake_tasks = [row for row in raw_data[1:] if "LakeDetection" in row[1]]
 
-# Parse tasks
-tasks = []
-current_task = {}
-for line in output.splitlines():
-    if line.strip() == "":
-        if current_task:
-            if TASK_PREFIX in current_task.get("TaskName", ""):
-                tasks.append(current_task)
-            current_task = {}
-        continue
-    if ":" in line:
-        key, val = line.split(":", 1)
-        current_task[key.strip()] = val.strip()
-# Add last task
-if current_task and TASK_PREFIX in current_task.get("TaskName", ""):
-    tasks.append(current_task)
+        if not lake_tasks:
+            st.info("No active GEE scheduled tasks found.")
 
-if not tasks:
-    st.info(f"No scheduled tasks found for '{TASK_PREFIX}'.")
-else:
-    for t in tasks:
-        st.markdown(f"**{t.get('TaskName','')}**")
-        st.write(f"Next Run Time: {t.get('Next Run Time','')}")
-        st.write(f"Status: {t.get('Status','')}")
-        st.write(f"Last Run Time: {t.get('Last Run Time','')}")
-        if st.button(f"🗑️ Delete {t.get('TaskName','')}", key=t.get('TaskName','')):
-            delete_cmd = f'schtasks /Delete /TN "{t.get("TaskName")}" /F'
-            try:
-                subprocess.run(delete_cmd, shell=True, check=True)
-                st.success(f"Task {t.get('TaskName')} deleted!")
-            except subprocess.CalledProcessError:
-                st.error(f"Failed to delete {t.get('TaskName')}")
-            st.rerun()
+        for t in lake_tasks:
+            full_task_name = t[1]
+            clean_name = full_task_name.replace('\\', '')
+            
+            # Extract and Clean Data
+            next_run = t[2]
+            status = t[3]
+            last_run_raw = t[5]
+            result_code = t[6].strip()
+
+            # Fix for the 1999 placeholder: if year 1999 is in the string, it hasn't run yet
+            if "1999" in last_run_raw:
+                last_run_display = "Never Run"
+                result_display = "⚪ Pending first run"
+            else:
+                last_run_display = last_run_raw
+                if result_code == '0':
+                    result_display = "✅ Success (0)"
+                else:
+                    result_display = f"❌ Error ({result_code})"
+
+            with st.expander(f"📌 {clean_name}"):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write(f"**Next Run:** {next_run}")
+                    st.write(f"**Last Run:** {last_run_display}")
+                
+                with col2:
+                    st.write(f"**Status:** {status}")
+                    st.write(f"**Last Result:** {result_display}")
+                    
+
+                if st.button(f"🗑️ Delete {clean_name}", key=f"del_{clean_name}"):
+                    subprocess.run(f'schtasks /Delete /TN "{full_task_name}" /F', shell=True)
+                    st.rerun()
+                
+except Exception as e:
+    st.error(f"Could not retrieve task list: {e}")

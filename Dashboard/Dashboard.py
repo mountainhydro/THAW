@@ -2,7 +2,7 @@ import streamlit as st
 import ee
 import os
 
-# 1. Directory Setup (.../parent/temp/gee_credentials.txt)
+# 1. Directory Setup
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
 TEMP_DIR = os.path.join(PARENT_DIR, "temp")
@@ -28,6 +28,7 @@ def load_creds():
     return "", ""
 
 def delete_creds():
+    """ONLY called when Logout is pressed."""
     if os.path.exists(CRED_FILE):
         os.remove(CRED_FILE)
 
@@ -41,6 +42,7 @@ def init_gee(project):
 # 4. Persistent Session Check
 saved_project, saved_path = load_creds()
 
+# If session is fresh, try to auto-login from the file
 if "authenticated" not in st.session_state:
     if saved_project:
         if init_gee(saved_project):
@@ -48,6 +50,7 @@ if "authenticated" not in st.session_state:
             st.session_state.active_project = saved_project
             st.session_state.active_path = saved_path
         else:
+            # File exists but initialization failed (e.g. project expired)
             st.session_state.authenticated = False
     else:
         st.session_state.authenticated = False
@@ -55,17 +58,18 @@ if "authenticated" not in st.session_state:
 # 5. UI Logic
 if not st.session_state.authenticated:
     st.markdown("<style>section[data-testid='stSidebar'] {display: none;}</style>", unsafe_allow_html=True)
-    st.title("🌍 GEE Portal")
+    st.title("Sentinel-1 SAR Water Monitor (THAW)")
     
     with st.container(border=True):
-        # Autofill fields with what was found in the file
+        # The fields are pre-filled from the file, but we don't delete the file here
         project_input = st.text_input("GEE Project ID", value=saved_project)
-        path_input = st.text_input("Service Account JSON Path", value=saved_path)
+        path_input = st.text_input("Service Account JSON Path", value=saved_path, placeholder="C:\\...\\key.json")
         
         if st.button("Login & Remember Me", use_container_width=True):
             if project_input:
-                ee.Authenticate() # Trigger browser flow
+                ee.Authenticate() 
                 if init_gee(project_input):
+                    # Writing to file ensures it persists across restarts
                     save_creds(project_input, path_input)
                     st.session_state.authenticated = True
                     st.session_state.active_project = project_input
@@ -76,12 +80,32 @@ if not st.session_state.authenticated:
             else:
                 st.warning("Project ID is required.")
 
+    # --- GUIDE SECTION ---
+    st.divider()
+    st.subheader("📖 How to get your Credentials")
+    with st.expander("Step 1: Get a Google Earth Engine Account"):
+        st.write("Sign up for access at [earthengine.google.com](https://earthengine.google.com/signup).")
+
+    with st.expander("Step 2: Create & Initialize your Project"):
+        st.markdown("""
+        1. **Create project:** [GEE Cloud Console](https://console.cloud.google.com/earth-engine/).
+        2. **Enable API:** Visit the [API Library](https://console.cloud.google.com/apis/library/earthengine.googleapis.com) and click **Enable**.
+        """)
+    
+    with st.expander("Step 3: Create a Service Account"):
+        st.markdown("""
+        1. Go to [IAM & Admin > Service Accounts](https://console.cloud.google.com/iam-admin/serviceaccounts).
+        2. Create a key (JSON). Save the path.
+        3. Share your `GEE_Exports` Drive folder with the Service Account email.
+        """)
+
 else:
     # --- MAIN APP PAGE ---
     st.sidebar.title("Navigation")
+    
+    # CRITICAL: This is the ONLY place where delete_creds() is called
     if st.sidebar.button("Logout"):
         delete_creds()
-        # Clear specific session keys
         for key in ["authenticated", "active_project", "active_path"]:
             if key in st.session_state:
                 del st.session_state[key]
@@ -89,19 +113,17 @@ else:
     
     st.title("Welcome to THAW")
     
-    # Show active credentials in a success box
     st.success(
         f"### Session Active\n\n"
         f"**Project ID:** `{st.session_state.get('active_project')}`\n\n"
         f"**Service Account path:** `{st.session_state.get('active_path')}`"
     )
     
-    # Verify Connection with a real GEE call
     try:
         status = ee.String("Earth Engine Engine Online").getInfo()
-        st.info(f"🛰️ **Status:** {status}")
+        st.info(f"**Status:** {status}")
     except Exception as e:
         st.error(f"Could not reach GEE servers: {e}")
 
     st.divider()
-    st.write("You are fully authenticated.")
+    st.write("You are fully authenticated. The application will remember you until you click Logout.")

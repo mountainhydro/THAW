@@ -1,2 +1,27 @@
+# UI & GEE
+streamlit==1.53.0
 earthengine-api==1.7.4
-geemap==0.36.6
+
+# Mapping
+rio-tiler==7.0.1
+rio-cogeo==5.3.3
+leafmap==0.57.10
+folium==0.20.0
+streamlit-folium==0.26.1
+rasterio
+
+# Visualization & Internal Streamlit Checks
+matplotlib
+pandas
+pyarrow
+
+# Google Auth
+google-api-python-client==2.188.0
+google-auth==2.41.1
+
+# Data (Pinned for stability)
+numpy==1.26.4
+
+# Backtracking Blockers
+ipywidgets==8.1.5
+traitlets==5.14.3
