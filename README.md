@@ -8,13 +8,13 @@
 ---
 
 ## Features
-- **Surface Water Detection** from Synthetic Aperture Radar (Sentinel1-SAR) data given a user-define area of interest (AOI). Determination of the anomaly of the latest backscatter data to historic backscatter phenology in each pixel, expressed as a composite z-score for the ascending and descending orbits. Unlike optical satellites, Sentinel-1 radar penetrates clouds and works at night, making it ideal for monitoring flooded areas or seasonal lake changes in mountainous regions.
+- **Surface Water Detection** from Synthetic Aperture Radar (Sentinel1-SAR) data given a user-define area of interest (AOI). Determination of the anomaly of the latest backscatter data to historic backscatter phenology in each pixel, expressed as a composite z-score for the ascending and descending orbits. Unlike optical satellites, Sentinel-1 radar penetrates clouds and delivers observations also during nighttimes, making it ideal for monitoring flooded areas or seasonal lake changes in mountainous regions.
 
-- **Scheduling** (Windows): Scheduled monitoring to run daily, weekly, or monthly and download automatically. The task is configured to trigger automatically as soon as the powered on, in cased it was turned off.
+- **Scheduling** (Windows): Scheduled monitoring to run daily, weekly, or monthly and download automatically. The task is configured to trigger automatically as soon as your computer is powered on, in case it was turned off at the scheduled time.
 
-- **Targeted analysis**: Can be used to process any date within the timeframe of Sentinel1-SAR (2014 - present). *Event-based tracking is a work-in-progress feature*
+- **Task Monitoring**: View "Last Run" timestamps and Windows success/error directly from the dashboard. A time-stamped log file is written to the output folder with the print-outs and errors from each run.
 
-- **Task Monitoring**: View "Last Run" timestamps and Windows success/error directly from the dashboard. A timestamped log file is written to the output folder with the print-outs and errors from each run.
+- **Targeted analysis**: Can be used to process any date within the timeframe of Sentinel1-SAR (2014 - present). *Event-level tracking is a work-in-progress feature*. Processing progress is displayed on the dashboard
 
 - **Results & Preview**: Visualize processed data with specialized layers:
   - Z-Score: Identifies anomalies relative to historical water extent.
@@ -31,7 +31,6 @@
 
 
  
-
 ## Getting Started
 
 ### Installation
@@ -58,7 +57,7 @@
   - Select AOI
   
   **Scheduled task**
-  - Select the recurrence frequency and timing
+  - Select the recurrence frequency and timing (One daily, one weekly and one monthly task can currently exist in parallel)
 
 ### Authentication
 
