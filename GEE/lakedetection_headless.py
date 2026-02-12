@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
+
 """
-Sentinel-1 Water Detection - Headless Integrated Script
+THAW - Headless Integrated Script
+Meant to run in combination with the THAW dashboard
+
+Processing code: Dr. Evan Miles
+Tool/Operationalization: Dr. Stefan Fugger
+
 Created on Feb 2 2026
 """
 
@@ -20,20 +26,8 @@ from rio_cogeo.cogeo import cog_translate
 from rio_cogeo.profiles import cog_profiles
 
 # ============================================================
-# 0. CORE FUNCTIONS
+# CORE FUNCTIONS
 # ============================================================
-def build_drive_service(service_account_path):
-    SCOPES = ['https://www.googleapis.com/auth/drive']
-    credentials = service_account.Credentials.from_service_account_file(
-        service_account_path, scopes=SCOPES)
-    return build(
-        'drive', 
-        'v3', 
-        credentials=credentials, 
-        cache_discovery=False, 
-        static_discovery=False  # <--- Add this line
-    )
-
 def get_radar_mask(image, dem):
     theta_i = image.select('angle')
     phi_i = ee.Terrain.aspect(theta_i).reduceRegion(
@@ -85,6 +79,18 @@ def get_historical_collection(s1, orbit_pass, doy, window, yearsBack, reference_
         seasonal_list.append(imgs)
     return ee.ImageCollection(ee.List(seasonal_list).flatten())
 
+def build_drive_service(service_account_path):
+    SCOPES = ['https://www.googleapis.com/auth/drive']
+    credentials = service_account.Credentials.from_service_account_file(
+        service_account_path, scopes=SCOPES)
+    return build(
+        'drive', 
+        'v3', 
+        credentials=credentials, 
+        cache_discovery=False, 
+        static_discovery=False  # <--- Add this line
+    )
+
 def export_and_download(images_to_export, reference_date, aoi, drive_service, output_root, timestamp):
     date_str = reference_date.strftime("%Y-%m-%d")
     local_dir = os.path.join(output_root, f'Outputs_{date_str}')
@@ -102,7 +108,7 @@ def export_and_download(images_to_export, reference_date, aoi, drive_service, ou
         task_list.append({'name': name, 'prefix': file_prefix, 'task': task})
         print(f"Started GEE Task: {name}", flush=True)
 
-    print("Waiting for GEE completion...", flush=True)
+    print("Waiting GEE completion...", flush=True)
     completed = 0
     while completed < len(task_list):
         for item in task_list:
@@ -129,9 +135,6 @@ def export_and_download(images_to_export, reference_date, aoi, drive_service, ou
     return local_dir
 
 def convert_to_cog(folder):
-
-
-    # Define the COG profile (Web-optimized compression)
     dst_profile = cog_profiles.get("deflate")
 
     for tif in glob.glob(os.path.join(folder, "*.tif")):
@@ -150,8 +153,6 @@ def convert_to_cog(folder):
                 in_memory=False, 
                 quiet=True
             )
-            # Optional: Delete the original non-cog TIF to save space
-            # os.remove(tif) 
         except Exception as e:
             print(f"Failed to convert {tif}: {e}", flush=True)
             
@@ -170,20 +171,16 @@ class Logger(object):
         self.log.flush()
 
 # ============================================================
-# 1. MAIN PROCESSING PIPELINE
+# MAIN PROCESSING PIPELINE
 # ============================================================
-
 def run_pipeline(config_path):
     with open(config_path, "r") as f:
         cfg = json.load(f)
 
-    # Initialize GEE
     ee.Initialize(project=cfg.get("project_id"))
 
-    ###### LOGGING OUTPUTS 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     
-    # Extract date for folder naming
     if cfg["run_date"] == "today":
         ref_date = datetime.datetime.now()
     else:
@@ -194,11 +191,10 @@ def run_pipeline(config_path):
     local_dir = os.path.join(cfg["output_root"], f'Outputs_{date_str}')
     os.makedirs(local_dir, exist_ok=True)
 
-    # Redirect all prints/errors to file
+    # logging of console outputs
     log_file = os.path.join(local_dir, f"pipeline_log_{timestamp}.txt")
     sys.stdout = Logger(log_file)
     sys.stderr = sys.stdout
-    #######
 
     # Setup AOI and Terrain
     with open(cfg["aoi_geojson"]) as f:
@@ -215,7 +211,7 @@ def run_pipeline(config_path):
     doy = ref_date.timetuple().tm_yday
     windowSize = 12
 
-    ## load image collection
+    # Load image collection
     s1 = ee.ImageCollection('COPERNICUS/S1_GRD') \
         .filterBounds(aoi) \
         .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV')) \
@@ -235,13 +231,11 @@ def run_pipeline(config_path):
         .sort('system:time_start', False)
     s1_desc =  apply_radar_mask_to_collection(s1_desc, elev);
 
-    # Reduce to the recent days, and the days before
+    # Reduce to the recent days, and the earlier days
     recent_asc = s1_asc.filterDate(ref_date-datetime.timedelta(days=13),ref_date);
     recent_desc = s1_desc.filterDate(ref_date-datetime.timedelta(days=13),ref_date);
     earlier_asc = s1_asc.filterDate(ref_date-datetime.timedelta(days=25), ref_date-datetime.timedelta(days=13))
     earlier_desc = s1_desc.filterDate(ref_date-datetime.timedelta(days=25), ref_date-datetime.timedelta(days=13))
-
-
 
     # Mosaic per orbit direction
     latest_asc = recent_asc.mosaic()
@@ -252,7 +246,6 @@ def run_pipeline(config_path):
     # Get images from the years before within a timewindow around the doy
     hist_asc = get_historical_collection(s1, 'ASCENDING', doy, windowSize, 10, ref_date)
     hist_desc = get_historical_collection(s1, 'DESCENDING', doy, windowSize, 10, ref_date)
-
 
     # get mean and stdv from historical ASC and DESC images
     hist_asc_stats = hist_asc.reduce(
@@ -297,14 +290,11 @@ def run_pipeline(config_path):
         .divide(hist_desc_stats.select('VV_stdDev')) \
         .rename('asc_zscore')
     zscore_mean = zscore_asc.add(zscore_desc).divide(2).focal_mean(3).updateMask(focal_mean)
+
     
-    
-    
-    
-    
-########################################
-## 5. EXPORT
-########################################
+# ============================================================
+# Export and download
+# ============================================================
     drive_service = build_drive_service(cfg["service_account_path"])
     exports = {
         "potential_water": potential_water,
@@ -319,7 +309,7 @@ def run_pipeline(config_path):
 
 
 # ============================================================
-# 2. SCRIPT ENTRY
+# SCRIPT ENTRY
 # ============================================================
 
 if __name__ == "__main__":

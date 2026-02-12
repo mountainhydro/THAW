@@ -1,4 +1,13 @@
 # -*- coding: utf-8 -*-
+
+"""
+THAW - Streamlit Dashboard Scheduler page
+
+Dr. Stefan Fugger
+
+Created in Feb 2026
+"""
+
 import os
 import glob
 import json
@@ -12,6 +21,38 @@ import folium
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 
+# 1. Function Definitions
+def load_gee_creds():
+    if os.path.exists(CRED_FILE):
+        with open(CRED_FILE, "r") as f:
+            lines = [line.strip() for line in f.readlines()]
+            if len(lines) >= 2:
+                return lines[0], lines[1]
+    return None, None
+
+def mark_frequency_changed():
+    st.session_state.frequency_changed = True
+
+def write_job_config(is_manual=True):
+    aoi_p = os.path.join(CONFIG_DIR, "aoi.geojson")
+    with open(aoi_p, "w") as f:
+        json.dump({"type":"FeatureCollection","features":[{"type":"Feature","geometry":aoi_geojson}]}, f)
+
+    cfg = {
+        "run_date": run_date.isoformat() if is_manual else "today",
+        "aoi_geojson": aoi_p,
+        "project_id": project_id,
+        "service_account_path": service_account_path,
+        "output_root": OUTPUT_DIR
+    }
+    
+    cfg_file = "now_config.json" if is_manual else "sch_config.json"
+    cfg_path = os.path.join(CONFIG_DIR, cfg_file)
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return cfg_path
+
+# 2. Directory Setup
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__)) 
 DASH_DIR = os.path.dirname(CURRENT_DIR)                 
 ROOT_DIR = os.path.dirname(DASH_DIR)                    
@@ -22,14 +63,7 @@ OUTPUT_DIR = os.path.join(ROOT_DIR, "Outputs")
 CONFIG_DIR = os.path.join(ROOT_DIR, "config")
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
-def load_gee_creds():
-    if os.path.exists(CRED_FILE):
-        with open(CRED_FILE, "r") as f:
-            lines = [line.strip() for line in f.readlines()]
-            if len(lines) >= 2:
-                return lines[0], lines[1]
-    return None, None
-
+# 3. Initialization and Auth Check
 project_id, service_account_path = load_gee_creds()
 
 st.set_page_config(layout="wide", page_title="Job Scheduler")
@@ -38,6 +72,7 @@ if not project_id:
     st.error("**No Credentials Found.** Please go to the **Home** page and log in first.")
     st.stop()
 
+# 4. Data Discovery
 output_folders = glob.glob(os.path.join(OUTPUT_DIR, "Outputs_*"))
 dated_folders = []
 for f in output_folders:
@@ -50,7 +85,8 @@ dated_folders.sort(key=lambda x: x[1], reverse=True)
 latest_folder = dated_folders[0][0] if dated_folders else None
 tif_files = glob.glob(os.path.join(latest_folder, "*_cog.tif")) if latest_folder else []
 
-st.title("Sentinel-1 SAR Water Monitor")
+# 5. UI Header and Map Setup
+st.title("THAW Task Manager and Scheduler")
 st.success(f"Connected to Project: `{project_id}`")
 
 center = [28.3, 85.6]
@@ -80,6 +116,7 @@ if draw_data and draw_data.get("all_drawings"):
     flat_coords = [f"{lon:.5f}, {lat:.5f}" for lon, lat in coords[:3]]
     st.sidebar.info("AOI selected: " + " | ".join(flat_coords) + "...")
 
+# 6. Sidebar Manual Run
 st.sidebar.header("▶ Manual Run")
 run_date = st.sidebar.date_input("Processing Date", value=dt_date.today(), max_value=dt_date.today())
 
@@ -89,12 +126,10 @@ if not aoi_geojson:
 run_now_clicked = st.sidebar.button("Run job now", disabled=not aoi_geojson)
 st.sidebar.markdown("---")
 
+# 7. Sidebar Scheduling
 st.sidebar.header("📅 Scheduled Task")
 if "frequency_changed" not in st.session_state:
     st.session_state.frequency_changed = False
-
-def mark_frequency_changed():
-    st.session_state.frequency_changed = True
 
 frequency = st.sidebar.selectbox(
     "Run Frequency", ["Daily", "Weekly", "Monthly"],
@@ -126,25 +161,7 @@ else:
 
 schedule_clicked = st.sidebar.button("Schedule job", disabled=len(missing_sch) > 0)
 
-def write_job_config(is_manual=True):
-    aoi_p = os.path.join(CONFIG_DIR, "aoi.geojson")
-    with open(aoi_p, "w") as f:
-        json.dump({"type":"FeatureCollection","features":[{"type":"Feature","geometry":aoi_geojson}]}, f)
-
-    cfg = {
-        "run_date": run_date.isoformat() if is_manual else "today",
-        "aoi_geojson": aoi_p,
-        "project_id": project_id,
-        "service_account_path": service_account_path,
-        "output_root": OUTPUT_DIR
-    }
-    
-    cfg_file = "now_config.json" if is_manual else "sch_config.json"
-    cfg_path = os.path.join(CONFIG_DIR, cfg_file)
-    with open(cfg_path, "w") as f:
-        json.dump(cfg, f, indent=2)
-    return cfg_path
-
+# 8. Execution Manual Job
 if run_now_clicked:
     cfg_p = write_job_config(is_manual=True)
     status_container = st.empty()
@@ -160,16 +177,15 @@ if run_now_clicked:
     if process.wait() == 0: st.success("Manual run complete!")
     else: st.error("Manual run failed.")
 
+# 9. Execution Task Scheduling
 if schedule_clicked:
     cfg_p = write_job_config(is_manual=False)
     script_p = os.path.join(GEE_DIR, "lakedetection_headless.py")
     task_name = f"LakeDetection_{frequency}"
     python_exe = sys.executable
     
-    # Mapping for XML and Commands
     day_map = {"Monday":"MON","Tuesday":"TUE","Wednesday":"WED","Thursday":"THU","Friday":"FRI","Saturday":"SAT","Sunday":"SUN"}
 
-    # 1. Create the task normally first
     if frequency == "Weekly":
         sch_cmd = f'schtasks /Create /SC WEEKLY /D {day_map[weekday]} /TN "{task_name}" /TR "{python_exe} {script_p} {cfg_p}" /ST {time_of_day} /F'
     elif frequency == "Daily":
@@ -177,50 +193,41 @@ if schedule_clicked:
     else:
         sch_cmd = f'schtasks /Create /SC MONTHLY /D {month_day} /TN "{task_name}" /TR "{python_exe} {script_p} {cfg_p}" /ST {time_of_day} /F'
 
-    # 2. Execute creation
     if os.system(sch_cmd) == 0:
-        # 3. CRITICAL ADDITION: Modify the task to "Run as soon as possible if missed"
-        # This PowerShell command updates the existing task settings
         powershell_fix = (
             f'powershell -Command "$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable; '
             f'Set-ScheduledTask -TaskName \\"{task_name}\\" -Settings $settings"'
         )
         
         if os.system(powershell_fix) == 0:
-            st.sidebar.success(f"Scheduled '{task_name}' successfully! (Will run after restart if missed)")
+            st.sidebar.success(f"Scheduled '{task_name}' successfully!")
         else:
             st.sidebar.warning("Task created, but 'Start When Available' setting failed. Check admin rights.")
     else:
         st.sidebar.error("Failed to schedule task.")
 
+# 10. Active Tasks Display
 st.divider()
 st.subheader("📋 Active Scheduled Tasks")
 st.caption("Note: Tasks missed while the computer is off will run after the system is turned back on.")
 
 try:
-    # Query with Verbose and CSV format
     output = subprocess.check_output(
         'schtasks /Query /FO CSV /V', 
         shell=True, 
         text=True, 
-        encoding='cp1252', # Often safer for Windows system outputs
+        encoding='cp1252', 
         errors='replace'
     )
     
     import csv
     from io import StringIO
     
-    # Read as list to handle indices directly
     raw_data = list(csv.reader(StringIO(output)))
     
     if len(raw_data) < 2:
         st.info("No scheduled tasks found.")
     else:
-        # Standard schtasks /V /FO CSV indices:
-        # 0: HostName, 1: TaskName, 2: Next Run, 3: Status, 4: LogMode, 
-        # 5: Last Run, 6: Last Result, 7: Author, 8: Task To Run...
-        
-        # Filter for your tasks (index 1 is TaskName)
         lake_tasks = [row for row in raw_data[1:] if "LakeDetection" in row[1]]
 
         if not lake_tasks:
@@ -230,13 +237,11 @@ try:
             full_task_name = t[1]
             clean_name = full_task_name.replace('\\', '')
             
-            # Extract and Clean Data
             next_run = t[2]
             status = t[3]
             last_run_raw = t[5]
             result_code = t[6].strip()
 
-            # Fix for the 1999 placeholder: if year 1999 is in the string, it hasn't run yet
             if "1999" in last_run_raw:
                 last_run_display = "Never Run"
                 result_display = "⚪ Pending first run"

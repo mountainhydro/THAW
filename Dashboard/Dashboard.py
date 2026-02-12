@@ -1,3 +1,14 @@
+# -*- coding: utf-8 -*-
+
+"""
+THAW - Streamlit Dashboard landing page
+
+Dr. Stefan Fugger
+
+Created in Feb 2026
+"""
+
+
 import streamlit as st
 import ee
 import os
@@ -50,7 +61,6 @@ if "authenticated" not in st.session_state:
             st.session_state.active_project = saved_project
             st.session_state.active_path = saved_path
         else:
-            # File exists but initialization failed (e.g. project expired)
             st.session_state.authenticated = False
     else:
         st.session_state.authenticated = False
@@ -61,7 +71,6 @@ if not st.session_state.authenticated:
     st.title("Sentinel-1 SAR Water Monitor (THAW)")
     
     with st.container(border=True):
-        # The fields are pre-filled from the file, but we don't delete the file here
         project_input = st.text_input("GEE Project ID", value=saved_project)
         path_input = st.text_input("Service Account JSON Path", value=saved_path, placeholder="C:\\...\\key.json")
         
@@ -102,8 +111,7 @@ if not st.session_state.authenticated:
 else:
     # --- MAIN APP PAGE ---
     st.sidebar.title("Navigation")
-    
-    # CRITICAL: This is the ONLY place where delete_creds() is called
+
     if st.sidebar.button("Logout"):
         delete_creds()
         for key in ["authenticated", "active_project", "active_path"]:

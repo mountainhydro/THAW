@@ -1,4 +1,12 @@
 # -*- coding: utf-8 -*-
+
+"""
+THAW - Streamlit Dashboard Output preview page
+
+Dr. Stefan Fugger
+
+Created in Feb 2026
+"""
 import streamlit as st
 import os
 import glob
@@ -12,23 +20,28 @@ import matplotlib.pyplot as plt
 import base64
 from io import BytesIO
 
-st.set_page_config(layout="wide", page_title="Output Preview")
-
-root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-output_dir = os.path.join(root_dir, "Outputs")
-
-VIS_BY_LAYER = {
-    "z_score": {"min": -2, "max": 2, "palette": "RdYlGn"},
-    "potential_water": {"min": 0, "max": 1, "palette": "Blues"},
-    "mean_diff": {"min": -5, "max": 5, "palette": "RdBu"},
-}
-
+# 1. Function Definitions
 def get_vis_params(filename):
     for key, vis in VIS_BY_LAYER.items():
         if key in filename:
             return vis
     return {'min': -30, 'max': 0, 'palette': 'gray'}
 
+# 2. Page Configuration
+st.set_page_config(layout="wide", page_title="Output Preview")
+
+# 3. Directory Setup
+root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+output_dir = os.path.join(root_dir, "Outputs")
+
+# 4. Visualization Settings
+VIS_BY_LAYER = {
+    "z_score": {"min": -2, "max": 2, "palette": "RdYlGn"},
+    "potential_water": {"min": 0, "max": 1, "palette": "Blues"},
+    "mean_diff": {"min": -5, "max": 5, "palette": "RdBu"},
+}
+
+# 5. Data Discovery
 output_folders = glob.glob(os.path.join(output_dir, "Outputs_*"))
 dated_folders = sorted([
     (f, datetime.strptime(os.path.basename(f).replace("Outputs_", ""), "%Y-%m-%d"))
@@ -39,6 +52,7 @@ if not dated_folders:
     st.info("No data found.")
     st.stop()
 
+# 6. Sidebar Selection
 date_options = [f[1].strftime("%Y-%m-%d") for f in dated_folders]
 if date_options:
     date_options[0] += " (most recent)"
@@ -50,7 +64,7 @@ tif_files = glob.glob(os.path.join(folder_path, "*_cog.tif"))
 
 st.title(f"Preview: {selected_folder_date}")
 
-# --- DYNAMIC CENTER & BOUNDS ---
+# 7. Dynamic Center & Bounds
 center = [28.3, 85.6]
 fit_bounds = None
 
@@ -63,6 +77,7 @@ if tif_files:
     except:
         pass
 
+# 8. Map Generation
 m = folium.Map(location=center, zoom_start=12)
 folium.TileLayer("https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}", 
                   attr="Google", name="Satellite").add_to(m)
@@ -101,5 +116,6 @@ else:
     if fit_bounds:
         m.fit_bounds(fit_bounds)
 
+# 9. Output Display
 folium.LayerControl().add_to(m)
 st_folium(m, width=1100, height=650, returned_objects=[])
