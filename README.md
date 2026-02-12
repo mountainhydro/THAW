@@ -36,14 +36,14 @@
 ### Installation
 
 
-- **Download the folder** as a .zip file and unpack it to a location of your choice on your computer
+- **Download the packed folder** by clicking **<>Code - Download ZIP** and unpack it to a location of your choice on your computer.
   
 **OR**
 
 - **Clone the Repository** using:
    
    ```bash
-   git clone [https://github.com/your-username/THAW.git](https://github.com/your-username/THAW.git)
+   git clone [https://github.com/mountainhydro/THAW.git](https://github.com/your-username/THAW.git)
    cd THAW
    ```
   
