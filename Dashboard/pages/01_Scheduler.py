@@ -34,23 +34,60 @@ def mark_frequency_changed():
     st.session_state.frequency_changed = True
 
 def write_job_config(is_manual=True):
-    aoi_p = os.path.join(CONFIG_DIR, "aoi.geojson")
+    aoi_filename = "now_aoi.geojson" if is_manual else "sch_aoi.geojson"
+    aoi_p = os.path.join(CONFIG_DIR, aoi_filename)
+
     with open(aoi_p, "w") as f:
-        json.dump({"type":"FeatureCollection","features":[{"type":"Feature","geometry":aoi_geojson}]}, f)
+        json.dump(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {"type": "Feature", "geometry": aoi_geojson}
+                ],
+            },
+            f,
+        )
 
     cfg = {
         "run_date": run_date.isoformat() if is_manual else "today",
-        "aoi_geojson": aoi_p,
+        "aoi_geojson": aoi_p,  # <-- now points to correct AOI
         "project_id": project_id,
         "service_account_path": service_account_path,
-        "output_root": OUTPUT_DIR
+        "output_root": OUTPUT_DIR,
     }
-    
+
     cfg_file = "now_config.json" if is_manual else "sch_config.json"
     cfg_path = os.path.join(CONFIG_DIR, cfg_file)
+
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
+
     return cfg_path
+
+def calculate_bbox_area_km2(geometry):
+    """
+    Calculates approximate bounding box area (km²)
+    from WGS84 polygon coordinates.
+    """
+    import math
+    
+    coords = geometry.get("coordinates", [[]])[0]
+    lons = [pt[0] for pt in coords]
+    lats = [pt[1] for pt in coords]
+    
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
+    
+    # Approximate conversions
+    lat_km = 111.32
+    lon_km = 111.32 * math.cos(math.radians((min_lat + max_lat) / 2))
+    
+    width = (max_lon - min_lon) * lon_km
+    height = (max_lat - min_lat) * lat_km
+    
+    return abs(width * height)
+
+
 
 # 2. Directory Setup
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__)) 
@@ -110,11 +147,26 @@ Draw(export=True, draw_options={"polyline":False, "circle":False, "marker":False
 draw_data = st_folium(m, width=900, height=550)
 
 aoi_geojson = None
+
+MAX_AOI_AREA_KM2 = 300000
 if draw_data and draw_data.get("all_drawings"):
     aoi_geojson = draw_data["all_drawings"][0]["geometry"]
-    coords = aoi_geojson.get("coordinates", [[]])[0]
-    flat_coords = [f"{lon:.5f}, {lat:.5f}" for lon, lat in coords[:3]]
-    st.sidebar.info("AOI selected: " + " | ".join(flat_coords) + "...")
+
+    aoi_area = calculate_bbox_area_km2(aoi_geojson)
+
+    if aoi_area > MAX_AOI_AREA_KM2:
+        st.sidebar.error(
+            f"AOI too large ({aoi_area:,.0f} km²). "
+            f"Maximum allowed area is {MAX_AOI_AREA_KM2:,} km²."
+        )
+        aoi_geojson = None
+    else:
+        coords = aoi_geojson.get("coordinates", [[]])[0]
+        flat_coords = [f"{lon:.5f}, {lat:.5f}" for lon, lat in coords[:3]]
+        st.sidebar.info(
+            f"AOI selected ({aoi_area:,.0f} km²): "
+            + " | ".join(flat_coords) + "..."
+        )
 
 # 6. Sidebar Manual Run
 st.sidebar.header("▶ Manual Run")
