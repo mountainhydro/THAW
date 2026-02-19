@@ -4,7 +4,7 @@
 THAW - Headless Integrated Script
 Meant to run in combination with the THAW dashboard
 
-Processing code: Dr. Evan Miles
+GEE Processing code: Dr. Evan Miles
 Tool/Operationalization: Dr. Stefan Fugger
 
 Created on Feb 2 2026
