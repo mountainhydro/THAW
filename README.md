@@ -84,6 +84,7 @@ THAW/
 ├── python_portable/      # Isolated Python environment and libraries
 └── OPEN_THAW.bat         # Main launcher script (Setup & Boot)
 ```
+![THAW Flowchart](docs/THAW_flowchart.png)
 
 ## Requirements
 OS: Windows 10/11 or higher (Required for schtasks and PowerShell scheduling logic).
