@@ -1,22 +1,15 @@
 # -*- coding: utf-8 -*-
-
 """
-THAW - Streamlit Dashboard landing page
+THAW - Streamlit Dashboard entry point
 
 Dr. Stefan Fugger
-
-Created in Feb 2026
 """
-
-
+import os
 import streamlit as st
 import ee
-import os
 
-# 1. Directory Setup
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.dirname(CURRENT_DIR)
-TEMP_DIR = os.path.join(PARENT_DIR, "temp")
+# 1. Paths
+TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".temp")
 CRED_FILE = os.path.join(TEMP_DIR, "gee_credentials.txt")
 
 if not os.path.exists(TEMP_DIR):
@@ -26,17 +19,19 @@ if not os.path.exists(TEMP_DIR):
 st.set_page_config(page_title="Welcome!", layout="centered")
 
 # 3. Helper Functions
-def save_creds(project, path):
+def save_creds(project, path, email):
     with open(CRED_FILE, "w") as f:
-        f.write(f"{project}\n{path}")
+        f.write(f"{project}\n{path}\n{email}")
 
 def load_creds():
     if os.path.exists(CRED_FILE):
         with open(CRED_FILE, "r") as f:
             lines = [line.strip() for line in f.readlines()]
-            if len(lines) >= 2:
-                return lines[0], lines[1]
-    return "", ""
+            if len(lines) >= 3:
+                return lines[0], lines[1], lines[2]
+            elif len(lines) >= 2:
+                return lines[0], lines[1], ""
+    return "", "", ""
 
 def delete_creds():
     """ONLY called when Logout is pressed."""
@@ -51,7 +46,7 @@ def init_gee(project):
         return False
 
 # 4. Persistent Session Check
-saved_project, saved_path = load_creds()
+saved_project, saved_path, saved_email = load_creds()
 
 # If session is fresh, try to auto-login from the file
 if "authenticated" not in st.session_state:
@@ -60,6 +55,7 @@ if "authenticated" not in st.session_state:
             st.session_state.authenticated = True
             st.session_state.active_project = saved_project
             st.session_state.active_path = saved_path
+            st.session_state.active_email = saved_email
         else:
             st.session_state.authenticated = False
     else:
@@ -73,16 +69,17 @@ if not st.session_state.authenticated:
     with st.container(border=True):
         project_input = st.text_input("GEE Project ID", value=saved_project)
         path_input = st.text_input("Service Account JSON Path", value=saved_path, placeholder="C:\\...\\key.json")
-        
+        email_input = st.text_input("Alert Email Address", value=saved_email, placeholder="you@example.com")
+
         if st.button("Login & Remember Me", use_container_width=True):
             if project_input:
-                ee.Authenticate() 
+                ee.Authenticate()
                 if init_gee(project_input):
-                    # Writing to file ensures it persists across restarts
-                    save_creds(project_input, path_input)
+                    save_creds(project_input, path_input, email_input)
                     st.session_state.authenticated = True
                     st.session_state.active_project = project_input
                     st.session_state.active_path = path_input
+                    st.session_state.active_email = email_input
                     st.rerun()
                 else:
                     st.error("Initialization failed. Check your Project ID.")
@@ -114,7 +111,7 @@ else:
 
     if st.sidebar.button("Logout"):
         delete_creds()
-        for key in ["authenticated", "active_project", "active_path"]:
+        for key in ["authenticated", "active_project", "active_path", "active_email"]:
             if key in st.session_state:
                 del st.session_state[key]
         st.rerun()
@@ -124,7 +121,8 @@ else:
     st.success(
         f"### Session Active\n\n"
         f"**Project ID:** `{st.session_state.get('active_project')}`\n\n"
-        f"**Service Account path:** `{st.session_state.get('active_path')}`"
+        f"**Service Account path:** `{st.session_state.get('active_path')}`\n\n"
+        f"**Alert Email:** `{st.session_state.get('active_email', 'not set')}`"
     )
     
     try:
