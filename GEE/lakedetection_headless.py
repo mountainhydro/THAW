@@ -112,7 +112,8 @@ def export_and_download(images_to_export, reference_date, aoi, drive_service, ou
     completed = 0
     while completed < len(task_list):
         for item in task_list:
-            if item.get('done'): continue
+            if item.get('done'): 
+                continue
             status = item['task'].status()
             if status['state'] == 'COMPLETED':
                 fname = f"{item['prefix']}.tif"
@@ -123,7 +124,8 @@ def export_and_download(images_to_export, reference_date, aoi, drive_service, ou
                     with io.FileIO(os.path.join(local_dir, fname), 'wb') as fh:
                         downloader = MediaIoBaseDownload(fh, request)
                         d = False
-                        while not d: _, d = downloader.next_chunk()
+                        while not d: 
+                            _, d = downloader.next_chunk()
                     print(f"Downloaded: {fname}", flush = True)
                     item['done'] = True
                     completed += 1
@@ -131,7 +133,8 @@ def export_and_download(images_to_export, reference_date, aoi, drive_service, ou
                 print(f"Task {item['name']} failed: {status.get('error_message')}", flush = True)
                 item['done'] = True
                 completed += 1
-        if completed < len(task_list): time.sleep(30)
+        if completed < len(task_list): 
+            time.sleep(30)
     return local_dir
 
 def convert_to_cog(folder):
@@ -223,17 +226,17 @@ def run_pipeline(config_path):
         .filterDate(start, ref_date) \
         .filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING')) \
         .sort('system:time_start', False)
-    s1_asc = apply_radar_mask_to_collection(s1_asc, elev);
+    s1_asc = apply_radar_mask_to_collection(s1_asc, elev)
 
     s1_desc = s1 \
         .filterDate(start, ref_date) \
         .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING')) \
         .sort('system:time_start', False)
-    s1_desc =  apply_radar_mask_to_collection(s1_desc, elev);
+    s1_desc =  apply_radar_mask_to_collection(s1_desc, elev)
 
     # Reduce to the recent days, and the earlier days
-    recent_asc = s1_asc.filterDate(ref_date-datetime.timedelta(days=13),ref_date);
-    recent_desc = s1_desc.filterDate(ref_date-datetime.timedelta(days=13),ref_date);
+    recent_asc = s1_asc.filterDate(ref_date-datetime.timedelta(days=13),ref_date)
+    recent_desc = s1_desc.filterDate(ref_date-datetime.timedelta(days=13),ref_date)
     earlier_asc = s1_asc.filterDate(ref_date-datetime.timedelta(days=25), ref_date-datetime.timedelta(days=13))
     earlier_desc = s1_desc.filterDate(ref_date-datetime.timedelta(days=25), ref_date-datetime.timedelta(days=13))
 

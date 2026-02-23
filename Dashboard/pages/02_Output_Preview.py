@@ -74,7 +74,7 @@ if tif_files:
             wgs_bounds = transform_bounds(src.crs, 'EPSG:4326', *src.bounds)
             center = [(wgs_bounds[1] + wgs_bounds[3]) / 2, (wgs_bounds[0] + wgs_bounds[2]) / 2]
             fit_bounds = [[wgs_bounds[1], wgs_bounds[0]], [wgs_bounds[3], wgs_bounds[2]]]
-    except:
+    except (rasterio.errors.RasterioIOError, ValueError):
         pass
 
 # 8. Map Generation

@@ -116,7 +116,8 @@ for f in output_folders:
     try:
         folder_date = datetime.strptime(os.path.basename(f).replace("Outputs_", ""), "%Y-%m-%d")
         dated_folders.append((f, folder_date))
-    except: continue
+    except ValueError:
+        continue
 
 dated_folders.sort(key=lambda x: x[1], reverse=True)
 latest_folder = dated_folders[0][0] if dated_folders else None
@@ -134,7 +135,8 @@ if tif_files:
             wgs_bounds = transform_bounds(src.crs, 'EPSG:4326', *src.bounds)
             center = [(wgs_bounds[1] + wgs_bounds[3]) / 2, (wgs_bounds[0] + wgs_bounds[2]) / 2]
             fit_bounds = [[wgs_bounds[1], wgs_bounds[0]], [wgs_bounds[3], wgs_bounds[2]]]
-    except: pass
+    except (rasterio.errors.RasterioIOError, ValueError) as e:
+        st.warning(f"Could not read raster bounds: {e}")
 
 m = folium.Map(location=center, zoom_start=10)
 folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", 
@@ -226,8 +228,10 @@ if run_now_clicked:
         full_log += line
         status_container.code(full_log)
     
-    if process.wait() == 0: st.success("Manual run complete!")
-    else: st.error("Manual run failed.")
+    if process.wait() == 0: 
+        st.success("Manual run complete!")
+    else: 
+        st.error("Manual run failed.")
 
 # 9. Execution Task Scheduling
 if schedule_clicked:
