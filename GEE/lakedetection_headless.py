@@ -19,6 +19,10 @@ import io
 import json
 import glob
 import sys
+import numpy as np
+import rasterio
+from rasterio.features import shapes
+from sklearn.cluster import DBSCAN
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
@@ -90,6 +94,81 @@ def build_drive_service(service_account_path):
         cache_discovery=False, 
         static_discovery=False  # <--- Add this line
     )
+
+def cluster_processing(tif_path, timestamp, z_thres=-1.5, min_size_cluster=20, pix=3):
+    """
+    Performs DBSCAN clustering locally and saves results with a timestamped filename.
+    """
+    print(f"Starting cluster detection: {os.path.basename(tif_path)}", flush=True)
+    
+    with rasterio.open(tif_path) as src:
+        data = src.read(1).astype(float)
+        transform = src.transform
+        res_x, res_y = src.res 
+
+    # Mask positive values and find candidates
+    data = np.where(data <= 0, data, np.nan)
+    candidate = data <= z_thres
+    ys, xs = np.nonzero(candidate)
+    
+    if len(ys) == 0:
+        print("No suspicious patterns found.")
+        return None, None
+
+    coords = np.column_stack([ys, xs])
+    db = DBSCAN(eps=pix, min_samples=min_size_cluster).fit(coords)
+    labels = db.labels_
+    
+    labels_raster = np.full(candidate.shape, -1, dtype=int)
+    labels_raster[ys, xs] = labels.astype(int)
+
+    features = []
+    summary_data = "Cluster_ID,Pixel_Count,Area_m2,Centroid_Lon,Centroid_Lat\n"
+
+    for geom, val in shapes(labels_raster, mask=(labels_raster != -1), transform=transform):
+        lbl = int(val)
+        coords_list = geom['coordinates'][0]
+        lons = [p[0] for p in coords_list]
+        lats = [p[1] for p in coords_list]
+        center_lon = sum(lons) / len(lons)
+        center_lat = sum(lats) / len(lats)
+        
+        pix_count = int((labels_raster == lbl).sum())
+
+        # Area calculation
+        m_per_deg_lat = 111320
+        m_per_deg_lon = 111320 * math.cos(math.radians(center_lat))
+        pixel_area_m2 = abs(res_x * m_per_deg_lon) * abs(res_y * m_per_deg_lat)
+        total_area_m2 = pix_count * pixel_area_m2
+        
+        feature = {
+            "type": "Feature",
+            "properties": {
+                "cluster_id": lbl,
+                "pixel_count": pix_count,
+                "area_m2": round(total_area_m2, 0)
+            },
+            "geometry": geom
+        }
+        features.append(feature)
+        summary_data += f"{lbl},{pix_count},{round(total_area_m2, 0)},{center_lon:.6f},{center_lat:.6f}\n"
+
+    # Define paths with the shared timestamp
+    output_dir = os.path.dirname(tif_path)
+    poly_path = os.path.join(output_dir, f"detected_clusters_{timestamp}.geojson")
+    summary_path = os.path.join(output_dir, f"cluster_summary_{timestamp}.csv")
+
+    # Save Files
+    with open(poly_path, 'w') as f:
+        json.dump({"type": "FeatureCollection", "features": features}, f)
+
+
+
+    with open(summary_path, 'w') as f:
+        f.write(summary_data)
+
+    print("Clustering complete.", flush=True)
+    return poly_path, summary_path
 
 def export_and_download(images_to_export, reference_date, aoi, drive_service, output_root, timestamp):
     date_str = reference_date.strftime("%Y-%m-%d")
@@ -308,8 +387,19 @@ def run_pipeline(config_path):
     local_path = export_and_download(exports, ref_date, aoi, drive_service, cfg["output_root"], timestamp)
     convert_to_cog(local_path)
 
-    return "Processing successful"
 
+# ============================================================
+# Clustering
+# ============================================================    
+    # Identify the downloaded z-score file
+    z_score_files = glob.glob(os.path.join(local_path, "z_score*_cog.tif"))
+    if z_score_files:
+        z_score_tif = z_score_files[0]
+        
+        # Run local clustering - PASSING THE TIMESTAMP HERE
+        poly_file, summary_file = cluster_processing(z_score_tif, timestamp)
+            
+    return "Processing complete."
 
 # ============================================================
 # SCRIPT ENTRY
