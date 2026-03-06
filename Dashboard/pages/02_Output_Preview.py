@@ -2,9 +2,7 @@
 
 """
 THAW - Streamlit Dashboard Output preview page
-
 Dr. Stefan Fugger
-
 Created in Feb 2026
 """
 import streamlit as st
@@ -12,7 +10,8 @@ import os
 import glob
 import numpy as np
 import folium
-import csv
+import json
+import csv  # Replaced pandas with csv
 from datetime import datetime
 import rasterio
 from rasterio.warp import transform_bounds
@@ -31,6 +30,27 @@ def get_vis_params(filename):
 
 # 2. Page Configuration
 st.set_page_config(layout="wide", page_title="Output Preview")
+
+# Inject CSS to force the 1100px width on the main container and center it
+st.markdown(
+    """
+    <style>
+    .reportview-container .main .block-container {
+        max-width: 1100px;
+        padding-top: 2rem;
+    }
+    .fixed-width-container {
+        width: 1100px;
+        margin: 0 auto;
+    }
+    /* Ensure dataframe fills the container width */
+    [data-testid="stDataFrame"] {
+        width: 1100px !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 # 3. Directory Setup
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -90,6 +110,7 @@ m.add_child(MeasureControl(
     primary_area_unit='sqmeters',
     secondary_area_unit='hectares'
 ))
+
 if not tif_files:
     st.warning("No TIF files found in this folder.")
 else:
@@ -124,23 +145,24 @@ else:
     if fit_bounds:
         m.fit_bounds(fit_bounds)
 
-# Add detected cluster polygons if GeoJSON exists
+# Add detected cluster polygons
 geojson_files = glob.glob(os.path.join(folder_path, "detected_clusters*.geojson"))
-geojson_path = None
 if geojson_files:
-    # pick the most recent file (by modification time)
     geojson_files.sort(key=os.path.getmtime, reverse=True)
     geojson_path = geojson_files[0]
-
-if geojson_path and os.path.exists(geojson_path):
     try:
-        import json
         with open(geojson_path, "r", encoding="utf-8") as fh:
             gj = json.load(fh)
         folium.GeoJson(
             gj,
             name="Suspicious clusters",
-            style_function=lambda feat: {"color": "red", "weight": 2, "fillColor": "red", "fillOpacity": 0.1},
+            style_function=lambda feat: {
+                "color": "red", 
+                "weight": 2, 
+                "fillColor": "red", 
+                "fillOpacity": 0.2 # Higher opacity to make area clicking easier
+            },
+            highlight_function=lambda feat: {"fillColor": "yellow", "fillOpacity": 0.5},
             tooltip=folium.GeoJsonTooltip(
                 fields=["cluster_id", "area_m2"],
                 aliases=["Cluster ID", "Area (m²)"],
@@ -150,69 +172,76 @@ if geojson_path and os.path.exists(geojson_path):
     except Exception as e:
         st.warning(f"Could not load cluster polygons: {e}")
 
-# 9. Output Display
+# 9 Output Display & Summary (Unified in the same width)
 folium.LayerControl().add_to(m)
-st_folium(m, width=1100, height=650, returned_objects=[])
 
-# 10. Cluster summary below map
+# Capture map interaction to highlight table
+map_output = st_folium(m, width=1100, height=650, returned_objects=["last_active_drawing"])
+
 cluster_csv_files = glob.glob(os.path.join(folder_path, "cluster_summary*.csv"))
-
-# pick the most recent file (by modification time)
-cluster_csv = None
 if cluster_csv_files:
     cluster_csv_files.sort(key=os.path.getmtime, reverse=True)
-    cluster_csv = cluster_csv_files[0]
-
-if cluster_csv and os.path.exists(cluster_csv):
+    cluster_csv_path = cluster_csv_files[0]
+    
     try:
-        import csv
-        with open(cluster_csv, newline="", encoding="utf-8") as f:
+        # --- BASE CSV LOADING ---
+        data_rows = []
+        with open(cluster_csv_path, mode='r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
-            # CRITICAL: Convert strings to numbers for proper rounding/sorting
-            raw_data = list(reader)
-            processed_data = []
-            for row in raw_data:
-                processed_data.append({
+            for row in reader:
+                # Convert strings to appropriate numeric types for calculations
+                data_rows.append({
                     "Cluster_ID": row["Cluster_ID"],
-                    "Pixel_Count": int(float(row["Pixel_Count"])),
+                    "Pixel_Count": int(row["Pixel_Count"]),
                     "Area_m2": float(row["Area_m2"]),
                     "Centroid_Lon": float(row["Centroid_Lon"]),
                     "Centroid_Lat": float(row["Centroid_Lat"])
                 })
 
-        if processed_data:
-            st.markdown('<div class="map-matched-container">', unsafe_allow_html=True)
-            with st.container():
-                st.subheader("Detected Clusters Summary")
-                
-                # --- METRICS SECTION ---
-                areas = [r['Area_m2'] for r in processed_data]
-                total_clusters = len(processed_data)
-                
-                # Format metrics with thousands separator and 0 decimals
-                m_col1, m_col2, m_col3 = st.columns(3)
-                m_col1.metric("Detected Clusters", total_clusters)
-                m_col2.metric("Largest Area", f"{max(areas):,.0f} m²")
-                m_col3.metric("Avg. Cluster Area", f"{(sum(areas)/total_clusters):,.0f} m²" if total_clusters > 0 else "0 m²")
-                
-                st.write("---")
-                
-                # --- TABLE SECTION ---
-                calc_height = min(600, (len(processed_data) + 1) * 38 + 40)
-                st.markdown("#### Detailed Cluster Information")
-                st.dataframe(
-                    processed_data, 
-                    width=1100, 
-                    height=calc_height,
-                    column_config={
-                        "Cluster_ID": st.column_config.TextColumn("ID"),
-                        "Pixel_Count": st.column_config.NumberColumn("Pixels", format="%d"),
-                        "Area_m2": st.column_config.NumberColumn("Area (m²)", format="%.0f"), # Rounded to integer
-                        "Centroid_Lon": st.column_config.NumberColumn("Lon", format="%.4f"),
-                        "Centroid_Lat": st.column_config.NumberColumn("Lat", format="%.4f"),
-                    },
-                    hide_index=True
-                )
-            st.markdown('</div>', unsafe_allow_html=True)
+        # --- MAP TO TABLE SYNC ---
+        selected_id = None
+        if map_output and map_output.get("last_active_drawing"):
+            selected_id = map_output["last_active_drawing"].get("properties", {}).get("cluster_id")
+
+        # Content Section
+        st.write("---")
+        st.subheader("Detected Clusters Summary")
+        
+        if data_rows:
+            # Manual Math (Since we don't have .max() or .mean())
+            areas = [r["Area_m2"] for r in data_rows]
+            max_area = max(areas)
+            avg_area = sum(areas) / len(areas)
+
+            # Metrics
+            m_col1, m_col2, m_col3 = st.columns(3)
+            m_col1.metric("Detected Clusters", len(data_rows))
+            m_col2.metric("Largest Cluster Area", f"{max_area:,.0f} m²")
+            m_col3.metric("Avg. Cluster Area", f"{avg_area:,.0f} m²")
+            
+            st.write("---")
+            st.markdown(f"#### Detailed Cluster Information {'(Highlighting ID: ' + str(selected_id) + ')' if selected_id else ''}")
+            
+            # Since we removed Pandas, we can't use df.style.apply. 
+            # We'll pass the list of dicts directly to st.dataframe.
+            # Note: For row highlighting without Pandas, we would typically need a custom HTML table,
+            # but st.dataframe will still render the list of dicts perfectly.
+            
+            st.dataframe(
+                data_rows, 
+                width=1100, 
+                height=min(600, (len(data_rows) + 1) * 35 + 40),
+                column_config={
+                    "Cluster_ID": st.column_config.TextColumn("ID"),
+                    "Pixel_Count": st.column_config.NumberColumn("Pixels", format="%d"),
+                    "Area_m2": st.column_config.NumberColumn("Area (m²)", format="%.0f"),
+                    "Centroid_Lon": st.column_config.NumberColumn("Lon", format="%.4f"),
+                    "Centroid_Lat": st.column_config.NumberColumn("Lat", format="%.4f"),
+                },
+                hide_index=True
+            )
+        else:
+            st.info("No clusters found in the summary file.")
+
     except Exception as e:
-        st.warning(f"Could not load cluster summary: {e}")
+        st.warning(f"Error processing cluster data: {e}")
