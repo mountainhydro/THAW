@@ -70,7 +70,7 @@ def run_tracking_pipeline(config_path):
         cfg = json.load(f)
 
     # Pre-flight Directory Check
-    Path("thinning_cache").mkdir(parents=True, exist_ok=True)
+    Path("temp/thinning_cache").mkdir(parents=True, exist_ok=True)    
     Path("outputs").mkdir(parents=True, exist_ok=True) 
 
     ee.Initialize(project=cfg.get("project_id"))

@@ -267,7 +267,7 @@ def export_raster(data, meta, out_path):
         for i in range(data.shape[0]):
             dst.write(data[i], i+1)
         
-def get_glacier_thinning_correction(aoi_geom, sar_year, dem, dem_year=2000, cache_dir="thinning_cache"):
+def get_glacier_thinning_correction(aoi_geom, sar_year, dem, dem_year=2000, cache_dir="temp/thinning_cache"):
     """
     Computes glacier thinning correction for a given AOI and year by:
     - Determining intersecting tiles

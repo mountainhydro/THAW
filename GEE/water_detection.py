@@ -71,7 +71,7 @@ def save_lake_metrics_plot_and_csv(df, output_csv='lake_metrics.csv', output_png
     plt.tight_layout()
     plt.savefig(output_png)
 
-    print(f"✅ Saved plot to {output_png} and data to {output_csv}")
+    print(f"Saved plot to {output_png} and data to {output_csv}")
 
 def make_gif(image_paths, gif_path, fps=2):
     frames = [Image.open(img_path) for img_path in image_paths]
@@ -117,7 +117,7 @@ def generate_lake_metrics_report(
     aoi_ee = ensure_ee_geometry(aoi)  # where aoi_geojson is your raw geojson dict
 
     # 1. Compute lake metrics and time series
-    print("📊 Computing lake metrics...")
+    print("Computing lake metrics...")
     metrics_fc = extract_lake_area_timeseries(
         lake_likelihood_collection,
         aoi
@@ -317,7 +317,7 @@ def build_lake_monitoring_gif(out_dir, dates, areas_km2,
     # Basic sanity check
     count = len(dates)
     if any(len(files) < count for files in band_files.values()):
-        print("⚠️ Warning: Not enough files found for some bands compared to dates.")
+        print("Warning: Not enough files found for some bands compared to dates.")
 
     # Load font
     try:
@@ -330,7 +330,7 @@ def build_lake_monitoring_gif(out_dir, dates, areas_km2,
     for i in range(count):
         # Check all needed files exist
         if any(i >= len(band_files[band]) for band in bands):
-            print(f"⚠️ Missing files for date {dates[i]}, skipping frame.")
+            print(f"Missing files for date {dates[i]}, skipping frame.")
             continue
 
         # Load and normalize raw VV: scale [-20,0] to [0,1], grayscale
@@ -391,6 +391,6 @@ def build_lake_monitoring_gif(out_dir, dates, areas_km2,
             loop=0,
             optimize=True
         )
-        print(f"✅ GIF saved to: {gif_filename}")
+        print(f"GIF saved to: {gif_filename}")
     else:
-        print("⚠️ No frames generated. Check file inputs and dates.")
+        print("No frames generated. Check file inputs and dates.")

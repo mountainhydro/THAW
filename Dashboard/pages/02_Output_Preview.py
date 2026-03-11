@@ -24,7 +24,6 @@ import base64
 from io import BytesIO
 
 # --- 1. Function Definitions ---
-
 def load_gee_creds():
     """Reads stored GEE credentials from the temp file."""
     if os.path.exists(CRED_FILE):
