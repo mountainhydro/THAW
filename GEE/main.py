@@ -97,7 +97,7 @@ def main():
     )
     
     img_count = s1_preprocessed.size().getInfo()
-    print(f"✅ Found and preprocessed {img_count} Sentinel-1 images.", flush=True)
+    print(f"Found and preprocessed {img_count} Sentinel-1 images.", flush=True)
 
     if img_count == 0:
         print("WARNING: No imagery found for the specified period. Terminating.", flush=True)
@@ -126,7 +126,7 @@ def main():
     print("Generating lake metrics report and visualizations...", flush=True)
     generate_lake_metrics_report(s1_scored, aoi)
     
-    print(f"✅ SUCCESS: Analysis complete for clusters {selected_ids if selected_ids else 'all'}.", flush=True)
+    print(f"SUCCESS: Analysis complete for clusters {selected_ids if selected_ids else 'all'}.", flush=True)
 
 if __name__ == "__main__":
     main()
