@@ -19,6 +19,7 @@ import rasterio
 from rasterio.warp import transform_bounds
 from streamlit_folium import st_folium
 from folium.plugins import MeasureControl, Draw
+from tracking_viewer import render_tracking_viewer
 import matplotlib.pyplot as plt
 import base64
 from io import BytesIO
@@ -294,3 +295,6 @@ else:
     st.sidebar.warning("Draw a rectangle on the map to define the target area.")
 
 folium.LayerControl().add_to(m)
+
+# timetracking viewer
+render_tracking_viewer(folder_path)
