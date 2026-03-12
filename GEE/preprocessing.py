@@ -9,6 +9,7 @@ import math
 import os
 
 def preprocess_s1_collection(aoi, start_date, end_date, slope_rad, dem, aspect, glacier_geom, terrain_mask, thinning_correction=0.0):
+    thinning_correction = float(thinning_correction)
     import math
     import ee
     aoi_ee = aoi

@@ -56,14 +56,14 @@ def load_aoi(aoi_input):
         raise ValueError("Unsupported AOI input format. Must be a file path, GeoJSON string, or bounding box list.")
 
 def load_dem(aoi, dem_source='JAXA/ALOS/AW3D30/V4_1'):
-    dem = ee.ImageCollection(dem_source).select('DSM').mosaic().clip(aoi)
+    dem = ee.Image(dem_source).select('DSM').clip(aoi)
     slope = ee.Terrain.slope(dem.focal_median(4))
     aspect = ee.Terrain.aspect(dem)
     terrain_mask = slope.focal_min(8).lt(6)
 
     return dem, slope, aspect, terrain_mask
 
-def load_glacier_mask(aoi, buffer_m=200):
+def load_glacier_mask(aoi, buffer_m=200, output_dir="outputs"):
     """
     Loads the GLIMS glacier outlines within the AOI and returns a single geometry
     buffered and clipped to the AOI.
@@ -71,6 +71,7 @@ def load_glacier_mask(aoi, buffer_m=200):
     Parameters:
         aoi (ee.Geometry): Area of interest
         buffer_m (int): Buffer distance in meters
+        output_dir (str): Directory to write glacier_geom.geojson into
 
     Returns:
         ee.Geometry: Buffered and clipped union of glacier outlines
@@ -85,8 +86,10 @@ def load_glacier_mask(aoi, buffer_m=200):
     clipped = unioned.intersection(aoi)
 
     # Export shapefile for inspection
+    os.makedirs(output_dir, exist_ok=True)
     shapely_glacier_geom = ee_to_shapely(clipped)
-    export_glacier_polygon(shapely_glacier_geom, crs_epsg=4326, output_path="outputs/glacier_geom.geojson")
+    export_glacier_polygon(shapely_glacier_geom, crs_epsg=4326,
+                           output_path=os.path.join(output_dir, "glacier_geom.geojson"))
 
     return clipped
 
@@ -108,10 +111,14 @@ def export_glacier_polygon(shapely_geom, crs_epsg=4326, output_path="glacier_geo
     print(f"Glacier polygon exported to {output_path}")
 
 def download_tiff_tile(tile_url, download_path):
-    """Download GeoTIFF tile if not present"""
+    """Download GeoTIFF tile if not present or if existing file is empty/corrupted."""
     if os.path.exists(download_path):
-        print(f"File {download_path} already exists, skipping download.")
-        return download_path
+        if os.path.getsize(download_path) > 0:
+            print(f"File {download_path} already exists, skipping download.")
+            return download_path
+        else:
+            print(f"File {download_path} exists but is empty. Re-downloading...")
+            os.remove(download_path)
 
     print(f"Downloading {tile_url} ...")
     r = requests.get(tile_url, stream=True)
@@ -267,7 +274,8 @@ def export_raster(data, meta, out_path):
         for i in range(data.shape[0]):
             dst.write(data[i], i+1)
         
-def get_glacier_thinning_correction(aoi_geom, sar_year, dem, dem_year=2000, cache_dir="temp/thinning_cache"):
+def get_glacier_thinning_correction(aoi_geom, sar_year, dem, dem_year=2000,
+                                    cache_dir="thinning_cache", output_dir="outputs"):
     """
     Computes glacier thinning correction for a given AOI and year by:
     - Determining intersecting tiles
@@ -276,12 +284,18 @@ def get_glacier_thinning_correction(aoi_geom, sar_year, dem, dem_year=2000, cach
 
     Parameters:
         aoi_geom (ee.Geometry): Area of interest (can be glacier-restricted)
-        year (int): Target year for scaling thinning
+        sar_year (int): Target year for scaling thinning
+        dem: DEM image (unused directly, kept for signature compatibility)
+        dem_year (int): Base year of the DEM (default 2000)
         cache_dir (str): Directory to cache/download raster tiles
+        output_dir (str): Directory to write clipped thinning rasters into
 
     Returns:
         float: Scaled mean thinning for the AOI and specified year
     """
+    os.makedirs(cache_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+
     tile_names = get_tile_names_for_geometry(aoi_geom)
     print(f"Tiles intersecting AOI: {tile_names}")
 
@@ -296,7 +310,8 @@ def get_glacier_thinning_correction(aoi_geom, sar_year, dem, dem_year=2000, cach
         # Clip thinning raster to AOI
         clipped_data, clipped_meta = clip_raster_to_aoi(local_tif, aoi_geom)
 
-        export_raster(clipped_data, clipped_meta, f"outputs/clipped_thinning_{tile_name}.tif")
+        export_raster(clipped_data, clipped_meta,
+                      os.path.join(output_dir, f"clipped_thinning_{tile_name}.tif"))
 
         # Ensure data is 2D (single band)
         if clipped_data.ndim == 3 and clipped_data.shape[0] == 1:
