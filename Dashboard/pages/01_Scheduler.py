@@ -33,7 +33,12 @@ def load_gee_creds():
 def mark_frequency_changed():
     st.session_state.frequency_changed = True
 
-def write_job_config(is_manual=True):
+def sanitize_name(name: str) -> str:
+    """Strip characters that are invalid in folder names and collapse spaces."""
+    safe = "".join(c for c in name if c.isalnum() or c in (" ", "-", "_")).strip()
+    return safe.replace(" ", "_")
+
+def write_job_config(is_manual=True, task_name=""):
     aoi_filename = "now_aoi.geojson" if is_manual else "sch_aoi.geojson"
     aoi_p = os.path.join(CONFIG_DIR, aoi_filename)
 
@@ -48,12 +53,18 @@ def write_job_config(is_manual=True):
             f,
         )
 
+    safe_name = sanitize_name(task_name)
+
     cfg = {
         "run_date": run_date.isoformat() if is_manual else "today",
-        "aoi_geojson": aoi_p,  # <-- now points to correct AOI
+        "aoi_geojson": aoi_p,
         "project_id": project_id,
         "service_account_path": service_account_path,
+        # output_root stays as the plain parent folder; lakedetection_headless.py
+        # appends its own Outputs_YYYY-MM-DD subfolder. task_name is passed
+        # separately so the headless script can suffix that folder name.
         "output_root": OUTPUT_DIR,
+        "task_name": safe_name,
     }
 
     cfg_file = "now_config.json" if is_manual else "sch_config.json"
@@ -88,7 +99,6 @@ def calculate_bbox_area_km2(geometry):
     return abs(width * height)
 
 
-
 # 2. Directory Setup
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__)) 
 DASH_DIR = os.path.dirname(CURRENT_DIR)                 
@@ -110,11 +120,14 @@ if not project_id:
     st.stop()
 
 # 4. Data Discovery
+# Folder names may now be "Outputs_YYYY-MM-DD" or "Outputs_YYYY-MM-DD_Name";
+# extract the date from the first 10 characters after the "Outputs_" prefix.
 output_folders = glob.glob(os.path.join(OUTPUT_DIR, "Outputs_*"))
 dated_folders = []
 for f in output_folders:
     try:
-        folder_date = datetime.strptime(os.path.basename(f).replace("Outputs_", ""), "%Y-%m-%d")
+        suffix = os.path.basename(f).replace("Outputs_", "", 1)
+        folder_date = datetime.strptime(suffix[:10], "%Y-%m-%d")
         dated_folders.append((f, folder_date))
     except ValueError:
         continue
@@ -170,14 +183,40 @@ if draw_data and draw_data.get("all_drawings"):
             + " | ".join(flat_coords) + "..."
         )
 
+# ── Shared Task Name ──────────────────────────────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🏷️ Task Name")
+task_name_raw = st.sidebar.text_input(
+    "Name",
+    placeholder="e.g. Himalaya_Survey",
+    help="Used in the output folder name: Outputs_YYYY-MM-DD_Name",
+    label_visibility="collapsed",
+)
+task_name_safe = sanitize_name(task_name_raw)
+has_name = bool(task_name_safe)
+
+if task_name_raw and not has_name:
+    st.sidebar.warning("Name contains only invalid characters. Use letters, numbers, hyphens or underscores.")
+elif has_name:
+    run_date_preview = dt_date.today().isoformat()
+    st.sidebar.caption(f"Output folder: `Outputs_{run_date_preview}_{task_name_safe}`")
+st.sidebar.markdown("---")
+
 # 6. Sidebar Manual Run
 st.sidebar.header("▶ Manual Run")
 run_date = st.sidebar.date_input("Processing Date", value=dt_date.today(), max_value=dt_date.today())
 
+missing_now = []
 if not aoi_geojson:
-    st.sidebar.warning("Please draw an AOI on the map to run a manual job.")
+    missing_now.append("Draw an AOI on the map")
+if not has_name:
+    missing_now.append("Enter a Task Name above")
 
-run_now_clicked = st.sidebar.button("Run job now", disabled=not aoi_geojson)
+if missing_now:
+    for msg in missing_now:
+        st.sidebar.warning(f"⚠ {msg}")
+
+run_now_clicked = st.sidebar.button("▶ Run job now", disabled=bool(missing_now))
 st.sidebar.markdown("---")
 
 # 7. Sidebar Scheduling
@@ -202,22 +241,24 @@ time_of_day = st.sidebar.selectbox("Time of day", time_options)
 
 missing_sch = []
 if not aoi_geojson:
-    missing_sch.append("Please draw an AOI on the map")
+    missing_sch.append("Draw an AOI on the map")
+if not has_name:
+    missing_sch.append("Enter a Task Name above")
 if not st.session_state.frequency_changed:
-    missing_sch.append("Please adjust/confirm frequency settings")
+    missing_sch.append("Adjust/confirm frequency settings")
 
 if missing_sch:
-    st.sidebar.markdown("### Required for Scheduling")
+    st.sidebar.markdown("**Required for Scheduling:**")
     for msg in missing_sch:
-        st.sidebar.warning(msg)
+        st.sidebar.warning(f"⚠ {msg}")
 else:
     st.sidebar.success("All required inputs provided.")
 
-schedule_clicked = st.sidebar.button("Schedule job", disabled=len(missing_sch) > 0)
+schedule_clicked = st.sidebar.button("📅 Schedule job", disabled=bool(missing_sch))
 
 # 8. Execution Manual Job
 if run_now_clicked:
-    cfg_p = write_job_config(is_manual=True)
+    cfg_p = write_job_config(is_manual=True, task_name=task_name_safe)
     status_container = st.empty()
     script_p = os.path.join(GEE_DIR, "lakedetection_headless.py")
     
@@ -235,9 +276,9 @@ if run_now_clicked:
 
 # 9. Execution Task Scheduling
 if schedule_clicked:
-    cfg_p = write_job_config(is_manual=False)
+    cfg_p = write_job_config(is_manual=False, task_name=task_name_safe)
     script_p = os.path.join(GEE_DIR, "lakedetection_headless.py")
-    task_name = f"LakeDetection_{frequency}"
+    task_name = f"LakeDetection_{frequency}_{task_name_safe}"
     python_exe = sys.executable
     
     day_map = {"Monday":"MON","Tuesday":"TUE","Wednesday":"WED","Thursday":"THU","Friday":"FRI","Saturday":"SAT","Sunday":"SUN"}

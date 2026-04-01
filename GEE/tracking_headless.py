@@ -99,7 +99,7 @@ def run_tracking_pipeline(config_path):
     print(f"Time Range:   {start_date} to {end_date}", flush=True)
     print(f"AOI BBox:     {aoi_input}", flush=True)
     print(f"Output dir:   {final_out_dir_str}", flush=True)
-    print(f"---------------------------------------", flush=True)
+    print("---------------------------------------", flush=True)
 
     # --- 3c. Initialise GEE using project_id from config ---
     try:

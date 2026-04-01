@@ -22,6 +22,7 @@ import sys
 import numpy as np
 import rasterio
 from rasterio.features import shapes
+from rasterio.warp import transform_geom
 from sklearn.cluster import DBSCAN
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -95,7 +96,7 @@ def build_drive_service(service_account_path):
         static_discovery=False  # <--- Add this line
     )
 
-def cluster_processing(tif_path, timestamp, z_thres=-1.5, min_size_cluster=20, pix=3):
+def cluster_processing(tif_path, timestamp, z_thres=-2, min_size_cluster=20, pix=6):
     """
     Performs DBSCAN clustering locally and saves results with a timestamped filename.
     """
@@ -104,7 +105,8 @@ def cluster_processing(tif_path, timestamp, z_thres=-1.5, min_size_cluster=20, p
     with rasterio.open(tif_path) as src:
         data = src.read(1).astype(float)
         transform = src.transform
-        res_x, res_y = src.res 
+        res_x, res_y = src.res
+        src_crs = src.crs
 
     # Mask positive values and find candidates
     data = np.where(data <= 0, data, np.nan)
@@ -127,20 +129,27 @@ def cluster_processing(tif_path, timestamp, z_thres=-1.5, min_size_cluster=20, p
 
     for geom, val in shapes(labels_raster, mask=(labels_raster != -1), transform=transform):
         lbl = int(val)
-        coords_list = geom['coordinates'][0]
+
+        # Reproject from raster native CRS (e.g. UTM) to WGS84 so Folium renders correctly
+        geom_wgs84 = transform_geom(src_crs, "EPSG:4326", geom)
+
+        coords_list = geom_wgs84['coordinates'][0]
         lons = [p[0] for p in coords_list]
         lats = [p[1] for p in coords_list]
         center_lon = sum(lons) / len(lons)
         center_lat = sum(lats) / len(lats)
-        
+
         pix_count = int((labels_raster == lbl).sum())
 
-        # Area calculation
-        m_per_deg_lat = 111320
-        m_per_deg_lon = 111320 * math.cos(math.radians(center_lat))
-        pixel_area_m2 = abs(res_x * m_per_deg_lon) * abs(res_y * m_per_deg_lat)
+        # Use native projected pixel size (metres) if CRS is projected, else degree approximation
+        if src_crs.is_projected:
+            pixel_area_m2 = abs(res_x) * abs(res_y)
+        else:
+            m_per_deg_lat = 111320
+            m_per_deg_lon = 111320 * math.cos(math.radians(center_lat))
+            pixel_area_m2 = abs(res_x * m_per_deg_lon) * abs(res_y * m_per_deg_lat)
         total_area_m2 = pix_count * pixel_area_m2
-        
+
         feature = {
             "type": "Feature",
             "properties": {
@@ -148,7 +157,7 @@ def cluster_processing(tif_path, timestamp, z_thres=-1.5, min_size_cluster=20, p
                 "pixel_count": pix_count,
                 "area_m2": round(total_area_m2, 0)
             },
-            "geometry": geom
+            "geometry": geom_wgs84
         }
         features.append(feature)
         summary_data += f"{lbl},{pix_count},{round(total_area_m2, 0)},{center_lon:.6f},{center_lat:.6f}\n"
@@ -170,9 +179,10 @@ def cluster_processing(tif_path, timestamp, z_thres=-1.5, min_size_cluster=20, p
     print("Clustering complete.", flush=True)
     return poly_path, summary_path
 
-def export_and_download(images_to_export, reference_date, aoi, drive_service, output_root, timestamp):
+def export_and_download(images_to_export, reference_date, aoi, drive_service, output_root, timestamp, task_name=""):
     date_str = reference_date.strftime("%Y-%m-%d")
-    local_dir = os.path.join(output_root, f'Outputs_{date_str}')
+    name_suffix = f"_{task_name}" if task_name else ""
+    local_dir = os.path.join(output_root, f'Outputs_{date_str}{name_suffix}')
     os.makedirs(local_dir, exist_ok=True)
 
     task_list = []
@@ -270,7 +280,9 @@ def run_pipeline(config_path):
     doy = ref_date.timetuple().tm_yday
     
     date_str = ref_date.strftime("%Y-%m-%d")
-    local_dir = os.path.join(cfg["output_root"], f'Outputs_{date_str}')
+    task_name = cfg.get("task_name", "")
+    name_suffix = f"_{task_name}" if task_name else ""
+    local_dir = os.path.join(cfg["output_root"], f'Outputs_{date_str}{name_suffix}')
     os.makedirs(local_dir, exist_ok=True)
 
     # logging of console outputs
@@ -384,15 +396,18 @@ def run_pipeline(config_path):
         "mean_diff": masked_diff.toFloat()
     }
 
-    local_path = export_and_download(exports, ref_date, aoi, drive_service, cfg["output_root"], timestamp)
+    local_path = export_and_download(exports, ref_date, aoi, drive_service, cfg["output_root"], timestamp, task_name)
     convert_to_cog(local_path)
 
 
 # ============================================================
 # Clustering
 # ============================================================    
-    # Identify the downloaded z-score file
-    z_score_files = glob.glob(os.path.join(local_path, "z_score*_cog.tif"))
+    # Identify the downloaded z-score file — use the ORIGINAL (non-COG) for clustering
+    # so that shapes() uses the unmodified geotransform. cog_translate can silently
+    # adjust the origin to align with its tile grid, introducing a sub-pixel shift.
+    z_score_files = glob.glob(os.path.join(local_path, "z_score*.tif"))
+    z_score_files = [f for f in z_score_files if not f.endswith("_cog.tif")]
     if z_score_files:
         z_score_tif = z_score_files[0]
         

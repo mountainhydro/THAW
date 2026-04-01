@@ -16,13 +16,14 @@ import subprocess
 import sys
 from datetime import datetime, timedelta
 import rasterio
-from rasterio.warp import transform_bounds
+from rasterio.warp import transform_bounds, calculate_default_transform, reproject, Resampling
+from rasterio.crs import CRS as RioCRS
 from streamlit_folium import st_folium
-from folium.plugins import MeasureControl, Draw
+from folium.plugins import MeasureControl, Draw, Fullscreen
 from tracking_viewer import render_tracking_viewer
 import matplotlib.pyplot as plt
 import base64
-from io import BytesIO
+from PIL import Image
 
 # --- 1. Function Definitions ---
 def load_gee_creds():
@@ -39,6 +40,54 @@ def get_vis_params(filename):
         if key in filename:
             return vis
     return {'min': -30, 'max': 0, 'palette': 'gray'}
+
+def make_combined_legend(layers_present, vis_by_layer):
+    """Single semi-transparent box with one gradient bar per visible layer."""
+    LAYER_META = {
+        "z_score":         dict(title="Z-Score",        unit=""),
+        "potential_water": dict(title="Potential Water", unit=""),
+        "mean_diff":       dict(title="Mean Diff",       unit=" dB"),
+    }
+    steps = 5
+    blocks = ""
+    for key, meta in LAYER_META.items():
+        if key not in layers_present:
+            continue
+        vis  = vis_by_layer[key]
+        cmap = plt.get_cmap(vis["palette"])
+        stops = ", ".join(
+            "#{:02x}{:02x}{:02x}".format(
+                int(cmap(k/steps)[0]*255),
+                int(cmap(k/steps)[1]*255),
+                int(cmap(k/steps)[2]*255),
+            )
+            for k in range(steps + 1)
+        )
+        blocks += (
+            '<div style="margin-bottom:10px;">'
+            f'<div style="font-size:12px;font-weight:bold;margin-bottom:3px;">{meta["title"]}</div>'
+            f'<div style="height:12px;width:160px;background:linear-gradient(to right,{stops});'
+            'border:1px solid #aaa;border-radius:2px;"></div>'
+            '<div style="display:flex;justify-content:space-between;width:160px;">'
+            f'<span style="font-size:10px;">{vis["min"]}{meta["unit"]}</span>'
+            f'<span style="font-size:10px;">{(vis["min"]+vis["max"])/2:.1f}{meta["unit"]}</span>'
+            f'<span style="font-size:10px;">{vis["max"]}{meta["unit"]}</span>'
+            '</div></div>'
+        )
+    if not blocks:
+        return None
+    html = (
+        '<div style="position:fixed;bottom:40px;left:50px;z-index:9999;'
+        'background:rgba(255,255,255,0.82);border:1px solid #bbb;'
+        'border-radius:8px;padding:10px 14px;font-family:Arial,sans-serif;'
+        'pointer-events:none;min-width:190px;">'
+        '<div style="font-size:13px;font-weight:bold;margin-bottom:8px;'
+        'border-bottom:1px solid #ccc;padding-bottom:4px;">Legend</div>'
+        + blocks +
+        '</div>'
+    )
+    return folium.Element(html)
+
 
 def write_timetrack_config(folder_path, aoi, start_date, end_date, selected_ids, proj_id, sa_path):
     """
@@ -110,10 +159,15 @@ VIS_BY_LAYER = {
 }
 
 output_folders = glob.glob(os.path.join(OUTPUT_DIR, "Outputs_*"))
-dated_folders = sorted([
-    (f, datetime.strptime(os.path.basename(f).replace("Outputs_", ""), "%Y-%m-%d"))
-    for f in output_folders if "Outputs_" in f
-], key=lambda x: x[1], reverse=True)
+dated_folders = []
+for f in output_folders:
+    try:
+        suffix = os.path.basename(f).replace("Outputs_", "", 1)
+        folder_date = datetime.strptime(suffix[:10], "%Y-%m-%d")
+        dated_folders.append((f, folder_date))
+    except ValueError:
+        continue
+dated_folders.sort(key=lambda x: x[1], reverse=True)
 
 if not dated_folders:
     st.info("No data found.")
@@ -155,32 +209,90 @@ draw = Draw(
 ).add_to(m)
 m.add_child(MeasureControl(position='topleft'))
 
+from io import BytesIO
+
+_MERCATOR = RioCRS.from_epsg(3857)
+
+@st.cache_data(show_spinner=False)
+def _render_tif(tif_path, vis_min, vis_max, palette, mask_below_zero, mtime):
+    """Reproject to Web Mercator, colourise, encode PNG. Cached by (path, mtime)."""
+    try:
+        with rasterio.open(tif_path) as src:
+            dst_transform, dst_w, dst_h = calculate_default_transform(
+                src.crs, _MERCATOR, src.width, src.height, *src.bounds)
+            raw = src.read(1).astype(np.float32)
+            if src.nodata is not None:
+                raw[raw == src.nodata] = np.nan
+            if mask_below_zero:
+                raw[raw < 0] = np.nan  # sub-zero = non-water, treat as nodata
+            dst = np.full((dst_h, dst_w), np.nan, dtype=np.float32)
+            reproject(
+                source=raw, destination=dst,
+                src_transform=src.transform, src_crs=src.crs,
+                dst_transform=dst_transform, dst_crs=_MERCATOR,
+                resampling=Resampling.bilinear,
+                src_nodata=np.nan, dst_nodata=np.nan,
+            )
+        merc_w = dst_transform.c
+        merc_n = dst_transform.f
+        merc_e = merc_w + dst_transform.a * dst_w
+        merc_s = merc_n + dst_transform.e * dst_h
+        tb = transform_bounds(_MERCATOR, 'EPSG:4326', merc_w, merc_s, merc_e, merc_n)
+        nodata_mask = np.isnan(dst)
+        norm = np.clip((dst - vis_min) / (vis_max - vis_min), 0, 1)
+        norm[nodata_mask] = 0.0
+        cmap = plt.get_cmap(palette)
+        rgba = (cmap(norm) * 255).astype(np.uint8)
+        rgba[nodata_mask, 3] = 0
+        img_io = BytesIO()
+        Image.fromarray(rgba, mode='RGBA').save(img_io, format='PNG')
+        img_io.seek(0)
+        return base64.b64encode(img_io.read()).decode(), tb[1], tb[0], tb[3], tb[2]
+    except Exception:
+        return None
+
 # Add TIF Layers
 if tif_files:
-    for tif in tif_files:
-        basename = os.path.basename(tif)
-        vis = get_vis_params(basename)
-        try:
-            with rasterio.open(tif) as src:
-                tb = transform_bounds(src.crs, 'EPSG:4326', *src.bounds)
-                data = src.read(1).astype(float)
-                data[data == src.nodata] = np.nan
-                norm_data = np.clip((data - vis['min']) / (vis['max'] - vis['min']), 0, 1)
-                cmap = plt.get_cmap(vis['palette'])
-                rgba_img = cmap(norm_data, bytes=True)
-                img_io = BytesIO()
-                plt.imsave(img_io, rgba_img, format='png')
-                img_io.seek(0)
-                img_b64 = base64.b64encode(img_io.read()).decode()
+    with st.spinner("Loading map layers, please wait..."):
+        for tif in tif_files:
+            basename = os.path.basename(tif)
+            vis = get_vis_params(basename)
+            result = _render_tif(tif, vis['min'], vis['max'], vis['palette'],
+                                 'potential_water' in basename, os.path.getmtime(tif))
+            if result:
+                img_b64, south, west, north, east = result
                 folium.raster_layers.ImageOverlay(
                     image=f"data:image/png;base64,{img_b64}",
-                    bounds=[[tb[1], tb[0]], [tb[3], tb[2]]],
+                    bounds=[[south, west], [north, east]],
                     name=basename, opacity=0.7, interactive=False
                 ).add_to(m)
-        except:
-            pass
     if fit_bounds:
         m.fit_bounds(fit_bounds)
+
+# Combined colour legend
+layers_present = [k for k in VIS_BY_LAYER if any(k in os.path.basename(t) for t in tif_files)]
+leg = make_combined_legend(layers_present, VIS_BY_LAYER)
+if leg:
+    m.get_root().html.add_child(leg)
+
+# Dashed bounding box derived from the first raw backscatter TIF in tracking results
+tracking_raw_tifs = sorted(glob.glob(os.path.join(folder_path, "tracking_results", "*VV_raw*.tif")))
+if tracking_raw_tifs:
+    try:
+        with rasterio.open(tracking_raw_tifs[0]) as _src:
+            _b = transform_bounds(_src.crs, "EPSG:4326", *_src.bounds)
+        _xmin, _ymin, _xmax, _ymax = _b
+        folium.Rectangle(
+            bounds=[[_ymin, _xmin], [_ymax, _xmax]],
+            color="#FF6B00",
+            weight=2,
+            dash_array="8 6",
+            fill=False,
+            tooltip="Tracking analysis AOI",
+            name="Tracking AOI",
+        ).add_to(m)
+    except Exception:
+        pass
 
 # Handle Clusters GeoJson
 geojson_files = glob.glob(os.path.join(folder_path, "detected_clusters*.geojson"))
@@ -193,7 +305,14 @@ if geojson_files:
         tooltip=folium.GeoJsonTooltip(fields=["cluster_id", "area_m2"], aliases=["ID", "Area"])
     ).add_to(m)
 
-map_output = st_folium(m, width=1100, height=650, returned_objects=["all_drawings"])
+Fullscreen(
+    position="topright",
+    title="Expand map",
+    title_cancel="Exit fullscreen",
+    force_separate_button=True,
+).add_to(m)
+folium.LayerControl(collapsed=False).add_to(m)
+map_output = st_folium(m, width="100%", height=620, returned_objects=["all_drawings"])
 
 # --- 7. Data Sync & Table ---
 cluster_csv_files = glob.glob(os.path.join(folder_path, "cluster_summary*.csv"))
@@ -242,9 +361,11 @@ if data_rows:
 
 st.dataframe(data_rows, width=1100, height=400, hide_index=True)
 
+
 # --- 8. Progress Tracking & Execution ---
 st.write("### Analysis Progress")
 progress_container = st.empty()
+progress_container.info("No time tracking analysis running, or running in the background. *(Refreshing stops streaming of messages — an issue to fix.)*")
 
 st.sidebar.header("Cluster tracking over time")
 if drawn_aoi:
@@ -292,9 +413,8 @@ if drawn_aoi:
         except Exception as e:
             st.sidebar.error(f"Error: {e}")
 else:
-    st.sidebar.warning("Draw a rectangle on the map to define the target area.")
+    st.sidebar.warning("Draw an area of interest on the map to define the target area for time tracking analysis.")
 
-folium.LayerControl().add_to(m)
 
 # timetracking viewer
 render_tracking_viewer(folder_path)
