@@ -55,12 +55,11 @@ def load_aoi(aoi_input):
     else:
         raise ValueError("Unsupported AOI input format. Must be a file path, GeoJSON string, or bounding box list.")
 
-def load_dem(aoi, dem_source='JAXA/ALOS/AW3D30/V4_1'):
-    dem = ee.Image(dem_source).select('DSM').clip(aoi)
+def load_dem(aoi, dem_source='JAXA/ALOS/AW3D30/V2_2'):
+    dem = ee.Image(dem_source).select('AVE_DSM').clip(aoi)
     slope = ee.Terrain.slope(dem.focal_median(4))
     aspect = ee.Terrain.aspect(dem)
     terrain_mask = slope.focal_min(8).lt(6)
-
     return dem, slope, aspect, terrain_mask
 
 def load_glacier_mask(aoi, buffer_m=200, output_dir="outputs"):
