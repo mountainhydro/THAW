@@ -1,11 +1,5 @@
 # -*- coding: utf-8 -*-
 import re as _re
-
-"""
-THAW - Streamlit Dashboard Output preview page
-Dr. Stefan Fugger
-Created in Feb 2026
-"""
 import streamlit as st
 import os
 import glob
@@ -90,7 +84,7 @@ def make_combined_legend(layers_present, vis_by_layer):
     return folium.Element(html)
 
 
-def write_timetrack_config(folder_path, aoi, start_date, end_date, selected_ids, proj_id, sa_path):
+def write_timetrack_config(folder_path, aoi, start_date, end_date, selected_ids, proj_id, drive_token_path):
     """
     Saves config using relative paths and GEE auth info to ensure transferability.
     """
@@ -106,7 +100,7 @@ def write_timetrack_config(folder_path, aoi, start_date, end_date, selected_ids,
         "cluster_ids": selected_ids,
         "rel_output_dir": rel_output_path, 
         "project_id": proj_id,
-        "service_account_path": sa_path,
+        "drive_token_path": drive_token_path,
         "processed_at": datetime.now().isoformat()
     }
     
@@ -121,13 +115,14 @@ DASH_DIR = os.path.dirname(CURRENT_DIR)
 ROOT_DIR = os.path.dirname(DASH_DIR)                    
 TEMP_DIR = os.path.join(ROOT_DIR, "temp")
 CRED_FILE = os.path.join(TEMP_DIR, "gee_credentials.txt")
+DRIVE_TOKEN_FILE = os.path.join(TEMP_DIR, "drive_token.json")
 GEE_DIR = os.path.join(ROOT_DIR, "GEE")
 OUTPUT_DIR = os.path.join(ROOT_DIR, "Outputs")
 CONFIG_DIR = os.path.join(ROOT_DIR, "config")
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
 # Load GEE Credentials (Same as Scheduler)
-project_id, service_account_path = load_gee_creds()
+project_id, _ = load_gee_creds()
 
 # --- 3. Page Configuration ---
 st.set_page_config(layout="wide", page_title="Output Preview")
@@ -405,7 +400,7 @@ if drawn_aoi:
             # 1. Write Config (Includes Credentials)
             cfg_p = write_timetrack_config(folder_path, drawn_aoi, calc_start, 
                                            selected_folder_date, selected_ids, 
-                                           project_id, service_account_path)
+                                           project_id, DRIVE_TOKEN_FILE)
             
             # 2. Path to script
             script_rel_path = os.path.join("GEE", "tracking_headless.py")

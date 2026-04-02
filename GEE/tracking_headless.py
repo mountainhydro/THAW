@@ -101,19 +101,26 @@ def run_tracking_pipeline(config_path):
     print(f"Output dir:   {final_out_dir_str}", flush=True)
     print("---------------------------------------", flush=True)
 
-    # --- 3c. Initialise GEE using project_id from config ---
+    # --- 3c. Initialise GEE using OAuth token ---
+    drive_token_path = cfg.get("drive_token_path")
     try:
-        ee.Initialize(project=project_id)
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        creds = Credentials.from_authorized_user_file(drive_token_path)
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            with open(drive_token_path, "w") as f:
+                f.write(creds.to_json())
+        ee.Initialize(credentials=creds, project=project_id)
         print(f"GEE initialised (project: {project_id})", flush=True)
     except Exception as e:
         print(f"CRITICAL: GEE initialisation failed: {e}", flush=True)
         sys.exit(1)
 
-    # --- 3d. Build Google Drive service using saved OAuth token ---
-    drive_token_path = cfg.get("drive_token_path")
+    # --- 3d. Build Google Drive service using the same OAuth token ---
     try:
-        from water_detection import _build_user_drive_service
-        drive_service = _build_user_drive_service(drive_token_path)
+        from googleapiclient.discovery import build as build_gdrive
+        drive_service = build_gdrive("drive", "v3", credentials=creds, cache_discovery=False, static_discovery=False)
         print("Google Drive service initialised.", flush=True)
     except Exception as e:
         print(f"CRITICAL: Could not build Drive service: {e}", flush=True)

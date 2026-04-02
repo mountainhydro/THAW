@@ -6,9 +6,14 @@ Created on Tue Jul 22 13:15:11 2025
 """
 from datetime import datetime
 import matplotlib.dates as mdates
+import os
+import io
+import time
 
 import ee
 from shapely.geometry import mapping
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
 def simple_threshold(image, threshold=-14):
     vv = image.select('VV_dB')
@@ -249,8 +254,8 @@ def _build_user_drive_service(token_path):
 
 def _delete_drive_files(token_path, file_ids):
     """
-    Moves a list of Google Drive files to trash using the user's OAuth credentials.
-    GEE exports are owned by the authenticated user; only the owner can trash them.
+    Permanently deletes a list of Google Drive files by file ID.
+    Uses the user's OAuth credentials — as file owner, permanent deletion is permitted.
     Errors are logged but do not raise so a cleanup failure never aborts the pipeline.
     """
     try:
@@ -260,10 +265,10 @@ def _delete_drive_files(token_path, file_ids):
         return
     for fid in file_ids:
         try:
-            drive.files().update(fileId=fid, body={"trashed": True}).execute()
-            print(f"Trashed Drive file: {fid}", flush=True)
+            drive.files().delete(fileId=fid).execute()
+            print(f"Deleted Drive file: {fid}", flush=True)
         except Exception as e:
-            print(f"Warning: could not trash Drive file {fid}: {e}", flush=True)
+            print(f"Warning: could not delete Drive file {fid}: {e}", flush=True)
 
 
 def export_images_via_drive(s1_collection, aoi_ee, token_path,
@@ -286,12 +291,6 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
         scale (int): Export resolution in metres.
         drive_folder (str): Google Drive folder name for GEE exports.
     """
-    import os
-    import io
-    import time
-    import ee
-    from googleapiclient.http import MediaIoBaseDownload
-
     if bands_to_export is None:
         bands_to_export = ['VV_raw', 'VV_corrected', 'VV_smoothed']
 

@@ -86,12 +86,17 @@ def get_historical_collection(s1, orbit_pass, doy, window, yearsBack, reference_
 def build_user_drive_service(token_path):
     """
     Build a Drive client authenticated as the GEE user via saved OAuth token.
-    The token is written once by the Dashboard's "Connect Google Drive" flow and
-    auto-refreshed on every subsequent call.
+    The token is written once by the Dashboard login flow and auto-refreshed on
+    every subsequent call.
     """
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
 
+    if not os.path.exists(token_path):
+        raise FileNotFoundError(
+            f"Drive token not found at {token_path}. "
+            f"Please log out of the THAW Dashboard and log in again to authorise Drive access."
+        )
     creds = Credentials.from_authorized_user_file(
         token_path,
         scopes=["https://www.googleapis.com/auth/drive"],
@@ -104,8 +109,8 @@ def build_user_drive_service(token_path):
 
 def delete_drive_files(token_path, file_ids):
     """
-    Moves a list of Google Drive files to trash using the user's OAuth credentials.
-    GEE exports are owned by the authenticated user; only the owner can trash them.
+    Permanently deletes a list of Google Drive files by file ID.
+    Uses the user's OAuth credentials — as file owner, permanent deletion is permitted.
     Errors are logged but do not raise so a cleanup failure never aborts the pipeline.
     """
     try:
@@ -115,10 +120,10 @@ def delete_drive_files(token_path, file_ids):
         return
     for fid in file_ids:
         try:
-            drive.files().update(fileId=fid, body={"trashed": True}).execute()
-            print(f"Trashed Drive file: {fid}", flush=True)
+            drive.files().delete(fileId=fid).execute()
+            print(f"Deleted Drive file: {fid}", flush=True)
         except Exception as e:
-            print(f"Warning: could not trash Drive file {fid}: {e}", flush=True)
+            print(f"Warning: could not delete Drive file {fid}: {e}", flush=True)
 
 def cluster_processing(tif_path, timestamp, z_thres=-2, min_size_cluster=20, pix=6):
     """
@@ -304,7 +309,15 @@ def run_pipeline(config_path):
     with open(config_path, "r") as f:
         cfg = json.load(f)
 
-    ee.Initialize(project=cfg.get("project_id"))
+    token_path = cfg["drive_token_path"]
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    creds = Credentials.from_authorized_user_file(token_path)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        with open(token_path, "w") as f:
+            f.write(creds.to_json())
+    ee.Initialize(credentials=creds, project=cfg.get("project_id"))
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     
@@ -404,7 +417,6 @@ def run_pipeline(config_path):
     # water/land transition between -14(very likely land -> likelyhood water = 0) and -18(very likely water -> likelyhood water = 1)
     potential_water = masked_mean.select('VV').subtract(-14).divide(-4)
     focal_mean = potential_water.focal_mean(3) # spatial clustering: focal mean of potential water
-    masked_diff = mean_diff.updateMask(focal_mean)
 
     latest_asc_anomaly = latest_asc.select('VV') \
         .subtract(hist_asc_stats.select('VV_mean')) \
