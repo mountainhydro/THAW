@@ -26,7 +26,6 @@ from rasterio.warp import transform_geom
 from sklearn.cluster import DBSCAN
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-from google.oauth2 import service_account
 from rio_cogeo.cogeo import cog_translate
 from rio_cogeo.profiles import cog_profiles
 
@@ -84,17 +83,42 @@ def get_historical_collection(s1, orbit_pass, doy, window, yearsBack, reference_
         seasonal_list.append(imgs)
     return ee.ImageCollection(ee.List(seasonal_list).flatten())
 
-def build_drive_service(service_account_path):
-    SCOPES = ['https://www.googleapis.com/auth/drive']
-    credentials = service_account.Credentials.from_service_account_file(
-        service_account_path, scopes=SCOPES)
-    return build(
-        'drive', 
-        'v3', 
-        credentials=credentials, 
-        cache_discovery=False, 
-        static_discovery=False  # <--- Add this line
+def build_user_drive_service(token_path):
+    """
+    Build a Drive client authenticated as the GEE user via saved OAuth token.
+    The token is written once by the Dashboard's "Connect Google Drive" flow and
+    auto-refreshed on every subsequent call.
+    """
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+
+    creds = Credentials.from_authorized_user_file(
+        token_path,
+        scopes=["https://www.googleapis.com/auth/drive"],
     )
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        with open(token_path, "w") as f:
+            f.write(creds.to_json())
+    return build("drive", "v3", credentials=creds, cache_discovery=False, static_discovery=False)
+
+def delete_drive_files(token_path, file_ids):
+    """
+    Moves a list of Google Drive files to trash using the user's OAuth credentials.
+    GEE exports are owned by the authenticated user; only the owner can trash them.
+    Errors are logged but do not raise so a cleanup failure never aborts the pipeline.
+    """
+    try:
+        drive = build_user_drive_service(token_path)
+    except Exception as e:
+        print(f"Warning: could not build Drive service for cleanup: {e}", flush=True)
+        return
+    for fid in file_ids:
+        try:
+            drive.files().update(fileId=fid, body={"trashed": True}).execute()
+            print(f"Trashed Drive file: {fid}", flush=True)
+        except Exception as e:
+            print(f"Warning: could not trash Drive file {fid}: {e}", flush=True)
 
 def cluster_processing(tif_path, timestamp, z_thres=-2, min_size_cluster=20, pix=6):
     """
@@ -179,11 +203,13 @@ def cluster_processing(tif_path, timestamp, z_thres=-2, min_size_cluster=20, pix
     print("Clustering complete.", flush=True)
     return poly_path, summary_path
 
-def export_and_download(images_to_export, reference_date, aoi, drive_service, output_root, timestamp, task_name=""):
+def export_and_download(images_to_export, reference_date, aoi, token_path, output_root, timestamp, task_name=""):
     date_str = reference_date.strftime("%Y-%m-%d")
     name_suffix = f"_{task_name}" if task_name else ""
     local_dir = os.path.join(output_root, f'Outputs_{date_str}{name_suffix}')
     os.makedirs(local_dir, exist_ok=True)
+
+    drive_service = build_user_drive_service(token_path)
 
     task_list = []
 
@@ -194,36 +220,45 @@ def export_and_download(images_to_export, reference_date, aoi, drive_service, ou
             fileNamePrefix=file_prefix, region=aoi, scale=10, maxPixels=1e12
         )
         task.start()
-        task_list.append({'name': name, 'prefix': file_prefix, 'task': task})
+        task_list.append({'name': name, 'prefix': file_prefix, 'task': task, 'drive_file_id': None})
         print(f"Started GEE Task: {name}", flush=True)
 
-    print("Waiting GEE completion...", flush=True)
+    print("Waiting for GEE exports...", flush=True)
     completed = 0
     while completed < len(task_list):
         for item in task_list:
-            if item.get('done'): 
+            if item.get('done'):
                 continue
             status = item['task'].status()
             if status['state'] == 'COMPLETED':
                 fname = f"{item['prefix']}.tif"
-                res = drive_service.files().list(q=f"name='{fname}' and trashed=false").execute()
+                res = drive_service.files().list(q=f"name='{fname}' and trashed=false", fields="files(id)").execute()
                 files = res.get('files', [])
                 if files:
-                    request = drive_service.files().get_media(fileId=files[0]['id'])
+                    file_id = files[0]['id']
+                    request = drive_service.files().get_media(fileId=file_id)
                     with io.FileIO(os.path.join(local_dir, fname), 'wb') as fh:
                         downloader = MediaIoBaseDownload(fh, request)
                         d = False
-                        while not d: 
+                        while not d:
                             _, d = downloader.next_chunk()
-                    print(f"Downloaded: {fname}", flush = True)
+                    print(f"Downloaded: {fname}", flush=True)
+                    item['drive_file_id'] = file_id  # store for cleanup
                     item['done'] = True
                     completed += 1
             elif status['state'] in ['FAILED', 'CANCELLED']:
-                print(f"Task {item['name']} failed: {status.get('error_message')}", flush = True)
+                print(f"Task {item['name']} failed: {status.get('error_message')}", flush=True)
                 item['done'] = True
                 completed += 1
-        if completed < len(task_list): 
+        if completed < len(task_list):
             time.sleep(30)
+
+    # Delete all successfully downloaded files from Drive
+    drive_ids_to_delete = [item['drive_file_id'] for item in task_list if item.get('drive_file_id')]
+    if drive_ids_to_delete:
+        print(f"Cleaning up {len(drive_ids_to_delete)} file(s) from Google Drive...", flush=True)
+        delete_drive_files(token_path, drive_ids_to_delete)
+
     return local_dir
 
 def convert_to_cog(folder):
@@ -369,6 +404,7 @@ def run_pipeline(config_path):
     # water/land transition between -14(very likely land -> likelyhood water = 0) and -18(very likely water -> likelyhood water = 1)
     potential_water = masked_mean.select('VV').subtract(-14).divide(-4)
     focal_mean = potential_water.focal_mean(3) # spatial clustering: focal mean of potential water
+    masked_diff = mean_diff.updateMask(focal_mean)
 
     latest_asc_anomaly = latest_asc.select('VV') \
         .subtract(hist_asc_stats.select('VV_mean')) \
@@ -389,14 +425,14 @@ def run_pipeline(config_path):
 # ============================================================
 # Export and download
 # ============================================================
-    drive_service = build_drive_service(cfg["service_account_path"])
+    token_path = cfg["drive_token_path"]
     exports = {
         "potential_water": potential_water,
         "z_score": zscore_mean,
         "mean_diff": masked_diff.toFloat()
     }
 
-    local_path = export_and_download(exports, ref_date, aoi, drive_service, cfg["output_root"], timestamp, task_name)
+    local_path = export_and_download(exports, ref_date, aoi, token_path, cfg["output_root"], timestamp, task_name)
     convert_to_cog(local_path)
 
 

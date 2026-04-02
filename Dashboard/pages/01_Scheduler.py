@@ -59,7 +59,7 @@ def write_job_config(is_manual=True, task_name=""):
         "run_date": run_date.isoformat() if is_manual else "today",
         "aoi_geojson": aoi_p,
         "project_id": project_id,
-        "service_account_path": service_account_path,
+        "drive_token_path": DRIVE_TOKEN_FILE,
         # output_root stays as the plain parent folder; lakedetection_headless.py
         # appends its own Outputs_YYYY-MM-DD subfolder. task_name is passed
         # separately so the headless script can suffix that folder name.
@@ -105,6 +105,7 @@ DASH_DIR = os.path.dirname(CURRENT_DIR)
 ROOT_DIR = os.path.dirname(DASH_DIR)                    
 TEMP_DIR = os.path.join(ROOT_DIR, "temp")
 CRED_FILE = os.path.join(TEMP_DIR, "gee_credentials.txt")
+DRIVE_TOKEN_FILE = os.path.join(TEMP_DIR, "drive_token.json")
 GEE_DIR = os.path.join(ROOT_DIR, "GEE")
 OUTPUT_DIR = os.path.join(ROOT_DIR, "Outputs")
 CONFIG_DIR = os.path.join(ROOT_DIR, "config")
