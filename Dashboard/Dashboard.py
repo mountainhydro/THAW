@@ -15,6 +15,11 @@ CRED_FILE = os.path.join(TEMP_DIR, "gee_credentials.txt")
 
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/earthengine",
+]
+
 # 2. Page Config
 st.set_page_config(page_title="Welcome!", layout="centered")
 
@@ -36,9 +41,36 @@ def delete_creds():
     if os.path.exists(CRED_FILE):
         os.remove(CRED_FILE)
 
+def run_oauth_flow(client_secret_path):
+    """Run the OAuth flow and save the token. Returns credentials on success."""
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, SCOPES)
+    creds = flow.run_local_server(port=0)
+    with open(DRIVE_TOKEN_FILE, "w") as f:
+        f.write(creds.to_json())
+    return creds
+
+def load_token_credentials():
+    """Load saved OAuth token and refresh if needed. Returns credentials or None."""
+    if not os.path.exists(DRIVE_TOKEN_FILE):
+        return None
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    creds = Credentials.from_authorized_user_file(DRIVE_TOKEN_FILE, SCOPES)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        with open(DRIVE_TOKEN_FILE, "w") as f:
+            f.write(creds.to_json())
+    return creds
+
 def init_gee(project):
+    """Initialise GEE using the saved OAuth token if available, else default auth."""
     try:
-        ee.Initialize(project=project)
+        creds = load_token_credentials()
+        if creds:
+            ee.Initialize(credentials=creds, project=project)
+        else:
+            ee.Initialize(project=project)
         return True
     except Exception:
         return False
@@ -68,22 +100,13 @@ if not st.session_state.authenticated:
 
         if st.button("Login & Remember Me", use_container_width=True):
             if project_input:
+                if path_input and os.path.exists(path_input):
+                    try:
+                        run_oauth_flow(path_input)
+                    except Exception as e:
+                        st.error(f"Authorisation failed: {e}")
+                        st.stop()
                 if init_gee(project_input):
-                    # Run Drive OAuth flow (always on first login, token saved to ROOT/temp/)
-                    if path_input and os.path.exists(path_input):
-                        try:
-                            from google_auth_oauthlib.flow import InstalledAppFlow
-                            flow = InstalledAppFlow.from_client_secrets_file(
-                                path_input,
-                                scopes=["https://www.googleapis.com/auth/drive"],
-                            )
-                            creds = flow.run_local_server(port=0)
-                            with open(DRIVE_TOKEN_FILE, "w") as tf:
-                                tf.write(creds.to_json())
-                            st.success(f"Drive token saved to: {DRIVE_TOKEN_FILE}")
-                        except Exception as e:
-                            st.error(f"Drive authorisation failed: {e}")
-                            st.stop()
                     save_creds(project_input, path_input)
                     st.session_state.authenticated = True
                     st.session_state.active_project = project_input
@@ -147,7 +170,7 @@ else:
         f"### Session Active\n\n"
         f"**Project ID:** `{st.session_state.get('active_project')}`\n\n"
         f"**Google Earth Engine:** {status}\n\n"
-        f"**Google Drive:** {'Authorised' if drive_ok else 'Not authorised ✗'}"
+        f"**Google Drive:** {'Authorised ✓' if drive_ok else 'Not authorised ✗'}"
     )
 
     if gee_ok and drive_ok:
@@ -155,23 +178,16 @@ else:
     else:
         st.warning("Some services are not yet authorised. Check the status above.")
 
-    # Run Drive OAuth if token is missing
+    # Run OAuth flow if token is missing
     if not os.path.exists(DRIVE_TOKEN_FILE):
         client_secret_path = st.session_state.get("active_path", "")
         if client_secret_path and os.path.exists(client_secret_path):
-            st.info("Google Drive authorisation required. A browser window will open...")
+            st.info("Authorisation required. A browser window will open...")
             try:
-                from google_auth_oauthlib.flow import InstalledAppFlow
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    client_secret_path,
-                    scopes=["https://www.googleapis.com/auth/drive"],
-                )
-                creds = flow.run_local_server(port=0)
-                with open(DRIVE_TOKEN_FILE, "w") as tf:
-                    tf.write(creds.to_json())
-                st.success(f"Drive token saved to: {DRIVE_TOKEN_FILE}")
+                run_oauth_flow(client_secret_path)
+                st.rerun()
             except Exception as e:
-                st.error(f"Drive authorisation failed: {e}")
+                st.error(f"Authorisation failed: {e}")
         else:
             st.warning("OAuth Client Secret path not found. Please log out and log in again with a valid path.")
     else:
