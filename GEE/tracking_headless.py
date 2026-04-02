@@ -23,10 +23,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from preprocessing import (
+from gee_core import (
     preprocess_s1_collection,
     compute_temporal_spatial_mean,
     apply_temporal_spatial_smoothing_by_orbit,
+    likelihood_score,
 )
 from inputs import (
     load_aoi,
@@ -34,27 +35,9 @@ from inputs import (
     load_dem,
     get_glacier_thinning_correction,
 )
-from water_detection import (
-    likelihood_score,
-    generate_lake_metrics_report,
-    export_images_via_drive,
-)
-
-
-# --- 2. Logger ---
-class Logger:
-    def __init__(self, filename):
-        self.terminal = sys.stdout
-        self.log = open(filename, "a", encoding="utf-8")
-
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-        self.log.flush()
-
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
+from reporting import generate_lake_metrics_report
+from drive_io import Logger, export_images_via_drive
+from gee_auth import initialize_ee, build_drive_service
 
 
 # --- 3. Main Pipeline ---
@@ -101,29 +84,15 @@ def run_tracking_pipeline(config_path):
     print(f"Output dir:   {final_out_dir_str}", flush=True)
     print("---------------------------------------", flush=True)
 
-    # --- 3c. Initialise GEE using OAuth token ---
+    # --- 3c. Initialise GEE and Drive using OAuth token ---
     drive_token_path = cfg.get("drive_token_path")
     try:
-        from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
-        creds = Credentials.from_authorized_user_file(drive_token_path)
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            with open(drive_token_path, "w") as f:
-                f.write(creds.to_json())
-        ee.Initialize(credentials=creds, project=project_id)
+        initialize_ee(drive_token_path, project_id)
+        drive_service = build_drive_service(drive_token_path)
         print(f"GEE initialised (project: {project_id})", flush=True)
-    except Exception as e:
-        print(f"CRITICAL: GEE initialisation failed: {e}", flush=True)
-        sys.exit(1)
-
-    # --- 3d. Build Google Drive service using the same OAuth token ---
-    try:
-        from googleapiclient.discovery import build as build_gdrive
-        drive_service = build_gdrive("drive", "v3", credentials=creds, cache_discovery=False, static_discovery=False)
         print("Google Drive service initialised.", flush=True)
     except Exception as e:
-        print(f"CRITICAL: Could not build Drive service: {e}", flush=True)
+        print(f"CRITICAL: Initialisation failed: {e}", flush=True)
         sys.exit(1)
 
     # --- 4. Spatial & Terrain Inputs ---
@@ -186,13 +155,9 @@ def run_tracking_pipeline(config_path):
     )
 
     # --- 7. Metrics Report & GIF ---
-    # All outputs (CSV, plot, GIF) are directed to final_out_dir via output_dir arg
+    # TIFs are already downloaded to final_out_dir — cluster-based metrics run locally
     print("Generating lake metrics report...", flush=True)
-    generate_lake_metrics_report(
-        s1_scored,
-        aoi,
-        output_dir=final_out_dir_str,
-    )
+    generate_lake_metrics_report(output_dir=final_out_dir_str)
 
     print("SUCCESS: Tracking analysis complete.", flush=True)
     return "Tracking analysis complete."

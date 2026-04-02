@@ -112,15 +112,20 @@ def render_tracking_viewer(folder_path):
 
     dates = [f["date"] for f in frames]
 
-    # ── date select_slider: each tick is a date string ──
-    selected_date = st.select_slider(
-        "Date",
-        options=dates,
-        value=dates[0],
-        key="tracking_slider",
-    )
-    idx = dates.index(selected_date)
-    st.caption(f"Image {idx + 1} of {len(frames)}")
+    # st.select_slider crashes when only one option exists (internal range [0,0])
+    if len(dates) == 1:
+        selected_date = dates[0]
+        st.caption(f"Single date available: {selected_date}")
+        idx = 0
+    else:
+        selected_date = st.select_slider(
+            "Date",
+            options=dates,
+            value=dates[0],
+            key="tracking_slider",
+        )
+        idx = dates.index(selected_date)
+        st.caption(f"Image {idx + 1} of {len(frames)}")
 
     frame = frames[idx]
 
