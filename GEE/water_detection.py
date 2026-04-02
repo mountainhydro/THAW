@@ -228,12 +228,50 @@ def extract_lake_area_timeseries(collection, aoi, out_dir="lake_outputs", thresh
     return df
 
 
-def export_images_via_drive(s1_collection, aoi_ee, drive_service,
+def _build_user_drive_service(token_path):
+    """
+    Build a Drive client authenticated as the GEE user via saved OAuth token.
+    The token is written once by the Dashboard login flow and auto-refreshed on
+    every subsequent call.
+    """
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+
+    creds = Credentials.from_authorized_user_file(
+        token_path,
+        scopes=["https://www.googleapis.com/auth/drive"],
+    )
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        with open(token_path, "w") as f:
+            f.write(creds.to_json())
+    return build("drive", "v3", credentials=creds, cache_discovery=False, static_discovery=False)
+
+def _delete_drive_files(token_path, file_ids):
+    """
+    Moves a list of Google Drive files to trash using the user's OAuth credentials.
+    GEE exports are owned by the authenticated user; only the owner can trash them.
+    Errors are logged but do not raise so a cleanup failure never aborts the pipeline.
+    """
+    try:
+        drive = _build_user_drive_service(token_path)
+    except Exception as e:
+        print(f"Warning: could not build Drive service for cleanup: {e}", flush=True)
+        return
+    for fid in file_ids:
+        try:
+            drive.files().update(fileId=fid, body={"trashed": True}).execute()
+            print(f"Trashed Drive file: {fid}", flush=True)
+        except Exception as e:
+            print(f"Warning: could not trash Drive file {fid}: {e}", flush=True)
+
+
+def export_images_via_drive(s1_collection, aoi_ee, token_path,
                             bands_to_export=None, output_dir="outputs",
                             prefix="S1", scale=10, drive_folder="GEE_Exports"):
     """
     Exports each image/band combination to Google Drive via GEE batch tasks,
-    then downloads completed files to output_dir.
+    downloads completed files to output_dir, then deletes them from Drive.
 
     Filenames follow the pattern: {prefix}_{band}_{img_id}.tif
     This matches the original main.py pipeline naming convention.
@@ -241,7 +279,7 @@ def export_images_via_drive(s1_collection, aoi_ee, drive_service,
     Args:
         s1_collection (ee.ImageCollection): Scored Sentinel-1 collection.
         aoi_ee: Area of interest (ee.Geometry or shapely geometry).
-        drive_service: Authenticated Google Drive service object.
+        token_path (str): Path to the saved OAuth Drive token JSON.
         bands_to_export (list): Band names to export. Defaults to VV_raw, VV_corrected, VV_smoothed.
         output_dir (str): Local directory to download files into.
         prefix (str): Filename prefix, e.g. 'tracking_s1'.
@@ -258,6 +296,7 @@ def export_images_via_drive(s1_collection, aoi_ee, drive_service,
         bands_to_export = ['VV_raw', 'VV_corrected', 'VV_smoothed']
 
     os.makedirs(output_dir, exist_ok=True)
+    drive_service = _build_user_drive_service(token_path)
 
     count = s1_collection.size().getInfo()
     s1_list = s1_collection.toList(count)
@@ -297,9 +336,10 @@ def export_images_via_drive(s1_collection, aoi_ee, drive_service,
                     'task': task,
                     'file_prefix': file_prefix,
                     'local_path': local_path,
+                    'drive_file_id': None,
                     'done': False,
                 })
-                print(f"Task started: {local_filename}")
+                print(f"Task started: {local_filename}", flush=True)
             except Exception as e:
                 print(f"Failed to start task for {local_filename}: {e}", flush=True)
 
@@ -320,17 +360,19 @@ def export_images_via_drive(s1_collection, aoi_ee, drive_service,
             if status['state'] == 'COMPLETED':
                 fname = f"{item['file_prefix']}.tif"
                 res = drive_service.files().list(
-                    q=f"name='{fname}' and trashed=false"
+                    q=f"name='{fname}' and trashed=false", fields="files(id)"
                 ).execute()
                 files = res.get('files', [])
                 if files:
-                    request = drive_service.files().get_media(fileId=files[0]['id'])
+                    file_id = files[0]['id']
+                    request = drive_service.files().get_media(fileId=file_id)
                     with io.FileIO(item['local_path'], 'wb') as fh:
                         downloader = MediaIoBaseDownload(fh, request)
                         done = False
                         while not done:
                             _, done = downloader.next_chunk()
-                    print(f"Downloaded: {fname}")
+                    print(f"Downloaded: {fname}", flush=True)
+                    item['drive_file_id'] = file_id  # store for cleanup
                     item['done'] = True
                     completed += 1
                 # If file not yet visible in Drive, loop will retry on next pass
@@ -342,6 +384,12 @@ def export_images_via_drive(s1_collection, aoi_ee, drive_service,
 
         if completed < len(task_list):
             time.sleep(30)
+
+    # --- 3. Delete all successfully downloaded files from Drive ---
+    drive_ids_to_delete = [item['drive_file_id'] for item in task_list if item.get('drive_file_id')]
+    if drive_ids_to_delete:
+        print(f"Cleaning up {len(drive_ids_to_delete)} file(s) from Google Drive...", flush=True)
+        _delete_drive_files(token_path, drive_ids_to_delete)
                 
 import os
 import glob

@@ -109,20 +109,11 @@ def run_tracking_pipeline(config_path):
         print(f"CRITICAL: GEE initialisation failed: {e}", flush=True)
         sys.exit(1)
 
-    # --- 3d. Build Google Drive service (mirrors lakedetection_headless) ---
-    service_account_path = cfg.get("service_account_path")
+    # --- 3d. Build Google Drive service using saved OAuth token ---
+    drive_token_path = cfg.get("drive_token_path")
     try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build as build_gdrive
-        SCOPES = ['https://www.googleapis.com/auth/drive']
-        credentials = service_account.Credentials.from_service_account_file(
-            service_account_path, scopes=SCOPES)
-        drive_service = build_gdrive(
-            'drive', 'v3',
-            credentials=credentials,
-            cache_discovery=False,
-            static_discovery=False,
-        )
+        from water_detection import _build_user_drive_service
+        drive_service = _build_user_drive_service(drive_token_path)
         print("Google Drive service initialised.", flush=True)
     except Exception as e:
         print(f"CRITICAL: Could not build Drive service: {e}", flush=True)
@@ -181,7 +172,7 @@ def run_tracking_pipeline(config_path):
     export_images_via_drive(
         s1_scored,
         aoi,
-        drive_service=drive_service,
+        token_path=drive_token_path,
         bands_to_export=bands,
         output_dir=final_out_dir_str,
         prefix="tracking_s1",

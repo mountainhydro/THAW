@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import re as _re
 
 """
 THAW - Streamlit Dashboard Output preview page
@@ -159,28 +160,52 @@ VIS_BY_LAYER = {
 }
 
 output_folders = glob.glob(os.path.join(OUTPUT_DIR, "Outputs_*"))
+_DATE_RE = _re.compile(r"(\d{4}-\d{2}-\d{2})")
 dated_folders = []
 for f in output_folders:
+    suffix = os.path.basename(f).replace("Outputs_", "", 1)
+    m = _DATE_RE.search(suffix)
+    if not m:
+        continue
     try:
-        suffix = os.path.basename(f).replace("Outputs_", "", 1)
-        folder_date = datetime.strptime(suffix[:10], "%Y-%m-%d")
-        dated_folders.append((f, folder_date))
+        folder_date = datetime.strptime(m.group(1), "%Y-%m-%d")
     except ValueError:
         continue
-dated_folders.sort(key=lambda x: x[1], reverse=True)
+    # Everything after the matched date (and any leading underscore) is the location
+    remainder = suffix[m.end():]
+    location = remainder.lstrip("_")
+    dated_folders.append((f, folder_date, location))
+dated_folders.sort(key=lambda x: (x[1], x[2]), reverse=True)
 
 if not dated_folders:
     st.info("No data found.")
     st.stop()
 
 # --- 5. Sidebar Selection ---
-date_options = [f[1].strftime("%Y-%m-%d") for f in dated_folders]
-if date_options:
-    date_options[0] += " (most recent)"
+# Determine the most recent date per location name
+most_recent_per_location = {}
+for f, folder_date, location in dated_folders:
+    if location not in most_recent_per_location:
+        most_recent_per_location[location] = folder_date
+
+def make_display_label(folder_date, location):
+    date_str = folder_date.strftime("%Y-%m-%d")
+    if location:
+        if most_recent_per_location.get(location) == folder_date:
+            return f"{date_str} ({location}, most recent)"
+        return f"{date_str} ({location})"
+    # No location: fall back to old behaviour
+    if folder_date == dated_folders[0][1]:
+        return f"{date_str} (most recent)"
+    return date_str
+
+date_options = [make_display_label(fd, loc) for _, fd, loc in dated_folders]
 
 selected_display = st.sidebar.selectbox("Date", date_options)
-selected_folder_date = selected_display.replace(" (most recent)", "")
-folder_path = next(f[0] for f in dated_folders if f[1].strftime("%Y-%m-%d") == selected_folder_date)
+# Recover folder_path from selected index
+selected_idx = date_options.index(selected_display)
+folder_path, selected_folder_dt, _ = dated_folders[selected_idx]
+selected_folder_date = selected_folder_dt.strftime("%Y-%m-%d")
 tif_files = glob.glob(os.path.join(folder_path, "*_cog.tif"))
 
 st.title(f"Preview: {selected_folder_date}")
