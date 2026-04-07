@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
+
 """
-THAW - Headless Tracking Analysis Script
-Launched by the THAW Dashboard (Output_Preview page).
-Reads a JSON config from argv[1]; all inputs/outputs resolved from there.
+THAW - Headless tracking analysis script
+Launched as a sub-process from the THAW dashboard (Output_and_Tracking page).
 
 GEE Processing code: Dr. Evan Miles
-Tool/Operationalization: Dr. Stefan Fugger
-Created Feb 2026
+Tool/Operationalizing: Dr. Stefan Fugger
+Created on Feb 2 2026
 """
 
 import ee
@@ -16,20 +16,19 @@ import json
 import datetime
 from pathlib import Path
 
-# --- 1. Path Resolution ---
-# When launched by the dashboard via subprocess, cwd is ROOT_DIR.
-# Insert the GEE module directory so local imports resolve correctly.
+# Path resolution for local imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
-
+    
+# Local imports
 from gee_core import (
     preprocess_s1_collection,
     compute_temporal_spatial_mean,
     apply_temporal_spatial_smoothing_by_orbit,
     likelihood_score,
 )
-from inputs import (
+from thinning import (
     load_aoi,
     load_glacier_mask,
     load_dem,
@@ -40,16 +39,13 @@ from drive_io import Logger, export_images_via_drive
 from gee_auth import initialize_ee, build_drive_service
 
 
-# --- 3. Main Pipeline ---
+# ============================================================
+# MAIN PROCESSING PIPELINE
+# ============================================================
 def run_tracking_pipeline(config_path):
 
-    # 3a. Load config written by the dashboard
-    try:
-        with open(config_path, "r") as f:
-            cfg = json.load(f)
-    except Exception as e:
-        print(f"CRITICAL: Could not read config at {config_path}: {e}", flush=True)
-        sys.exit(1)
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
 
     aoi_input   = cfg.get("aoi_bbox")
     start_date  = cfg.get("start_date")
@@ -68,11 +64,11 @@ def run_tracking_pipeline(config_path):
     final_out_dir_str = str(final_out_dir)
 
     # Pre-create thinning cache at ROOT_DIR/temp/thinning_cache so
-    # inputs.get_glacier_thinning_correction can write tile downloads there
+    # get_glacier_thinning_correction can write tile downloads there
     thinning_cache_dir = Path(ROOT_DIR) / "temp" / "thinning_cache"
     thinning_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3b. Start logging (stdout still streams to the dashboard via PIPE)
+    # logging of console outputs
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     log_file = final_out_dir / f"tracking_log_{timestamp}.txt"
     sys.stdout = Logger(str(log_file))
@@ -84,18 +80,14 @@ def run_tracking_pipeline(config_path):
     print(f"Output dir:   {final_out_dir_str}", flush=True)
     print("---------------------------------------", flush=True)
 
-    # --- 3c. Initialise GEE and Drive using OAuth token ---
-    drive_token_path = cfg.get("drive_token_path")
-    try:
-        initialize_ee(drive_token_path, project_id)
-        drive_service = build_drive_service(drive_token_path)
-        print(f"GEE initialised (project: {project_id})", flush=True)
-        print("Google Drive service initialised.", flush=True)
-    except Exception as e:
-        print(f"CRITICAL: Initialisation failed: {e}", flush=True)
-        sys.exit(1)
+    initialize_ee(cfg.get("drive_token_path"), project_id)
+    drive_service = build_drive_service(cfg.get("drive_token_path"))
+    print(f"GEE initialised (project: {project_id})", flush=True)
 
-    # --- 4. Spatial & Terrain Inputs ---
+
+# ============================================================
+# SPATIAL AND TERRAIN INPUTS
+# ============================================================
     aoi          = load_aoi(aoi_input)
     glacier_geom = load_glacier_mask(aoi, buffer_m=100, output_dir=final_out_dir_str)
     dem, slope_rad, aspect, terrain_mask = load_dem(aoi)
@@ -112,12 +104,16 @@ def run_tracking_pipeline(config_path):
     # Cast to plain float to prevent numpy float32 JSON-serialisation error
     thinning_correction = float(get_glacier_thinning_correction(
         refined_aoi, target_year, dem,
-        cache_dir=str(thinning_cache_dir),   # ROOT_DIR/temp/thinning_cache
-        output_dir=final_out_dir_str,        # tracking_results/
+        cache_dir=str(thinning_cache_dir),
+        output_dir=final_out_dir_str,
     ))
     print(f"Glacier thinning correction (m): {thinning_correction:.3f}", flush=True)
 
-    # --- 5. Processing Pipeline ---
+
+
+# ============================================================
+# S1 PREPROCESSING AND SCORING
+# ============================================================
     print("Preprocessing Sentinel-1 collection...", flush=True)
     s1_preprocessed = preprocess_s1_collection(
         refined_aoi, start_date, end_date,
@@ -140,22 +136,26 @@ def run_tracking_pipeline(config_path):
 
     s1_scored = s1_smoothed.map(likelihood_score)
 
-    # --- 6. Export via Drive (one task per image per band) ---
-    # Filenames: tracking_s1_{band}_{img_id}.tif — matches main.py convention
+
+# ============================================================
+# EXPORT AND DOWNLOAD
+# ============================================================
     bands = ["VV_raw", "VV_corrected", "lake_likelihood"]
 
     print("Launching GEE Drive export tasks...", flush=True)
     export_images_via_drive(
         s1_scored,
         aoi,
-        token_path=drive_token_path,
+        token_path=cfg.get("drive_token_path"),
         bands_to_export=bands,
         output_dir=final_out_dir_str,
         prefix="tracking_s1",
     )
 
-    # --- 7. Metrics Report & GIF ---
-    # TIFs are already downloaded to final_out_dir — cluster-based metrics run locally
+
+# ============================================================
+# REPORTING
+# ============================================================
     print("Generating lake metrics report...", flush=True)
     generate_lake_metrics_report(output_dir=final_out_dir_str)
 
@@ -163,7 +163,9 @@ def run_tracking_pipeline(config_path):
     return "Tracking analysis complete."
 
 
-# --- 8. Entry Point ---
+# ============================================================
+# SCRIPT ENTRY
+# ============================================================
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("CRITICAL: No config path provided.", flush=True)
