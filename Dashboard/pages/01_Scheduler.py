@@ -164,7 +164,7 @@ draw_data = st_folium(m, width=900, height=550)
 
 aoi_geojson = None
 
-MAX_AOI_AREA_KM2 = 300000
+MAX_AOI_AREA_KM2 = 200000
 if draw_data and draw_data.get("all_drawings"):
     aoi_geojson = draw_data["all_drawings"][0]["geometry"]
 

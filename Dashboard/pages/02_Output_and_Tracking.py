@@ -320,9 +320,17 @@ if geojson_files:
     geojson_files.sort(key=os.path.getmtime, reverse=True)
     with open(geojson_files[0], "r", encoding="utf-8") as fh:
         gj = json.load(fh)
+    # Only add tooltip fields that actually exist in the GeoJSON properties
+    _sample_props = next(
+        (f["properties"] for f in gj.get("features", []) if f.get("properties")), {}
+    )
+    _field_map = {"cluster_id": "ID", "area_m2": "Area (m²)"}
+    _tooltip_fields  = [f for f in _field_map if f in _sample_props]
+    _tooltip_aliases = [_field_map[f] for f in _tooltip_fields]
+    _tooltip = folium.GeoJsonTooltip(fields=_tooltip_fields, aliases=_tooltip_aliases) if _tooltip_fields else None
     folium.GeoJson(gj, name="All Clusters",
         style_function=lambda feat: {"color": "red", "weight": 2, "fillColor": "red", "fillOpacity": 0.1},
-        tooltip=folium.GeoJsonTooltip(fields=["cluster_id", "area_m2"], aliases=["ID", "Area"])
+        tooltip=_tooltip
     ).add_to(m)
 
 Fullscreen(

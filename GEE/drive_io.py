@@ -3,8 +3,12 @@
 THAW - Google Drive I/O module
 
 Handles all GEE export → Drive → local download operations, COG conversion,
-and Drive cleanup. Both pipeline scripts import from here so the poll-download-
-delete loop is never duplicated.
+and Drive cleanup. 
+
+GEE Processing code: Dr. Evan Miles
+Tool/Operationalization: Dr. Stefan Fugger
+
+Created on Feb 2 2026
 """
 
 import os
@@ -20,17 +24,21 @@ from rio_cogeo.profiles import cog_profiles
 from gee_auth import build_drive_service
 
 
-
-
-
 # ============================================================
 # LOGGER
 # ============================================================
 
 class Logger:
     """
-    Tees stdout/stderr to both the terminal and a log file simultaneously.
-    Used by both headless pipeline scripts.
+    Passes stdout/stderr to both the terminal and a log file simultaneously.
+
+    Used by both headless pipeline scripts to ensure all console output
+    is preserved in the run log without losing live terminal feedback.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the log file. Opened in append mode.
     """
     def __init__(self, filename):
         self.terminal = sys.stdout
@@ -49,18 +57,21 @@ class Logger:
 # ============================================================
 # SHARED POLL-DOWNLOAD-DELETE LOOP
 # ============================================================
+
 def delete_drive_files(token_path, file_ids):
     """
     Permanently delete a list of Google Drive files by file ID.
 
     Uses the user's OAuth credentials — as file owner, permanent deletion is
-    permitted. Errors are logged but never raised so a cleanup failure does not
-    abort the pipeline.
+    permitted. Errors are logged but never raised so a cleanup failure does
+    not abort the pipeline.
 
     Parameters
     ----------
-    token_path : str       — path to drive_token.json
-    file_ids   : list[str] — Drive file IDs to delete
+    token_path : str
+        Path to drive_token.json.
+    file_ids : list[str]
+        Drive file IDs to delete.
     """
     try:
         drive = build_drive_service(token_path)
@@ -73,25 +84,29 @@ def delete_drive_files(token_path, file_ids):
             print(f"Deleted Drive file: {fid}", flush=True)
         except Exception as e:
             print(f"Warning: could not delete Drive file {fid}: {e}", flush=True)
-            
+
+
 def _poll_and_download(task_list, drive_service, token_path):
     """
     Poll a list of GEE export tasks, download each file as it completes,
     then permanently delete all downloaded files from Drive.
 
-    Each item in task_list must be a dict with:
-        task         : ee.batch.Task — the running GEE export task
-        file_prefix  : str           — GEE export fileNamePrefix (without .tif)
-        local_path   : str           — full local path to write the downloaded file
-        label        : str           — human-readable name used in log messages
-        drive_file_id: None          — populated once the file is found in Drive
-        done         : False         — set to True when the item is resolved
+    Each item in task_list must be a dict with keys:
+        task          : ee.batch.Task  — the running GEE export task
+        file_prefix   : str            — GEE export fileNamePrefix (without .tif)
+        local_path    : str            — full local path to write the downloaded file
+        label         : str            — human-readable name used in log messages
+        drive_file_id : None           — populated once the file is found in Drive
+        done          : False          — set to True when the item is resolved
 
     Parameters
     ----------
-    task_list    : list[dict]
-    drive_service: googleapiclient.discovery.Resource  — authenticated Drive client
-    token_path   : str  — path to drive_token.json, used for the cleanup step
+    task_list : list[dict]
+        Export task descriptors as described above.
+    drive_service : googleapiclient.discovery.Resource
+        Authenticated Drive client.
+    token_path : str
+        Path to drive_token.json, used for the cleanup step.
     """
     print(f"Waiting for {len(task_list)} GEE task(s)...", flush=True)
     completed = 0
@@ -157,16 +172,23 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
     ----------
     images_to_export : dict[str, ee.Image]
         Keys are output name prefixes (e.g. 'z_score'), values are EE images.
-    reference_date   : datetime.datetime
-    aoi              : ee.Geometry
-    token_path       : str
-    output_root      : str   — parent directory; a dated subfolder is created here
-    timestamp        : str   — run timestamp string (YYYYMMDD_HHMM)
-    task_name        : str   — optional suffix for the output folder name
+    reference_date : datetime.datetime
+        Reference date used to name the output subdirectory.
+    aoi : ee.Geometry
+        Export region.
+    token_path : str
+        Path to drive_token.json.
+    output_root : str
+        Parent directory; a dated subfolder is created inside it.
+    timestamp : str
+        Run timestamp string (YYYYMMDD_HHMM) used in filenames.
+    task_name : str, optional
+        Optional suffix appended to the output folder name.
 
     Returns
     -------
-    str : path to the local output directory
+    str
+        Path to the local output directory.
     """
     date_str = reference_date.strftime("%Y-%m-%d")
     name_suffix = f"_{task_name}" if task_name else ""
@@ -196,7 +218,7 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
             "drive_file_id": None,
             "done":          False,
         })
-        print(f"Started GEE Task: {name}", flush=True)
+        print(f"Started GEE task: {name}", flush=True)
 
     _poll_and_download(task_list, drive_service, token_path)
     return local_dir
@@ -210,19 +232,27 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
                             bands_to_export=None, output_dir="outputs",
                             prefix="S1", scale=10, drive_folder="GEE_Exports"):
     """
-    Export each image × band combination from a Sentinel-1 collection to Drive,
-    download locally, then delete from Drive. Used by the tracking pipeline.
+    Export each image × band from a Sentinel-1 collection to Drive, download
+    locally, then delete from Drive. Used by the tracking pipeline.
 
     Parameters
     ----------
-    s1_collection  : ee.ImageCollection  — scored Sentinel-1 collection
-    aoi_ee         : ee.Geometry or shapely geometry
-    token_path     : str
-    bands_to_export: list[str]  — defaults to VV_raw, VV_corrected, VV_smoothed
-    output_dir     : str        — local directory for downloaded files
-    prefix         : str        — filename prefix (e.g. 'tracking_s1')
-    scale          : int        — export resolution in metres
-    drive_folder   : str        — GEE Drive export folder name
+    s1_collection : ee.ImageCollection
+        Scored Sentinel-1 collection to export.
+    aoi_ee : ee.Geometry
+        Export region.
+    token_path : str
+        Path to drive_token.json.
+    bands_to_export : list[str], optional
+        Bands to export. Defaults to ['VV_raw', 'VV_corrected', 'VV_smoothed'].
+    output_dir : str, optional
+        Local directory for downloaded files (default 'outputs').
+    prefix : str, optional
+        Filename prefix (default 'S1').
+    scale : int, optional
+        Export resolution in metres (default 10).
+    drive_folder : str, optional
+        GEE Drive export folder name (default 'GEE_Exports').
     """
     if bands_to_export is None:
         bands_to_export = ["VV_raw", "VV_corrected", "VV_smoothed"]
@@ -286,11 +316,13 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
 def convert_to_cog(folder):
     """
     Convert all plain GeoTIFFs in a folder to Cloud-Optimised GeoTIFFs (COG).
-    Files already ending in _cog.tif are skipped.
+
+    Files already ending in _cog.tif are skipped to avoid double-conversion.
 
     Parameters
     ----------
-    folder : str — directory containing .tif files to convert
+    folder : str
+        Directory containing .tif files to convert.
     """
     dst_profile = cog_profiles.get("deflate")
 

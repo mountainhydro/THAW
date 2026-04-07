@@ -1,33 +1,32 @@
 # -*- coding: utf-8 -*-
 
 """
-THAW - Headless Integrated Script
-Meant to run in combination with the THAW dashboard
+THAW - Main processing pipeline for lake detection
+Launched as a sub-process from the THAW dashboard
 
 GEE Processing code: Dr. Evan Miles
-Tool/Operationalization: Dr. Stefan Fugger
+Tool/Operationalizing: Dr. Stefan Fugger
 
 Created on Feb 2 2026
 """
 
+import os
+import sys
 import math
 import ee
 import datetime
 import time
-import os
 import io
 import json
 import glob
-import sys
 import numpy as np
 import rasterio
 
-# Ensure the GEE directory is on the path so sibling modules resolve correctly
-# when this script is launched as a subprocess from ROOT_DIR.
+# Path resolution for local imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
-
+# Local imports
 from gee_auth import initialize_ee, build_drive_service
 from drive_io import Logger, export_and_download, convert_to_cog, delete_drive_files
 from gee_core import get_radar_mask, apply_radar_mask_to_collection, get_historical_collection
@@ -137,12 +136,13 @@ def run_pipeline(config_path):
     # apply terrain and mask
     masked_mean = mean_img.updateMask(terrain_mask).focal_mean(5)
     #masked_mean_prev = mean_prev.updateMask(terrain_mask)
-    masked_diff = mean_diff.updateMask(terrain_mask)
+
     
     # flagging
     # water/land transition between -14(very likely land -> likelyhood water = 0) and -18(very likely water -> likelyhood water = 1)
     potential_water = masked_mean.select('VV').subtract(-14).divide(-4)
     focal_mean = potential_water.focal_mean(3) # spatial clustering: focal mean of potential water
+    masked_diff = mean_diff.updateMask(focal_mean)
 
     latest_asc_anomaly = latest_asc.select('VV') \
         .subtract(hist_asc_stats.select('VV_mean')) \
@@ -161,7 +161,7 @@ def run_pipeline(config_path):
 
     
 # ============================================================
-# Export and download
+# EXPORT AND DOWNLOAD
 # ============================================================
     token_path = cfg["drive_token_path"]
     exports = {
@@ -175,11 +175,8 @@ def run_pipeline(config_path):
 
 
 # ============================================================
-# Clustering
+# CLUSTERING
 # ============================================================    
-    # Identify the downloaded z-score file — use the ORIGINAL (non-COG) for clustering
-    # so that shapes() uses the unmodified geotransform. cog_translate can silently
-    # adjust the origin to align with its tile grid, introducing a sub-pixel shift.
     z_score_files = glob.glob(os.path.join(local_path, "z_score*.tif"))
     z_score_files = [f for f in z_score_files if not f.endswith("_cog.tif")]
     if z_score_files:
