@@ -166,8 +166,8 @@ def run_pipeline(config_path):
     token_path = cfg["drive_token_path"]
     exports = {
         "potential_water": potential_water,
-        "z_score": zscore_mean,
-        "mean_diff": masked_diff.toFloat()
+        "z_score": zscore_mean# ,
+        # "mean_diff": masked_diff.toFloat()
     }
 
     local_path = export_and_download(exports, ref_date, aoi, token_path, cfg["output_root"], timestamp, task_name)
