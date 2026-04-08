@@ -9,7 +9,7 @@
 
 [![THAW introduction video](docs/background)](https://youtu.be/Eg3_Jr2FksA)
 
-## Features
+## Features Overview
 - **Surface Water Detection** from Synthetic Aperture Radar (Sentinel1-SAR) data given a user-define area of interest (AOI). Determination of the anomaly of the latest backscatter data to historic backscatter phenology in each pixel, expressed as a composite z-score for the ascending and descending orbits. Unlike optical satellites, Sentinel-1 radar penetrates clouds and delivers observations also during nighttimes, making it ideal for monitoring flooded areas or seasonal lake changes in mountainous regions.
 
 - **Scope**: Can be used over any mountain area globally, for areas up to 60,000 km<sup>2</sup>, for any date within the timeframe of Sentinel1-SAR (2014 - present). *Event-level tracking is a work-in-progress feature*. 
