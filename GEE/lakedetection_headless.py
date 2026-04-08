@@ -1,174 +1,39 @@
 # -*- coding: utf-8 -*-
 
 """
-THAW - Headless Integrated Script
-Meant to run in combination with the THAW dashboard
+THAW - Main processing pipeline for lake detection
+Launched as a sub-process from the THAW dashboard
 
 GEE Processing code: Dr. Evan Miles
-Tool/Operationalization: Dr. Stefan Fugger
+Tool/Operationalizing: Dr. Stefan Fugger
 
 Created on Feb 2 2026
 """
 
+import os
+import sys
 import math
 import ee
 import datetime
 import time
-import os
 import io
 import json
 import glob
-import sys
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from google.oauth2 import service_account
-from rio_cogeo.cogeo import cog_translate
-from rio_cogeo.profiles import cog_profiles
+import numpy as np
+import rasterio
 
-# ============================================================
-# CORE FUNCTIONS
-# ============================================================
-def get_radar_mask(image, dem):
-    theta_i = image.select('angle')
-    phi_i = ee.Terrain.aspect(theta_i).reduceRegion(
-        reducer=ee.Reducer.mean(),
-        geometry=image.geometry(),
-        scale=1000,
-        maxPixels=1e9).get('aspect')
-    phi_i = ee.Number(phi_i)
+# Path resolution for local imports
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+# Local imports
+from gee_auth import initialize_ee, build_drive_service
+from drive_io import Logger, export_and_download, convert_to_cog, delete_drive_files
+from gee_core import get_radar_mask, apply_radar_mask_to_collection, get_historical_collection
+from reporting import cluster_processing
 
-    alpha_s = ee.Terrain.slope(dem).select('slope')
-    phi_s = ee.Terrain.aspect(dem).select('aspect')
-    phi_r = ee.Image.constant(phi_i).subtract(phi_s)
 
-    deg2rad, rad2deg = math.pi/180, 180/math.pi
-    theta_i_rad, alpha_s_rad = theta_i.multiply(deg2rad), alpha_s.multiply(deg2rad)
-    phi_r_rad = phi_r.multiply(deg2rad)
-    ninetyRad = ee.Image.constant(math.pi/2)
 
-    alpha_r_rad = alpha_s_rad.tan().multiply(phi_r_rad.cos()).atan()
-    alpha_az = alpha_s_rad.tan().multiply(phi_r_rad.sin()).atan()
-    theta_lia_rad = alpha_az.cos().multiply(theta_i_rad.subtract(alpha_r_rad).cos()).acos()
-    theta_lia = theta_lia_rad.multiply(rad2deg)
-
-    sigma0 = ee.Image.constant(10).pow(image.select('VV').divide(10))
-    gamma0 = sigma0.divide(theta_i_rad.cos())
-    gamma0_volume = gamma0.divide(ninetyRad.subtract(theta_i_rad).add(alpha_r_rad).tan()
-                                  .divide(ninetyRad.subtract(theta_i_rad).tan()).abs())
-    gamma0_volume_db = ee.Image.constant(10).multiply(gamma0_volume.log10())
-
-    alpha_r = alpha_r_rad.multiply(rad2deg)
-    layover, shadow = alpha_r.gt(theta_i), theta_lia.gt(85)
-    mask = layover.Not().And(shadow.Not()).And(gamma0_volume_db.gt(-35)).focalMedian(3)
-    return mask.rename('valid_mask')
-
-def apply_radar_mask_to_collection(collection, dem):
-    def wrap(image):
-        mask = get_radar_mask(image, dem)
-        maskedVV = image.select('VV').updateMask(mask).rename('VV_masked')
-        return image.addBands(maskedVV).addBands(mask).copyProperties(image, image.propertyNames())
-    return collection.map(wrap)
-
-def get_historical_collection(s1, orbit_pass, doy, window, yearsBack, reference_date):
-    yearList = range(reference_date.year - yearsBack, reference_date.year)
-    seasonal_list = []
-    for y in yearList:
-        target = datetime.datetime(y, 1, 1) + datetime.timedelta(days=doy - 1)
-        start, end = target - datetime.timedelta(days=window), target + datetime.timedelta(days=window)
-        imgs = s1.filterDate(start, end).filter(ee.Filter.eq('orbitProperties_pass', orbit_pass)).toList(100)
-        seasonal_list.append(imgs)
-    return ee.ImageCollection(ee.List(seasonal_list).flatten())
-
-def build_drive_service(service_account_path):
-    SCOPES = ['https://www.googleapis.com/auth/drive']
-    credentials = service_account.Credentials.from_service_account_file(
-        service_account_path, scopes=SCOPES)
-    return build(
-        'drive', 
-        'v3', 
-        credentials=credentials, 
-        cache_discovery=False, 
-        static_discovery=False  # <--- Add this line
-    )
-
-def export_and_download(images_to_export, reference_date, aoi, drive_service, output_root, timestamp):
-    date_str = reference_date.strftime("%Y-%m-%d")
-    local_dir = os.path.join(output_root, f'Outputs_{date_str}')
-    os.makedirs(local_dir, exist_ok=True)
-
-    task_list = []
-
-    for name, img in images_to_export.items():
-        file_prefix = f"{name}_{timestamp}"
-        task = ee.batch.Export.image.toDrive(
-            image=img, description=file_prefix, folder="GEE_Exports",
-            fileNamePrefix=file_prefix, region=aoi, scale=10, maxPixels=1e12
-        )
-        task.start()
-        task_list.append({'name': name, 'prefix': file_prefix, 'task': task})
-        print(f"Started GEE Task: {name}", flush=True)
-
-    print("Waiting GEE completion...", flush=True)
-    completed = 0
-    while completed < len(task_list):
-        for item in task_list:
-            if item.get('done'): continue
-            status = item['task'].status()
-            if status['state'] == 'COMPLETED':
-                fname = f"{item['prefix']}.tif"
-                res = drive_service.files().list(q=f"name='{fname}' and trashed=false").execute()
-                files = res.get('files', [])
-                if files:
-                    request = drive_service.files().get_media(fileId=files[0]['id'])
-                    with io.FileIO(os.path.join(local_dir, fname), 'wb') as fh:
-                        downloader = MediaIoBaseDownload(fh, request)
-                        d = False
-                        while not d: _, d = downloader.next_chunk()
-                    print(f"Downloaded: {fname}", flush = True)
-                    item['done'] = True
-                    completed += 1
-            elif status['state'] in ['FAILED', 'CANCELLED']:
-                print(f"Task {item['name']} failed: {status.get('error_message')}", flush = True)
-                item['done'] = True
-                completed += 1
-        if completed < len(task_list): time.sleep(30)
-    return local_dir
-
-def convert_to_cog(folder):
-    dst_profile = cog_profiles.get("deflate")
-
-    for tif in glob.glob(os.path.join(folder, "*.tif")):
-        # Skip if it's already a COG or not a standard TIF
-        if tif.endswith("_cog.tif"): 
-            continue
-        
-        output_cog = tif.replace(".tif", "_cog.tif")
-        
-        print(f"Converting to COG: {os.path.basename(tif)}...", flush=True)
-        try:
-            cog_translate(
-                tif, 
-                output_cog, 
-                dst_profile, 
-                in_memory=False, 
-                quiet=True
-            )
-        except Exception as e:
-            print(f"Failed to convert {tif}: {e}", flush=True)
-            
-class Logger(object):
-    def __init__(self, filename):
-        self.terminal = sys.stdout
-        self.log = open(filename, "a", encoding="utf-8")
-
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-        self.log.flush()
-
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
 
 # ============================================================
 # MAIN PROCESSING PIPELINE
@@ -177,7 +42,7 @@ def run_pipeline(config_path):
     with open(config_path, "r") as f:
         cfg = json.load(f)
 
-    ee.Initialize(project=cfg.get("project_id"))
+    initialize_ee(cfg["drive_token_path"], cfg.get("project_id"))
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     
@@ -188,7 +53,9 @@ def run_pipeline(config_path):
     doy = ref_date.timetuple().tm_yday
     
     date_str = ref_date.strftime("%Y-%m-%d")
-    local_dir = os.path.join(cfg["output_root"], f'Outputs_{date_str}')
+    task_name = cfg.get("task_name", "")
+    name_suffix = f"_{task_name}" if task_name else ""
+    local_dir = os.path.join(cfg["output_root"], f'Outputs_{date_str}{name_suffix}')
     os.makedirs(local_dir, exist_ok=True)
 
     # logging of console outputs
@@ -223,17 +90,17 @@ def run_pipeline(config_path):
         .filterDate(start, ref_date) \
         .filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING')) \
         .sort('system:time_start', False)
-    s1_asc = apply_radar_mask_to_collection(s1_asc, elev);
+    s1_asc = apply_radar_mask_to_collection(s1_asc, elev)
 
     s1_desc = s1 \
         .filterDate(start, ref_date) \
         .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING')) \
         .sort('system:time_start', False)
-    s1_desc =  apply_radar_mask_to_collection(s1_desc, elev);
+    s1_desc =  apply_radar_mask_to_collection(s1_desc, elev)
 
     # Reduce to the recent days, and the earlier days
-    recent_asc = s1_asc.filterDate(ref_date-datetime.timedelta(days=13),ref_date);
-    recent_desc = s1_desc.filterDate(ref_date-datetime.timedelta(days=13),ref_date);
+    recent_asc = s1_asc.filterDate(ref_date-datetime.timedelta(days=13),ref_date)
+    recent_desc = s1_desc.filterDate(ref_date-datetime.timedelta(days=13),ref_date)
     earlier_asc = s1_asc.filterDate(ref_date-datetime.timedelta(days=25), ref_date-datetime.timedelta(days=13))
     earlier_desc = s1_desc.filterDate(ref_date-datetime.timedelta(days=25), ref_date-datetime.timedelta(days=13))
 
@@ -269,12 +136,13 @@ def run_pipeline(config_path):
     # apply terrain and mask
     masked_mean = mean_img.updateMask(terrain_mask).focal_mean(5)
     #masked_mean_prev = mean_prev.updateMask(terrain_mask)
-    masked_diff = mean_diff.updateMask(terrain_mask)
+
     
     # flagging
     # water/land transition between -14(very likely land -> likelyhood water = 0) and -18(very likely water -> likelyhood water = 1)
     potential_water = masked_mean.select('VV').subtract(-14).divide(-4)
     focal_mean = potential_water.focal_mean(3) # spatial clustering: focal mean of potential water
+    masked_diff = mean_diff.updateMask(focal_mean)
 
     latest_asc_anomaly = latest_asc.select('VV') \
         .subtract(hist_asc_stats.select('VV_mean')) \
@@ -293,20 +161,31 @@ def run_pipeline(config_path):
 
     
 # ============================================================
-# Export and download
+# EXPORT AND DOWNLOAD
 # ============================================================
-    drive_service = build_drive_service(cfg["service_account_path"])
+    token_path = cfg["drive_token_path"]
     exports = {
         "potential_water": potential_water,
-        "z_score": zscore_mean,
-        "mean_diff": masked_diff.toFloat()
+        "z_score": zscore_mean# ,
+        # "mean_diff": masked_diff.toFloat()
     }
 
-    local_path = export_and_download(exports, ref_date, aoi, drive_service, cfg["output_root"], timestamp)
+    local_path = export_and_download(exports, ref_date, aoi, token_path, cfg["output_root"], timestamp, task_name)
     convert_to_cog(local_path)
 
-    return "Processing successful"
 
+# ============================================================
+# CLUSTERING
+# ============================================================    
+    z_score_files = glob.glob(os.path.join(local_path, "z_score*.tif"))
+    z_score_files = [f for f in z_score_files if not f.endswith("_cog.tif")]
+    if z_score_files:
+        z_score_tif = z_score_files[0]
+        
+        # Run local clustering - PASSING THE TIMESTAMP HERE
+        poly_file, summary_file = cluster_processing(z_score_tif, timestamp)
+            
+    return "Processing complete."
 
 # ============================================================
 # SCRIPT ENTRY
