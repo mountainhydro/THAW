@@ -11,13 +11,12 @@ import subprocess
 import sys
 from datetime import datetime, timedelta
 import rasterio
-from rasterio.warp import transform_bounds, calculate_default_transform, reproject, Resampling
-from rasterio.crs import CRS as RioCRS
+from rasterio.warp import transform_bounds
+import base64
 from streamlit_folium import st_folium
 from folium.plugins import MeasureControl, Draw, Fullscreen
 from tracking_viewer import render_tracking_viewer
 import matplotlib.pyplot as plt
-import base64
 from PIL import Image
 
 # --- 1. Function Definitions ---
@@ -229,30 +228,51 @@ draw = Draw(
 ).add_to(m)
 m.add_child(MeasureControl(position='topleft'))
 
-from io import BytesIO
 
-_MERCATOR = RioCRS.from_epsg(3857)
+
+from io import BytesIO
+from rasterio.warp import calculate_default_transform, reproject, Resampling as _Resampling
+from rasterio.crs import CRS as _RioCRS
+
+_MERCATOR = _RioCRS.from_epsg(3857)
+_MAP_W, _MAP_H = 900, 550  # matches st_folium width/height
 
 @st.cache_data(show_spinner=False)
 def _render_tif(tif_path, vis_min, vis_max, palette, mask_below_zero, mtime):
-    """Reproject to Web Mercator, colourise, encode PNG. Cached by (path, mtime)."""
+    """Read at map display resolution, reproject, colourise, encode PNG.
+    Cached by (path, mtime) so re-renders only when the file changes."""
     try:
         with rasterio.open(tif_path) as src:
-            dst_transform, dst_w, dst_h = calculate_default_transform(
-                src.crs, _MERCATOR, src.width, src.height, *src.bounds)
-            raw = src.read(1).astype(np.float32)
+            # Scale to fit within map display dimensions — preserves aspect ratio
+            scale = min(_MAP_W / src.width, _MAP_H / src.height)
+            read_w = max(1, int(src.width  * scale))
+            read_h = max(1, int(src.height * scale))
+
+            raw = src.read(
+                1,
+                out_shape=(read_h, read_w),
+                resampling=_Resampling.average,
+            ).astype(np.float32)
+
+            from rasterio.transform import from_bounds as _tfm_from_bounds
+            scaled_transform = _tfm_from_bounds(*src.bounds, read_w, read_h)
+
             if src.nodata is not None:
                 raw[raw == src.nodata] = np.nan
             if mask_below_zero:
-                raw[raw < 0] = np.nan  # sub-zero = non-water, treat as nodata
+                raw[raw < 0] = np.nan
+
+            dst_transform, dst_w, dst_h = calculate_default_transform(
+                src.crs, _MERCATOR, read_w, read_h, *src.bounds)
             dst = np.full((dst_h, dst_w), np.nan, dtype=np.float32)
             reproject(
                 source=raw, destination=dst,
-                src_transform=src.transform, src_crs=src.crs,
+                src_transform=scaled_transform, src_crs=src.crs,
                 dst_transform=dst_transform, dst_crs=_MERCATOR,
-                resampling=Resampling.bilinear,
+                resampling=_Resampling.bilinear,
                 src_nodata=np.nan, dst_nodata=np.nan,
             )
+
         merc_w = dst_transform.c
         merc_n = dst_transform.f
         merc_e = merc_w + dst_transform.a * dst_w
@@ -273,7 +293,7 @@ def _render_tif(tif_path, vis_min, vis_max, palette, mask_below_zero, mtime):
 
 # Add TIF Layers
 if tif_files:
-    with st.spinner("Loading map layers, please wait..."):
+    with st.spinner("Loading map layers..."):
         for tif in tif_files:
             basename = os.path.basename(tif)
             vis = get_vis_params(basename)

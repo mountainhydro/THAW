@@ -17,6 +17,7 @@ import sys
 import glob
 import time
 import ee
+import rasterio
 from googleapiclient.http import MediaIoBaseDownload
 from rio_cogeo.cogeo import cog_translate
 from rio_cogeo.profiles import cog_profiles
@@ -86,27 +87,158 @@ def delete_drive_files(token_path, file_ids):
             print(f"Warning: could not delete Drive file {fid}: {e}", flush=True)
 
 
+def _download_and_merge_tiles(drive_service, file_prefix, local_path):
+    """
+    Find all Drive files whose name starts with file_prefix, download them,
+    merge into a single GeoTIFF at local_path, and return all Drive file IDs.
+
+    GEE appends tile suffixes (-0000000000-0000000000, -0000000000-0000016384,
+    etc.) whenever an export is split across multiple files. This function
+    handles both single-file and multi-tile exports transparently.
+
+    Parameters
+    ----------
+    drive_service : googleapiclient.discovery.Resource
+    file_prefix   : str  — GEE fileNamePrefix (without .tif)
+    local_path    : str  — desired final merged output path
+
+    Returns
+    -------
+    list[str]  Drive file IDs that were downloaded (empty if nothing found yet)
+    """
+    res = drive_service.files().list(
+        q=f"name contains '{file_prefix}' and trashed=false",
+        fields="files(id, name)",
+        orderBy="name",
+    ).execute()
+    files = res.get("files", [])
+
+    if not files:
+        return []
+
+    drive_ids = [f["id"] for f in files]
+    local_dir = os.path.dirname(local_path)
+
+    if len(files) == 1:
+        # Single file — download directly to final path
+        request = drive_service.files().get_media(fileId=files[0]["id"])
+        with io.FileIO(local_path, "wb") as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+        print(f"Downloaded: {files[0]['name']}", flush=True)
+
+    else:
+        # Multiple tiles — download to temp files then merge
+        tile_paths = []
+        for f in files:
+            tile_path = os.path.join(local_dir, f["name"])
+            request = drive_service.files().get_media(fileId=f["id"])
+            with io.FileIO(tile_path, "wb") as fh:
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+            print(f"Downloaded tile: {f['name']}", flush=True)
+            tile_paths.append(tile_path)
+
+        print(f"Merging {len(tile_paths)} tiles into {os.path.basename(local_path)}...", flush=True)
+        src_files = [rasterio.open(p) for p in tile_paths]
+        try:
+            # Compute combined bounds and output profile without loading data
+            from rasterio.transform import from_bounds
+            lefts   = [s.bounds.left   for s in src_files]
+            bottoms = [s.bounds.bottom for s in src_files]
+            rights  = [s.bounds.right  for s in src_files]
+            tops    = [s.bounds.top    for s in src_files]
+            out_left, out_bottom = min(lefts), min(bottoms)
+            out_right, out_top   = max(rights), max(tops)
+            res = src_files[0].res
+            out_w = int(round((out_right  - out_left)   / res[1]))
+            out_h = int(round((out_top    - out_bottom) / res[0]))
+            out_transform = from_bounds(out_left, out_bottom, out_right, out_top, out_w, out_h)
+
+            profile = src_files[0].profile.copy()
+            profile.update({
+                "height":    out_h,
+                "width":     out_w,
+                "transform": out_transform,
+                "dtype":     "float32",
+                "nodata":    src_files[0].nodata,
+            })
+
+            # Write output window by window — no full mosaic in memory
+            CHUNK = 1024
+            with rasterio.open(local_path, "w", **profile) as dst:
+                import numpy as np
+                for row_off in range(0, out_h, CHUNK):
+                    row_end = min(row_off + CHUNK, out_h)
+                    chunk_h = row_end - row_off
+                    chunk = np.full((1, chunk_h, out_w), np.nan, dtype=np.float32)
+                    for src in src_files:
+                        # Find overlap between this chunk and this tile
+                        from rasterio.windows import from_bounds as win_from_bounds
+                        chunk_top    = out_top    - row_off * res[0]
+                        chunk_bottom = out_top    - row_end * res[0]
+                        win = win_from_bounds(out_left, chunk_bottom, out_right, chunk_top, src.transform)
+                        try:
+                            win = win.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
+                        except rasterio.errors.WindowError:
+                            continue  # this tile doesn't overlap this chunk row
+                        if win.width <= 0 or win.height <= 0:
+                            continue
+                        data = src.read(1, window=win).astype(np.float32)
+                        nodata = src.nodata
+                        if nodata is not None:
+                            data[data == nodata] = np.nan
+                        # Place into correct position in chunk
+                        tile_left   = src.bounds.left
+                        tile_top    = src.bounds.top
+                        col_start = int(round((tile_left  - out_left) / res[1]))
+                        row_start = int(round((out_top    - tile_top)  / res[0])) - row_off
+                        r0 = max(row_start, 0)
+                        c0 = max(col_start, 0)
+                        dr = r0 - row_start
+                        dc = c0 - col_start
+                        r1 = min(r0 + data.shape[0] - dr, chunk_h)
+                        c1 = min(c0 + data.shape[1] - dc, out_w)
+                        src_r1 = dr + (r1 - r0)
+                        src_c1 = dc + (c1 - c0)
+                        valid = ~np.isnan(data[dr:src_r1, dc:src_c1])
+                        chunk[0, r0:r1, c0:c1][valid] = data[dr:src_r1, dc:src_c1][valid]
+                    dst.write(chunk, window=rasterio.windows.Window(0, row_off, out_w, chunk_h))
+            print(f"Merged: {os.path.basename(local_path)}", flush=True)
+        finally:
+            for src in src_files:
+                src.close()
+            for tile_path in tile_paths:
+                try:
+                    os.remove(tile_path)
+                except Exception:
+                    pass
+
+    return drive_ids
+
+
 def _poll_and_download(task_list, drive_service, token_path):
     """
-    Poll a list of GEE export tasks, download each file as it completes,
-    then permanently delete all downloaded files from Drive.
+    Poll a list of GEE export tasks, download each file as it completes
+    (handling multi-tile exports transparently), then delete all files from Drive.
 
     Each item in task_list must be a dict with keys:
         task          : ee.batch.Task  — the running GEE export task
         file_prefix   : str            — GEE export fileNamePrefix (without .tif)
         local_path    : str            — full local path to write the downloaded file
         label         : str            — human-readable name used in log messages
-        drive_file_id : None           — populated once the file is found in Drive
+        drive_file_ids: []             — populated with Drive IDs once downloaded
         done          : False          — set to True when the item is resolved
 
     Parameters
     ----------
     task_list : list[dict]
-        Export task descriptors as described above.
     drive_service : googleapiclient.discovery.Resource
-        Authenticated Drive client.
     token_path : str
-        Path to drive_token.json, used for the cleanup step.
     """
     print(f"Waiting for {len(task_list)} GEE task(s)...", flush=True)
     completed = 0
@@ -119,26 +251,14 @@ def _poll_and_download(task_list, drive_service, token_path):
             status = item["task"].status()
 
             if status["state"] == "COMPLETED":
-                fname = f"{item['file_prefix']}.tif"
-                res = drive_service.files().list(
-                    q=f"name='{fname}' and trashed=false",
-                    fields="files(id)",
-                ).execute()
-                files = res.get("files", [])
-
-                if files:
-                    file_id = files[0]["id"]
-                    request = drive_service.files().get_media(fileId=file_id)
-                    with io.FileIO(item["local_path"], "wb") as fh:
-                        downloader = MediaIoBaseDownload(fh, request)
-                        done = False
-                        while not done:
-                            _, done = downloader.next_chunk()
-                    print(f"Downloaded: {fname}", flush=True)
-                    item["drive_file_id"] = file_id
+                drive_ids = _download_and_merge_tiles(
+                    drive_service, item["file_prefix"], item["local_path"]
+                )
+                if drive_ids:
+                    item["drive_file_ids"] = drive_ids
                     item["done"] = True
                     completed += 1
-                # File not yet visible in Drive — retry on next pass
+                # No files visible yet in Drive — retry on next pass
 
             elif status["state"] in ["FAILED", "CANCELLED"]:
                 print(
@@ -151,8 +271,12 @@ def _poll_and_download(task_list, drive_service, token_path):
         if completed < len(task_list):
             time.sleep(30)
 
-    # Delete all successfully downloaded files from Drive
-    ids_to_delete = [item["drive_file_id"] for item in task_list if item.get("drive_file_id")]
+    # Delete all downloaded files from Drive
+    ids_to_delete = [
+        fid
+        for item in task_list
+        for fid in item.get("drive_file_ids", [])
+    ]
     if ids_to_delete:
         print(f"Cleaning up {len(ids_to_delete)} file(s) from Google Drive...", flush=True)
         delete_drive_files(token_path, ids_to_delete)
@@ -211,16 +335,72 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
         )
         task.start()
         task_list.append({
-            "task":          task,
-            "file_prefix":   file_prefix,
-            "local_path":    os.path.join(local_dir, f"{file_prefix}.tif"),
-            "label":         name,
-            "drive_file_id": None,
-            "done":          False,
+            "task":           task,
+            "file_prefix":    file_prefix,
+            "local_path":     os.path.join(local_dir, f"{file_prefix}.tif"),
+            "label":          name,
+            "drive_file_ids": [],
+            "done":           False,
         })
         print(f"Started GEE task: {name}", flush=True)
 
     _poll_and_download(task_list, drive_service, token_path)
+    return local_dir
+
+
+def resume_download(export_names, reference_date, token_path, output_root,
+                    timestamp, task_name=""):
+    """
+    Resume a failed lakedetection download without re-running GEE tasks.
+
+    Use this when GEE exports completed and files are still in Drive, but the
+    pipeline crashed before finishing the download/merge/COG/cluster steps.
+    Files that already exist locally are skipped automatically.
+
+    Parameters
+    ----------
+    export_names : list[str]
+        Export name prefixes to recover, e.g. ['potential_water', 'z_score', 'mean_diff'].
+    reference_date : datetime.datetime
+        Reference date used to locate the output subdirectory.
+    token_path : str
+        Path to drive_token.json.
+    output_root : str
+        Parent directory containing the dated output subfolder.
+    timestamp : str
+        Run timestamp string (YYYYMMDD_HHMM) from the failed run.
+    task_name : str, optional
+        Task name suffix used in the output folder name.
+
+    Returns
+    -------
+    str
+        Path to the local output directory.
+    """
+    date_str = reference_date.strftime("%Y-%m-%d")
+    name_suffix = f"_{task_name}" if task_name else ""
+    local_dir = os.path.join(output_root, f"Outputs_{date_str}{name_suffix}")
+    os.makedirs(local_dir, exist_ok=True)
+
+    drive_service = build_drive_service(token_path)
+
+    for name in export_names:
+        file_prefix = f"{name}_{timestamp}"
+        local_path = os.path.join(local_dir, f"{file_prefix}.tif")
+
+        if os.path.exists(local_path):
+            print(f"Already exists, skipping: {os.path.basename(local_path)}", flush=True)
+            continue
+
+        print(f"Resuming download: {file_prefix}", flush=True)
+        drive_ids = _download_and_merge_tiles(drive_service, file_prefix, local_path)
+
+        if drive_ids:
+            delete_drive_files(token_path, drive_ids)
+        else:
+            print(f"Warning: no Drive files found for {file_prefix}. "
+                  f"They may have already been deleted.", flush=True)
+
     return local_dir
 
 
@@ -291,12 +471,12 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
                 )
                 task.start()
                 task_list.append({
-                    "task":          task,
-                    "file_prefix":   file_prefix,
-                    "local_path":    local_path,
-                    "label":         local_filename,
-                    "drive_file_id": None,
-                    "done":          False,
+                    "task":           task,
+                    "file_prefix":    file_prefix,
+                    "local_path":     local_path,
+                    "label":          local_filename,
+                    "drive_file_ids": [],
+                    "done":           False,
                 })
                 print(f"Task started: {local_filename}", flush=True)
             except Exception as e:
