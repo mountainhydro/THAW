@@ -33,7 +33,7 @@ if not exist "%BASE_DIR%temp" (
     echo Temp directory already exists, skipping cleanup to preserve credentials.
 )
 
-echo [3/3] Starting Streamlit...
+echo [3/3] Starting Streamlit... please don't close this window!
 "%PY%" -m streamlit run "%BASE_DIR%Dashboard\Dashboard.py" --server.port 8501 --server.address 127.0.0.1 --browser.gatherUsageStats false
 
 pause
