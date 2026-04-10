@@ -292,7 +292,7 @@ def get_glacier_thinning_correction(aoi_geom, sar_year, dem, dem_year=2000,
         return 0.0
 
     mean_thinning = sum(thinning_values) / sum(pixel_counts)
-    print(f"Mean thinning rate (2000–2019) over AOI: {mean_thinning:.4f} m/yr")
+    print(f"Mean thinning rate (2000-2019) over AOI: {mean_thinning:.4f} m/yr")
 
     percentile_25 = np.percentile(valid_pixels, 25)
     print(f"25th percentile thinning rate over AOI: {percentile_25:.4f} m/yr")

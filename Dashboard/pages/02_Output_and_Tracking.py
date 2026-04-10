@@ -235,16 +235,15 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling as 
 from rasterio.crs import CRS as _RioCRS
 
 _MERCATOR = _RioCRS.from_epsg(3857)
-_MAP_W, _MAP_H = 900, 550  # matches st_folium width/height
+_COG_MAX_PX = 4096  # cap longest dimension — uses COG overview, preserves detail
 
 @st.cache_data(show_spinner=False)
 def _render_tif(tif_path, vis_min, vis_max, palette, mask_below_zero, mtime):
-    """Read at map display resolution, reproject, colourise, encode PNG.
-    Cached by (path, mtime) so re-renders only when the file changes."""
+    """Reproject to Web Mercator, colourise, encode PNG. Cached by (path, mtime).
+    Reads at up to 4096px on the longest dimension using COG internal overviews."""
     try:
         with rasterio.open(tif_path) as src:
-            # Scale to fit within map display dimensions — preserves aspect ratio
-            scale = min(_MAP_W / src.width, _MAP_H / src.height)
+            scale = min(_COG_MAX_PX / src.width, _COG_MAX_PX / src.height, 1.0)
             read_w = max(1, int(src.width  * scale))
             read_h = max(1, int(src.height * scale))
 
