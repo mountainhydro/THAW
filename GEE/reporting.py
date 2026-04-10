@@ -4,14 +4,12 @@ THAW - Reporting module
 
 Post-processing and output generation for both pipelines:
 
-  Lakedetection: cluster_processing
-  Tracking:      extract_cluster_area_timeseries
-                 generate_lake_metrics_report
+  Lakedetection: cluster_processing — DBSCAN on z_score raster, saves GeoJSON + CSV
+  Tracking:      extract_cluster_area_timeseries — DBSCAN on likelihood TIFs per
+                 frame, computes area at three likelihood levels
+                 generate_lake_metrics_report — orchestrates metrics, plot, GIF
 
-GEE Processing code: Dr. Evan Miles
-Tool/Operationalization: Dr. Stefan Fugger
-
-Created on Feb 2 2026
+Replaces water_detection.py (reporting portions) and analysis.py entirely.
 """
 
 import os
@@ -19,6 +17,7 @@ import re
 import glob
 import json
 import math
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -36,29 +35,20 @@ from datetime import datetime
 
 def cluster_processing(tif_path, timestamp, z_thres=-2, min_size_cluster=20, pix=6):
     """
-    Run DBSCAN clustering on a z_score raster and save results.
-
-    Candidate pixels are those with z_score <= z_thres (anomalously low
-    backscatter). Saves a GeoJSON polygon file and a CSV summary to the
-    same directory as the input raster.
+    DBSCAN clustering on a z_score raster. Candidate pixels are those <= z_thres
+    (anomalously low backscatter). Saves a GeoJSON polygon file and a CSV summary.
 
     Parameters
     ----------
-    tif_path : str
-        Path to the z_score GeoTIFF.
-    timestamp : str
-        Run timestamp used in output filenames (YYYYMMDD_HHMM).
-    z_thres : float, optional
-        Z-score threshold; pixels at or below this are candidates (default -2).
-    min_size_cluster : int, optional
-        DBSCAN min_samples parameter (default 20).
-    pix : int, optional
-        DBSCAN eps parameter in pixels (default 6).
+    tif_path         : str   — path to the z_score GeoTIFF
+    timestamp        : str   — run timestamp used in output filenames
+    z_thres          : float — z_score threshold; pixels <= this are candidates
+    min_size_cluster : int   — DBSCAN min_samples
+    pix              : int   — DBSCAN eps (pixels)
 
     Returns
     -------
-    tuple[str, str] or tuple[None, None]
-        Paths to (poly_path, summary_path), or (None, None) if no clusters found.
+    (poly_path, summary_path) or (None, None) if no clusters found
     """
     print(f"Starting cluster detection: {os.path.basename(tif_path)}", flush=True)
 
@@ -146,21 +136,22 @@ def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
     """
     Compute lake area time series from locally downloaded lake_likelihood TIFs.
 
+    For each frame, DBSCAN is run at the mid threshold to identify lake clusters.
+    Area is then computed at three likelihood levels:
+      lower_area_km2 — pixels within clusters where likelihood >= lower threshold
+      mean_area_km2  — likelihood-weighted area within clusters (sum × pixel area)
+      upper_area_km2 — pixels within clusters where likelihood >= upper threshold
+
     Parameters
     ----------
-    out_dir : str
-        Directory containing ``*lake_likelihood*.tif`` files.
-    thresholds : tuple[float, float, float], optional
-        (lower, mid, upper) likelihood thresholds (default (0.1, 0.5, 0.9)).
-    min_size_cluster : int, optional
-        DBSCAN min_samples parameter (default 20).
-    pix : int, optional
-        DBSCAN eps parameter in pixels (default 6).
+    out_dir          : str   — directory containing *lake_likelihood*.tif files
+    thresholds       : tuple — (lower, mid, upper) likelihood thresholds
+    min_size_cluster : int   — DBSCAN min_samples
+    pix              : int   — DBSCAN eps (pixels)
 
     Returns
     -------
-    pd.DataFrame
-        Columns: date, mean_area_km2, lower_area_km2, upper_area_km2.
+    pd.DataFrame with columns: date, mean_area_km2, lower_area_km2, upper_area_km2
     """
     lower_thresh, mid_thresh, upper_thresh = thresholds
 
@@ -205,11 +196,11 @@ def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
 
         # Find candidate pixels at mid threshold for DBSCAN
         valid = np.isfinite(data)
-        candidate = valid & (data >= lower_thresh)
+        candidate = valid & (data >= mid_thresh)
         ys, xs = np.nonzero(candidate)
 
         if len(ys) == 0:
-            print(f"  No clusters found above {lower_thresh}.", flush=True)
+            print(f"  No clusters found above {mid_thresh}.", flush=True)
             dates.append(date_str)
             areas_mean.append(0.0)
             areas_lower.append(0.0)
@@ -235,14 +226,14 @@ def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
         cluster_xs = xs[cluster_mask]
         cluster_vals = data[cluster_ys, cluster_xs]
 
-        # Area at three likelihood levels, summed across all clusters
+        # Area at three levels, summed across all clusters
         lower_area = float((cluster_vals >= lower_thresh).sum()) * pix_area_km2
-        mean_area  = float((cluster_vals >= mid_thresh).sum())   * pix_area_km2
+        mean_area  = float(cluster_vals.sum()) * pix_area_km2  # likelihood-weighted
         upper_area = float((cluster_vals >= upper_thresh).sum()) * pix_area_km2
 
         n_clusters = len(set(labels[cluster_mask]))
-        print(f"  {n_clusters} cluster(s) — lower (≥{lower_thresh}): {lower_area:.4f} km2, "
-              f"mid (≥{mid_thresh}): {mean_area:.4f} km2, upper (≥{upper_thresh}): {upper_area:.4f} km2", flush=True)
+        print(f"  {n_clusters} cluster(s) - lower: {lower_area:.4f} km2, "
+              f"mid: {mean_area:.4f} km2, upper: {upper_area:.4f} km2", flush=True)
 
         dates.append(date_str)
         areas_mean.append(mean_area)
@@ -267,17 +258,13 @@ def flag_growth_trend(areas, dates, threshold_km2=0.05):
 
     Parameters
     ----------
-    areas : list[float]
-        Lake area values in km², ordered by date.
-    dates : list[str]
-        Corresponding date strings (same length as areas).
-    threshold_km2 : float, optional
-        Minimum area increase to flag as growth (default 0.05).
+    areas        : list[float] — lake area values in km2, ordered by date
+    dates        : list[str]   — corresponding date strings
+    threshold_km2: float       — minimum area increase to flag as growth
 
     Returns
     -------
-    bool
-        True if growth exceeds threshold, False otherwise.
+    bool: True if growth exceeds threshold, False otherwise.
     """
     if len(areas) < 2:
         return False
@@ -292,18 +279,6 @@ def flag_growth_trend(areas, dates, threshold_km2=0.05):
 def save_lake_metrics_plot_and_csv(df, output_csv='lake_metrics.csv', output_png='lake_plot.png'):
     """
     Save a lake area time series DataFrame to CSV and a PNG plot.
-
-    The plot shows the mid-threshold area (≥ 0.5) as a line with the
-    lower/upper uncertainty band shaded in light blue.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must contain columns: date, mean_area_km2, lower_area_km2, upper_area_km2.
-    output_csv : str, optional
-        Output CSV path (default 'lake_metrics.csv').
-    output_png : str, optional
-        Output PNG path (default 'lake_plot.png').
     """
     df.to_csv(output_csv, index=False)
 
@@ -311,7 +286,7 @@ def save_lake_metrics_plot_and_csv(df, output_csv='lake_metrics.csv', output_png
     plt.figure(figsize=(10, 6))
     plt.fill_between(date_objs, df['upper_area_km2'], df['lower_area_km2'],
                      color='lightblue', alpha=0.5, label='Uncertainty')
-    plt.plot(date_objs, df['mean_area_km2'], label='Mid-threshold area (≥0.5)', color='blue')
+    plt.plot(date_objs, df['mean_area_km2'], label='Likelihood-weighted area', color='blue')
     plt.xlabel('Date')
     plt.ylabel('Water Area (km2)')
     plt.title('Lake Area over Time (Cluster-based Likelihood)')
@@ -336,23 +311,16 @@ def generate_lake_metrics_report(
     thresholds=(0.1, 0.5, 0.9),
 ):
     """
-    Orchestrate cluster-based lake metrics for the tracking pipeline.
-
-    Computes area time series from downloaded likelihood TIFs, saves a CSV
-    and plot, flags growth trend, and builds an animated monitoring GIF.
+    Compute cluster-based lake area metrics from downloaded likelihood TIFs,
+    save CSV + plot, flag growth trend, and build animated GIF.
 
     Parameters
     ----------
-    output_dir : str
-        Directory containing downloaded ``*lake_likelihood*.tif`` files.
-    gif_output_path : str, optional
-        Path for the output GIF (default: output_dir/lake_monitoring.gif).
-    csv_filename : str, optional
-        Output CSV path (default: output_dir/lake_metrics.csv).
-    png_filename : str, optional
-        Output plot path (default: output_dir/lake_metrics_plot.png).
-    thresholds : tuple[float, float, float], optional
-        (lower, mid, upper) likelihood thresholds (default (0.1, 0.5, 0.9)).
+    output_dir      : str   — directory containing downloaded *lake_likelihood*.tif files
+    gif_output_path : str   — path for the GIF (default: output_dir/lake_monitoring.gif)
+    csv_filename    : str   — output CSV path (default: output_dir/lake_metrics.csv)
+    png_filename    : str   — output plot path (default: output_dir/lake_metrics_plot.png)
+    thresholds      : tuple — (lower, mid, upper) likelihood thresholds
     """
     os.makedirs(output_dir, exist_ok=True)
     if csv_filename is None:
@@ -435,30 +403,8 @@ def build_lake_monitoring_gif(out_dir, dates, areas_km2,
                                duration=600,
                                font_path=None):
     """
-    Build an animated lake monitoring GIF from exported TIF files.
-
-    Each frame shows three panels side by side — Raw VV | Corrected VV |
-    Lake Likelihood — with date and area overlaid as text. Frames are
-    assembled in date order and saved as a looping GIF.
-
-    Parameters
-    ----------
-    out_dir : str
-        Directory containing exported ``*{band}*.tif`` files.
-    dates : list[str]
-        Ordered list of date strings, one per frame.
-    areas_km2 : list[float]
-        Lake area in km² for each frame, overlaid as text.
-    bands : list[str], optional
-        Band names to look for (default ['VV_raw', 'VV_corrected', 'lake_likelihood']).
-    target_size : tuple[int, int], optional
-        Final GIF frame dimensions in pixels (default (1800, 600)).
-    gif_filename : str, optional
-        Output GIF path (default: out_dir/lake_monitoring.gif).
-    duration : int, optional
-        Frame duration in milliseconds (default 600).
-    font_path : str, optional
-        Path to a .ttf font file. Falls back to PIL default if not found.
+    Build a lake monitoring GIF from exported TIF files.
+    Panels: Raw VV | Corrected VV | Lake Likelihood, with date and area overlay.
     """
     if gif_filename is None:
         gif_filename = os.path.join(out_dir, "lake_monitoring.gif")
