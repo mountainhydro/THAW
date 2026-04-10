@@ -13,6 +13,7 @@ import glob
 import json
 import subprocess
 import sys
+import pandas as pd  # Added for GLOF CSV processing
 import rasterio
 from rasterio.warp import transform_bounds
 from datetime import datetime, date as dt_date
@@ -60,9 +61,6 @@ def write_job_config(is_manual=True, task_name=""):
         "aoi_geojson": aoi_p,
         "project_id": project_id,
         "drive_token_path": DRIVE_TOKEN_FILE,
-        # output_root stays as the plain parent folder; lakedetection_headless.py
-        # appends its own Outputs_YYYY-MM-DD subfolder. task_name is passed
-        # separately so the headless script can suffix that folder name.
         "output_root": OUTPUT_DIR,
         "task_name": safe_name,
     }
@@ -77,7 +75,7 @@ def write_job_config(is_manual=True, task_name=""):
 
 def calculate_bbox_area_km2(geometry):
     """
-    Calculates approximate bounding box area (km²)
+    Calculates approximate bounding box area (km2)
     from WGS84 polygon coordinates.
     """
     import math
@@ -104,6 +102,7 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 DASH_DIR = os.path.dirname(CURRENT_DIR)                 
 ROOT_DIR = os.path.dirname(DASH_DIR)                    
 TEMP_DIR = os.path.join(ROOT_DIR, "temp")
+DOCS_DIR = os.path.join(ROOT_DIR, "docs")  # Defined for GLOF CSV
 CRED_FILE = os.path.join(TEMP_DIR, "gee_credentials.txt")
 DRIVE_TOKEN_FILE = os.path.join(TEMP_DIR, "drive_token.json")
 GEE_DIR = os.path.join(ROOT_DIR, "GEE")
@@ -117,12 +116,10 @@ project_id, service_account_path = load_gee_creds()
 st.set_page_config(layout="wide", page_title="Job Scheduler")
 
 if not project_id:
-    st.error("**No Credentials Found.** Please go to the **Home** page and log in first.")
+    st.error("**No Credentials Found.** Please go to the Home page and log in first.")
     st.stop()
 
 # 4. Data Discovery
-# Folder names may now be "Outputs_YYYY-MM-DD" or "Outputs_YYYY-MM-DD_Name";
-# extract the date from the first 10 characters after the "Outputs_" prefix.
 output_folders = glob.glob(os.path.join(OUTPUT_DIR, "Outputs_*"))
 dated_folders = []
 for f in output_folders:
@@ -134,27 +131,82 @@ for f in output_folders:
         continue
 
 dated_folders.sort(key=lambda x: x[1], reverse=True)
-latest_folder = dated_folders[0][0] if dated_folders else None
-tif_files = glob.glob(os.path.join(latest_folder, "*_cog.tif")) if latest_folder else []
 
 # 5. UI Header and Map Setup
 st.title("THAW Task Manager and Scheduler")
-st.success(f"Connected to Project: `{project_id}`")
+st.success(f"Connected to Project: {project_id}")
 
-center = [28.3, 85.6]
-fit_bounds = None
-if tif_files:
+# Use HMA center as default and removed automatic tif-based zooming
+center = [36.0, 86] 
+fit_bounds = None 
+
+# Zoom-to-location manual controls
+with st.expander("Zoom to location", expanded=False):
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
+        zoom_lat = st.number_input("Latitude", value=float(center[0]), min_value=-90.0, max_value=90.0, format="%.5f")
+    with col2:
+        zoom_lon = st.number_input("Longitude", value=float(center[1]), min_value=-180.0, max_value=180.0, format="%.5f")
+    with col3:
+        st.write("")
+        st.write("")
+        zoom_clicked = st.button("Go", use_container_width=True)
+
+if zoom_clicked:
+    center = [zoom_lat, zoom_lon]
+    # Small window around manual input
+    fit_bounds = [[zoom_lat - 0.5, zoom_lon - 0.5], [zoom_lat + 0.5, zoom_lon + 0.5]]
+
+# Map initialized zoomed out (zoom_start=5) with no tiles to control base layer order
+m = folium.Map(location=center, zoom_start=5, tiles=None) 
+
+# Base Layer 1: Satellite (Default)
+folium.TileLayer(
+    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", 
+    name="Satellite", 
+    attr="Esri",
+    overlay=False
+).add_to(m)
+
+# Base Layer 2: OpenStreetMap
+folium.TileLayer('openstreetmap', name="OpenStreetMap", overlay=False).add_to(m)
+
+# Overlay Layer: Past GLOF Events
+glof_file = os.path.join(DOCS_DIR, "GLOFevents2015-.csv")
+if os.path.exists(glof_file):
     try:
-        with rasterio.open(tif_files[0]) as src:
-            wgs_bounds = transform_bounds(src.crs, 'EPSG:4326', *src.bounds)
-            center = [(wgs_bounds[1] + wgs_bounds[3]) / 2, (wgs_bounds[0] + wgs_bounds[2]) / 2]
-            fit_bounds = [[wgs_bounds[1], wgs_bounds[0]], [wgs_bounds[3], wgs_bounds[2]]]
-    except (rasterio.errors.RasterioIOError, ValueError) as e:
-        st.warning(f"Could not read raster bounds: {e}")
+        # Fixed encoding to cp1252 to handle special characters/non-breaking spaces
+        df_events = pd.read_csv(glof_file, encoding='cp1252')
+        glof_group = folium.FeatureGroup(name="Past GLOF Events")
+        
+        for _, row in df_events.iterrows():
+            if pd.notna(row['Lat_lake']) and pd.notna(row['Lon_lake']):
+                # Construct Label: Lake Name (YYYY-MM-DD)
+                name = str(row['Lake_name']) if pd.notna(row['Lake_name']) else "Unknown"
+                y = str(int(row['Year_exact'])) if pd.notna(row['Year_exact']) else "XXXX"
+                mv = str(int(row['Month'])).zfill(2) if pd.notna(row['Month']) else "XX"
+                dv = str(int(row['Day'])).zfill(2) if pd.notna(row['Day']) else "XX"
+                
+                label = f"{name} ({y}-{mv}-{dv})"
+                
+                folium.CircleMarker(
+                    location=[row['Lat_lake'], row['Lon_lake']],
+                    radius=5,
+                    color="red",
+                    weight=2,
+                    fill=True,
+                    fill_color="red",
+                    fill_opacity=0.6,
+                    tooltip=label,
+                    popup=label
+                ).add_to(glof_group)
+        
+        glof_group.add_to(m)
+    except Exception as e:
+        st.warning(f"Could not load GLOF markers: {e}")
 
-m = folium.Map(location=center, zoom_start=10)
-folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", 
-                  name="Satellite", attr="Esri").add_to(m)
+# Layer Selector
+folium.LayerControl(position='topright', collapsed=False).add_to(m)
 
 if fit_bounds:
     m.fit_bounds(fit_bounds)
@@ -167,26 +219,25 @@ aoi_geojson = None
 MAX_AOI_AREA_KM2 = 60000
 if draw_data and draw_data.get("all_drawings"):
     aoi_geojson = draw_data["all_drawings"][0]["geometry"]
-
     aoi_area = calculate_bbox_area_km2(aoi_geojson)
 
     if aoi_area > MAX_AOI_AREA_KM2:
         st.sidebar.error(
-            f"AOI too large ({aoi_area:,.0f} km²). "
-            f"Maximum allowed area is {MAX_AOI_AREA_KM2:,} km²."
+            f"AOI too large ({aoi_area:,.0f} km2). "
+            f"Maximum allowed area is {MAX_AOI_AREA_KM2:,} km2."
         )
         aoi_geojson = None
     else:
         coords = aoi_geojson.get("coordinates", [[]])[0]
         flat_coords = [f"{lon:.5f}, {lat:.5f}" for lon, lat in coords[:3]]
         st.sidebar.info(
-            f"AOI selected ({aoi_area:,.0f} km²): "
+            f"AOI selected ({aoi_area:,.0f} km2): "
             + " | ".join(flat_coords) + "..."
         )
 
-# ── Shared Task Name ──────────────────────────────────────────────────────────
+# Shared Task Name 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 🏷️ Task Name")
+st.sidebar.markdown("### Task Name")
 task_name_raw = st.sidebar.text_input(
     "Name",
     placeholder="e.g. Himalaya_Survey",
@@ -200,11 +251,11 @@ if task_name_raw and not has_name:
     st.sidebar.warning("Name contains only invalid characters. Use letters, numbers, hyphens or underscores.")
 elif has_name:
     run_date_preview = dt_date.today().isoformat()
-    st.sidebar.caption(f"Output folder: `Outputs_{run_date_preview}_{task_name_safe}`")
+    st.sidebar.caption(f"Output folder: Outputs_{run_date_preview}_{task_name_safe}")
 st.sidebar.markdown("---")
 
 # 6. Sidebar Manual Run
-st.sidebar.header("▶ Manual Run")
+st.sidebar.header("Manual Run")
 run_date = st.sidebar.date_input("Processing Date", value=dt_date.today(), max_value=dt_date.today())
 
 missing_now = []
@@ -214,14 +265,15 @@ if not has_name:
     missing_now.append("Enter a Task Name above")
 
 if missing_now:
+    st.sidebar.markdown("**Required for analysis:**")
     for msg in missing_now:
-        st.sidebar.warning(f"⚠ {msg}")
+        st.sidebar.warning(f"Note: {msg}")
 
-run_now_clicked = st.sidebar.button("▶ Run job now", disabled=bool(missing_now))
+run_now_clicked = st.sidebar.button("Run job now", disabled=bool(missing_now))
 st.sidebar.markdown("---")
 
 # 7. Sidebar Scheduling
-st.sidebar.header("📅 Scheduled Task")
+st.sidebar.header("Scheduled Task")
 if "frequency_changed" not in st.session_state:
     st.session_state.frequency_changed = False
 
@@ -251,11 +303,11 @@ if not st.session_state.frequency_changed:
 if missing_sch:
     st.sidebar.markdown("**Required for Scheduling:**")
     for msg in missing_sch:
-        st.sidebar.warning(f"⚠ {msg}")
+        st.sidebar.warning(f"Note: {msg}")
 else:
     st.sidebar.success("All required inputs provided.")
 
-schedule_clicked = st.sidebar.button("📅 Schedule job", disabled=bool(missing_sch))
+schedule_clicked = st.sidebar.button("Schedule job", disabled=bool(missing_sch))
 
 # 8. Execution Manual Job
 if run_now_clicked:
@@ -306,7 +358,7 @@ if schedule_clicked:
 
 # 10. Active Tasks Display
 st.divider()
-st.subheader("📋 Active Scheduled Tasks")
+st.subheader("Active Scheduled Tasks")
 st.caption("Note: Tasks missed while the computer is off will run after the system is turned back on.")
 
 try:
@@ -342,15 +394,15 @@ try:
 
             if "1999" in last_run_raw:
                 last_run_display = "Never Run"
-                result_display = "⚪ Pending first run"
+                result_display = "Pending first run"
             else:
                 last_run_display = last_run_raw
                 if result_code == '0':
-                    result_display = "✅ Success (0)"
+                    result_display = "Success (0)"
                 else:
-                    result_display = f"❌ Error ({result_code})"
+                    result_display = f"Error ({result_code})"
 
-            with st.expander(f"📌 {clean_name}"):
+            with st.expander(f"Task: {clean_name}"):
                 col1, col2 = st.columns(2)
                 
                 with col1:
@@ -362,7 +414,7 @@ try:
                     st.write(f"**Last Result:** {result_display}")
                     
 
-                if st.button(f"🗑️ Delete {clean_name}", key=f"del_{clean_name}"):
+                if st.button(f"Delete {clean_name}", key=f"del_{clean_name}"):
                     subprocess.run(f'schtasks /Delete /TN "{full_task_name}" /F', shell=True)
                     st.rerun()
                 
