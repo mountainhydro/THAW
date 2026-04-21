@@ -9,6 +9,7 @@ leafmap==0.57.10
 folium==0.20.0
 streamlit-folium==0.26.1
 rasterio
+scikit-learn
 
 # Visualization & Internal Streamlit Checks
 matplotlib
@@ -18,6 +19,7 @@ pyarrow
 # Google Auth
 google-api-python-client==2.188.0
 google-auth==2.41.1
+google-auth-oauthlib
 
 # Data (Pinned for stability)
 numpy==1.26.4
