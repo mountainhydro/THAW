@@ -55,27 +55,25 @@
 
 
 ## Authentication
-A step-by-step setup guide is available on the Dashboard login page.
+A **step-by-step setup guide** for getting you credentials is available on the Dashboard login page!
+
+In short, the following things are needed for running THAW:
 
 - Requires a GEE account and a registered GEE project
-  
 - Authentication uses an OAuth 2.0 client secret (Desktop app type), downloaded from Google Cloud Console
-  
-- On first login, a browser window opens once to authorise Earth Engine and Google Drive access — the token is saved automatically and reused on all subsequent runs
-  
-- Credentials are stored in temp/ and persist across restarts until you click Logout
 
 
 ### Launching tasks
 
 - Navigate to the **Scheduler** and costumize the task (scheduler or instantaneous run)
 
-  **Instantaneous run**
-  - Select a task name (e.g. "Langtang")
+  **Instantaneous run**:
+  - Select a task name (e.g. "Purepu")
   - Select run date
   - Select AOI (up to 60,000 km<sup>2</sup>)
+  - Click **Run job now**
     
-  **Scheduled task**
+  **Scheduled task**: Additionally,
   - Select the recurrence frequency and timing (One daily, one weekly and one monthly task can currently exist in parallel)
 
 
@@ -87,7 +85,7 @@ THAW/
 ├── Dashboard/            # Streamlit UI files (Main app interface)
 ├── docs/                 # files for documenting the tool
 ├── GEE/                  # Earth Engine processing, tracking and helper modules (lakedetection_headless.py)
-├── Outputs/              # Results storage: GeoTIFFs and logs (sorted by date)
+├── Outputs/              # Results storage: GeoTIFFs and logs (sorted by target date and task name)
 ├── config/               # Current task JSONs and AOI GeoJSON data
 ├── temp/                 # Local persistence (gee_credentials.txt)
 ├── python_portable/      # Isolated Python environment and libraries
