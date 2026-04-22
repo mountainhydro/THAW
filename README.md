@@ -75,6 +75,7 @@ In short, the following things are needed for running THAW:
     
   **Scheduled task**: Additionally,
   - Select the recurrence frequency and timing (One daily, one weekly and one monthly task can currently exist in parallel)
+  - Click **Schedule job**
 
 
 
