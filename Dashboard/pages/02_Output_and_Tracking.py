@@ -361,11 +361,19 @@ Fullscreen(
 folium.LayerControl(collapsed=False).add_to(m)
 map_output = st_folium(m, width="100%", height=620, returned_objects=["all_drawings"])
 
+# Extract drawn AOI from map regardless of whether clusters exist
+drawn_aoi = None
+if map_output and map_output.get("all_drawings"):
+    for drawing in map_output["all_drawings"]:
+        if drawing['geometry']['type'] == 'Polygon':
+            coords = drawing['geometry']['coordinates'][0]
+            lons, lats = [c[0] for c in coords], [c[1] for c in coords]
+            drawn_aoi = [min(lons), min(lats), max(lons), max(lats)]
+
 # --- 7. Data Sync & Table ---
 cluster_csv_files = glob.glob(os.path.join(folder_path, "cluster_summary*.csv"))
 data_rows = []
 selected_ids = []
-drawn_aoi = None
 
 if cluster_csv_files:
     cluster_csv_files.sort(key=os.path.getmtime, reverse=True)
@@ -381,14 +389,13 @@ if cluster_csv_files:
                 "Selected": " " 
             })
 
-    if map_output and map_output.get("all_drawings"):
+    if map_output and map_output.get("all_drawings") and drawn_aoi:
         for drawing in map_output["all_drawings"]:
             if drawing['geometry']['type'] == 'Polygon':
                 coords = drawing['geometry']['coordinates'][0]
                 lons, lats = [c[0] for c in coords], [c[1] for c in coords]
-                drawn_aoi = [min(lons), min(lats), max(lons), max(lats)]
                 for row in data_rows:
-                    if (min(lons) <= row["Centroid_Lon"] <= max(lons) and 
+                    if (min(lons) <= row["Centroid_Lon"] <= max(lons) and
                         min(lats) <= row["Centroid_Lat"] <= max(lats)):
                         selected_ids.append(str(row["Cluster_ID"]))
     
@@ -415,13 +422,13 @@ progress_container = st.empty()
 progress_container.info("No time tracking analysis running, or running in the background. *(Refreshing stops streaming of messages — an issue to fix.)*")
 
 st.sidebar.header("Cluster tracking over time")
+base_date_dt = datetime.strptime(selected_folder_date, "%Y-%m-%d")
+days_back = st.sidebar.slider("Look-back period (days)", 1, 180, 90)
+calc_start = (base_date_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
+st.sidebar.write(f"**Period:** {calc_start} to {selected_folder_date}")
+
 if drawn_aoi:
     st.sidebar.success(f"AOI Defined: {len(selected_ids)} clusters selected.")
-    base_date_dt = datetime.strptime(selected_folder_date, "%Y-%m-%d")
-    days_back = st.sidebar.slider("Look-back period (days)", 1, 180, 90)
-    calc_start = (base_date_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    st.sidebar.write(f"**Period:** {calc_start} to {selected_folder_date}")
-
     if st.sidebar.button("Run Tracking Analysis"):
         try:
             # 1. Write Config (Includes Credentials)
@@ -460,7 +467,7 @@ if drawn_aoi:
         except Exception as e:
             st.sidebar.error(f"Error: {e}")
 else:
-    st.sidebar.warning("Draw an area of interest on the map to define the target area for time tracking analysis.")
+    st.sidebar.info("Draw an area of interest on the map to select clusters for tracking.")
 
 
 # timetracking viewer
