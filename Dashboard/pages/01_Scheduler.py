@@ -136,9 +136,9 @@ dated_folders.sort(key=lambda x: x[1], reverse=True)
 st.title("THAW Task Manager and Scheduler")
 st.success(f"Connected to Project: {project_id}")
 
-# Use HMA center as default and removed automatic tif-based zooming
-center = [36.0, 86] 
-fit_bounds = None 
+# Use HMA center as default
+center = [36.0, 86]
+fit_bounds = None
 
 # Zoom-to-location manual controls
 with st.expander("Zoom to location", expanded=False):
@@ -152,24 +152,31 @@ with st.expander("Zoom to location", expanded=False):
         st.write("")
         zoom_clicked = st.button("Go", use_container_width=True)
 
+# Persist zoom target across reruns
 if zoom_clicked:
-    center = [zoom_lat, zoom_lon]
-    # Small window around manual input
-    fit_bounds = [[zoom_lat - 0.5, zoom_lon - 0.5], [zoom_lat + 0.5, zoom_lon + 0.5]]
+    st.session_state["map_center"] = [zoom_lat, zoom_lon]
+    st.session_state["map_fit_bounds"] = [
+        [zoom_lat - 0.1, zoom_lon - 0.1],
+        [zoom_lat + 0.1, zoom_lon + 0.1],
+    ]
+    st.session_state["map_key"] = st.session_state.get("map_key", 0) + 1
 
-# Map initialized zoomed out (zoom_start=5) with no tiles to control base layer order
-m = folium.Map(location=center, zoom_start=5, tiles=None) 
+center    = st.session_state.get("map_center", center)
+fit_bounds = st.session_state.get("map_fit_bounds", None)
 
-# Base Layer 1: Satellite (Default)
+# Map
+m = folium.Map(location=center, zoom_start=5, tiles=None)
+
+# OSM first (so it appears below satellite in layer control)
+folium.TileLayer("openstreetmap", name="OpenStreetMap", overlay=False).add_to(m)
+
+# Satellite last — Folium makes the last base layer the active default
 folium.TileLayer(
-    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", 
-    name="Satellite", 
+    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    name="Satellite",
     attr="Esri",
-    overlay=False
+    overlay=False,
 ).add_to(m)
-
-# Base Layer 2: OpenStreetMap
-folium.TileLayer('openstreetmap', name="OpenStreetMap", overlay=False).add_to(m)
 
 # Overlay Layer: Past GLOF Events
 glof_file = os.path.join(DOCS_DIR, "GLOFevents2015-.csv")
@@ -212,7 +219,8 @@ if fit_bounds:
     m.fit_bounds(fit_bounds)
 
 Draw(export=True, draw_options={"polyline":False, "circle":False, "marker":False}).add_to(m)
-draw_data = st_folium(m, width=None, height=550)
+draw_data = st_folium(m, width=None, height=550,
+                      key=f"map_{st.session_state.get('map_key', 0)}")
 
 aoi_geojson = None
 
@@ -250,13 +258,15 @@ has_name = bool(task_name_safe)
 if task_name_raw and not has_name:
     st.sidebar.warning("Name contains only invalid characters. Use letters, numbers, hyphens or underscores.")
 elif has_name:
-    run_date_preview = dt_date.today().isoformat()
-    st.sidebar.caption(f"Output folder: Outputs_{run_date_preview}_{task_name_safe}")
+    pass  # caption shown below after run_date is defined
 st.sidebar.markdown("---")
 
 # 6. Sidebar Manual Run
 st.sidebar.header("Manual Run")
 run_date = st.sidebar.date_input("Processing Date", value=dt_date.today(), max_value=dt_date.today())
+
+if has_name:
+    st.sidebar.caption(f"Output folder: Outputs_{run_date.isoformat()}_{task_name_safe}")
 
 missing_now = []
 if not aoi_geojson:
