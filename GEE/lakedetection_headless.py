@@ -104,11 +104,19 @@ def run_pipeline(config_path):
     earlier_asc = s1_asc.filterDate(ref_date-datetime.timedelta(days=25), ref_date-datetime.timedelta(days=13))
     earlier_desc = s1_desc.filterDate(ref_date-datetime.timedelta(days=25), ref_date-datetime.timedelta(days=13))
 
-    # Mosaic per orbit direction
-    latest_asc = recent_asc.mosaic()
-    latest_desc = recent_desc.mosaic()
-    prev_asc = earlier_asc.mosaic()
-    prev_desc = earlier_desc.mosaic()
+    # Mosaic per orbit direction — fall back to most recent available image
+    # if the fixed date window returns nothing (sparse coverage AOIs)
+    def safe_mosaic(recent_col, full_col, label):
+        n = recent_col.size().getInfo()
+        if n == 0:
+            print(f"Warning: no {label} images in recent window, using most recent available.", flush=True)
+            return full_col.sort('system:time_start', False).limit(1).mosaic()
+        return recent_col.mosaic()
+
+    latest_asc  = safe_mosaic(recent_asc,  s1_asc,  "ASC recent")
+    latest_desc = safe_mosaic(recent_desc, s1_desc, "DESC recent")
+    prev_asc    = safe_mosaic(earlier_asc,  s1_asc.sort('system:time_start', False).limit(4).sort('system:time_start', True).limit(1),  "ASC earlier")
+    prev_desc   = safe_mosaic(earlier_desc, s1_desc.sort('system:time_start', False).limit(4).sort('system:time_start', True).limit(1), "DESC earlier")
 
     # Get images from the years before within a timewindow around the doy
     hist_asc = get_historical_collection(s1, 'ASCENDING', doy, windowSize, 10, ref_date)

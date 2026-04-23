@@ -35,6 +35,260 @@ def get_vis_params(filename):
             return vis
     return {'min': -30, 'max': 0, 'palette': 'gray'}
 
+def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=None):
+    """
+    Build a fully self-contained HTML report of the tracking analysis.
+    Embeds all panel images, lake area chart, and a satellite map with
+    z_score overlay as an interactive Folium iframe.
+    Returns (html_bytes, filename) or (None, None) if no data found.
+    """
+    import pandas as pd
+    from tracking_viewer import (
+        PANEL_CFG, _read_masked, _render_to_pil, _discover_frames
+    )
+    from PIL import ImageDraw, ImageFont
+
+    frames = _discover_frames(tracking_dir)
+    if not frames:
+        return None, None
+
+    PANEL_W   = 400
+    TOTAL_W   = PANEL_W * 3
+    CAPTION_H = 22
+
+    # Render each frame to base64 PNG
+    frame_b64 = []
+    for frame in frames:
+        panels, captions = [], []
+        for band, cfg in PANEL_CFG.items():
+            try:
+                data = _read_masked(frame[band])
+                im   = _render_to_pil(data, cfg["cmap"], cfg["vmin"], cfg["vmax"], cfg["nan_fill"])
+                ratio = PANEL_W / im.width
+                im = im.resize((PANEL_W, max(1, int(im.height * ratio))), Image.LANCZOS)
+                panels.append(im)
+            except Exception:
+                panels.append(Image.new("RGB", (PANEL_W, PANEL_W), (80, 80, 80)))
+            captions.append(cfg["label"])
+
+        img_h    = max(p.height for p in panels)
+        combined = Image.new("RGB", (TOTAL_W, img_h + CAPTION_H), (255, 255, 255))
+        x = 0
+        for p in panels:
+            combined.paste(p, (x, 0))
+            x += p.width
+
+        draw = ImageDraw.Draw(combined)
+        try:
+            font = ImageFont.truetype("arial.ttf", 12)
+        except Exception:
+            font = ImageFont.load_default()
+        for i, caption in enumerate(captions):
+            cx = i * PANEL_W + PANEL_W // 2
+            draw.text((cx, img_h + 4), caption, fill=(80, 80, 80), font=font, anchor="mt")
+
+        buf = BytesIO()
+        combined.save(buf, format="PNG")
+        frame_b64.append(base64.b64encode(buf.getvalue()).decode())
+
+    dates = [f["date"] for f in frames]
+
+    # Render lake area chart
+    chart_b64 = ""
+    metrics_csv = os.path.join(tracking_dir, "lake_metrics.csv")
+    if os.path.isfile(metrics_csv):
+        try:
+            df = pd.read_csv(metrics_csv)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True)
+            fig, ax = plt.subplots(figsize=(9, 4))
+            fig.patch.set_facecolor("#ffffff")
+            ax.set_facecolor("#ffffff")
+            ax.fill_between(df["date"], df["lower_area_km2"], df["upper_area_km2"],
+                            color="#4a90d9", alpha=0.25, label="Uncertainty band")
+            ax.plot(df["date"], df["mean_area_km2"],
+                    color="#4a90d9", linewidth=1.8, label="Mean area")
+            ax.scatter(df["date"], df["mean_area_km2"], color="#4a90d9", s=22, zorder=5)
+            ax.set_xlabel("Date", fontsize=9)
+            ax.set_ylabel("Lake Area (km2)", fontsize=9)
+            ax.tick_params(labelsize=8)
+            ax.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter("%Y-%m-%d"))
+            fig.autofmt_xdate(rotation=30, ha="right")
+            ax.legend(fontsize=8, loc="upper left")
+            fig.tight_layout()
+            buf = BytesIO()
+            fig.savefig(buf, format="PNG", dpi=100, bbox_inches="tight")
+            plt.close(fig)
+            chart_b64 = base64.b64encode(buf.getvalue()).decode()
+        except Exception:
+            pass
+
+    # Build cluster table HTML
+    cluster_table = ""
+    if folder_path:
+        csv_files = glob.glob(os.path.join(folder_path, "cluster_summary*.csv"))
+        if csv_files:
+            csv_files.sort(key=os.path.getmtime, reverse=True)
+            try:
+                rows = []
+                with open(csv_files[0], mode='r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        rows.append(row)
+                if rows:
+                    headers = list(rows[0].keys())
+                    th = "".join(f"<th>{h}</th>" for h in headers)
+                    trs = ""
+                    for row in rows:
+                        trs += "<tr>" + "".join(f"<td>{row.get(h,'')}</td>" for h in headers) + "</tr>"
+                    cluster_table = f"""<h2>Detected Clusters</h2>
+<table>
+<thead><tr>{th}</tr></thead>
+<tbody>{trs}</tbody>
+</table>"""
+            except Exception:
+                pass
+
+    # Build self-contained HTML
+    dates_js  = json.dumps(dates)
+    frames_js = json.dumps(frame_b64)
+    title     = f"THAW Tracking Report - {task_date} {task_name}".strip()
+    chart_section = (
+        f"<h2>Lake Area Over Time</h2>"
+        f"<img id='chart-img' src='data:image/png;base64,{chart_b64}'>"
+        if chart_b64 else ""
+    )
+
+    # Build satellite + z_score Folium map
+    map_iframe = ""
+    if folder_path:
+        z_files = glob.glob(os.path.join(folder_path, "*z_score*_cog.tif"))
+        if not z_files:
+            z_files = glob.glob(os.path.join(folder_path, "*z_score*.tif"))
+            z_files = [f for f in z_files if not f.endswith("_cog.tif")]
+        if z_files:
+            try:
+                from rasterio.warp import calculate_default_transform, reproject, Resampling as _RS
+                from rasterio.crs import CRS as _RioCRS
+                _MERC = _RioCRS.from_epsg(3857)
+                VIS   = VIS_BY_LAYER["z_score"]
+                tif   = z_files[0]
+                with rasterio.open(tif) as src:
+                    scale = min(2048 / src.width, 2048 / src.height, 1.0)
+                    rw = max(1, int(src.width * scale))
+                    rh = max(1, int(src.height * scale))
+                    raw = src.read(1, out_shape=(rh, rw), resampling=_RS.average).astype(np.float32)
+                    from rasterio.transform import from_bounds as _tfm
+                    st_  = _tfm(*src.bounds, rw, rh)
+                    if src.nodata is not None:
+                        raw[raw == src.nodata] = np.nan
+                    dt, dw, dh = calculate_default_transform(src.crs, _MERC, rw, rh, *src.bounds)
+                    dst = np.full((dh, dw), np.nan, dtype=np.float32)
+                    reproject(source=raw, destination=dst,
+                              src_transform=st_, src_crs=src.crs,
+                              dst_transform=dt, dst_crs=_MERC,
+                              resampling=_RS.bilinear, src_nodata=np.nan, dst_nodata=np.nan)
+                    wgs = transform_bounds(_MERC, "EPSG:4326",
+                                           dt.c, dt.f + dt.e * dh,
+                                           dt.c + dt.a * dw, dt.f)
+                nodata_mask = np.isnan(dst)
+                norm = np.clip((dst - VIS["min"]) / (VIS["max"] - VIS["min"]), 0, 1)
+                norm[nodata_mask] = 0.0
+                cmap_ = plt.get_cmap(VIS["palette"])
+                rgba  = (cmap_(norm) * 255).astype(np.uint8)
+                rgba[nodata_mask, 3] = 0
+                buf_ = BytesIO()
+                Image.fromarray(rgba, mode="RGBA").save(buf_, format="PNG")
+                z_b64 = base64.b64encode(buf_.getvalue()).decode()
+
+                south, west, north, east = wgs[1], wgs[0], wgs[3], wgs[2]
+                lat_c = (south + north) / 2
+                lon_c = (west  + east)  / 2
+                fm = folium.Map(location=[lat_c, lon_c], zoom_start=12, tiles=None)
+                folium.TileLayer(
+                    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                    name="Satellite", attr="Esri"
+                ).add_to(fm)
+                folium.raster_layers.ImageOverlay(
+                    image=f"data:image/png;base64,{z_b64}",
+                    bounds=[[south, west], [north, east]],
+                    name="Z-Score", opacity=0.7, interactive=False
+                ).add_to(fm)
+                # Tracking AOI bounding box from first VV_raw TIF
+                trk_tifs = sorted(glob.glob(os.path.join(tracking_dir, "*VV_raw*.tif")))
+                if trk_tifs:
+                    try:
+                        with rasterio.open(trk_tifs[0]) as _ts:
+                            _b = transform_bounds(_ts.crs, "EPSG:4326", *_ts.bounds)
+                        folium.Rectangle(
+                            bounds=[[_b[1], _b[0]], [_b[3], _b[2]]],
+                            color="#FF6B00", weight=2, dash_array="8 6",
+                            fill=False, tooltip="Tracking AOI",
+                        ).add_to(fm)
+                    except Exception:
+                        pass
+                folium.LayerControl(collapsed=False).add_to(fm)
+                map_html = fm.get_root().render()
+                map_html_esc = map_html.replace("&", "&amp;").replace('"', "&quot;")
+                map_iframe = (
+                    f'<h2>Satellite Map with Z-Score</h2>'
+                    f'<iframe srcdoc="{map_html_esc}" width="100%" height="520" '
+                    f'style="border:1px solid #ddd;border-radius:4px;" '
+                    f'allowfullscreen></iframe>'
+                )
+            except Exception as e:
+                map_iframe = f"<p style='color:#888'>Map could not be generated: {e}</p>"
+    first_img  = frame_b64[0] if frame_b64 else ""
+    first_date = dates[0] if dates else ""
+    n_frames   = len(dates)
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{title}</title>
+<style>
+  body {{ font-family: Arial, sans-serif; background: #f5f5f5; color: #333; margin: 0; padding: 20px; }}
+  h1   {{ font-size: 1.4em; margin-bottom: 4px; }}
+  h2   {{ font-size: 1.1em; color: #555; margin: 24px 0 8px; }}
+  .subtitle {{ color: #777; font-size: 0.9em; margin-bottom: 20px; }}
+  .slider-wrap {{ max-width: 1200px; margin-bottom: 8px; }}
+  input[type=range] {{ width: 100%; }}
+  #date-label {{ font-size: 0.95em; color: #444; margin: 4px 0 10px; }}
+  #frame-img  {{ max-width: 1200px; width: 100%; border: 1px solid #ddd; border-radius: 4px; }}
+  #chart-img  {{ max-width: 1200px; width: 100%; border: 1px solid #ddd; border-radius: 4px; margin-top: 10px; }}
+  table {{ border-collapse: collapse; width: 100%; max-width: 1200px; font-size: 0.85em; margin-top: 6px; }}
+  th {{ background: #4a90d9; color: #fff; padding: 7px 10px; text-align: left; }}
+  td {{ padding: 6px 10px; border-bottom: 1px solid #e0e0e0; }}
+  tr:nth-child(even) {{ background: #f0f4fb; }}
+</style>
+</head>
+<body>
+<h1>{title}</h1>
+<p class="subtitle">Generated by THAW - Sentinel-1 SAR Water Monitor</p>
+{map_iframe}
+<h2>Tracking Images</h2>
+<div class="slider-wrap">
+  <input type="range" id="slider" min="0" max="{n_frames - 1}" value="0" oninput="updateFrame(this.value)">
+</div>
+<div id="date-label">Date: {first_date} (1 of {n_frames})</div>
+<img id="frame-img" src="data:image/png;base64,{first_img}">
+{chart_section}
+<script>
+const dates  = {dates_js};
+const frames = {frames_js};
+function updateFrame(i) {{
+  document.getElementById("frame-img").src = "data:image/png;base64," + frames[i];
+  document.getElementById("date-label").textContent = "Date: " + dates[i] + " (" + (parseInt(i)+1) + " of " + frames.length + ")";
+}}
+</script>
+</body>
+</html>"""
+
+    safe_name = task_name.replace(" ", "_") if task_name else "report"
+    filename  = f"THAW_tracking_{task_date}_{safe_name}.html"
+    return html.encode("utf-8"), filename
+
 def make_combined_legend(layers_present, vis_by_layer):
     """Single semi-transparent box with one gradient bar per visible layer."""
     LAYER_META = {
@@ -59,24 +313,24 @@ def make_combined_legend(layers_present, vis_by_layer):
         )
         blocks += (
             '<div style="margin-bottom:10px;">'
-            f'<div style="font-size:12px;font-weight:bold;margin-bottom:3px;">{meta["title"]}</div>'
+            f'<div style="font-size:12px;font-weight:bold;margin-bottom:3px;color:#222;">{meta["title"]}</div>'
             f'<div style="height:12px;width:160px;background:linear-gradient(to right,{stops});'
             'border:1px solid #aaa;border-radius:2px;"></div>'
             '<div style="display:flex;justify-content:space-between;width:160px;">'
-            f'<span style="font-size:10px;">{vis["min"]}{meta["unit"]}</span>'
-            f'<span style="font-size:10px;">{(vis["min"]+vis["max"])/2:.1f}{meta["unit"]}</span>'
-            f'<span style="font-size:10px;">{vis["max"]}{meta["unit"]}</span>'
+            f'<span style="font-size:10px;color:#222;">{vis["min"]}{meta["unit"]}</span>'
+            f'<span style="font-size:10px;color:#222;">{(vis["min"]+vis["max"])/2:.1f}{meta["unit"]}</span>'
+            f'<span style="font-size:10px;color:#222;">{vis["max"]}{meta["unit"]}</span>'
             '</div></div>'
         )
     if not blocks:
         return None
     html = (
         '<div style="position:fixed;bottom:40px;left:50px;z-index:9999;'
-        'background:rgba(255,255,255,0.82);border:1px solid #bbb;'
+        'background:rgba(255,255,255,0.92);border:1px solid #bbb;'
         'border-radius:8px;padding:10px 14px;font-family:Arial,sans-serif;'
-        'pointer-events:none;min-width:190px;">'
+        'pointer-events:none;min-width:190px;color:#222;">'
         '<div style="font-size:13px;font-weight:bold;margin-bottom:8px;'
-        'border-bottom:1px solid #ccc;padding-bottom:4px;">Legend</div>'
+        'border-bottom:1px solid #ccc;padding-bottom:4px;color:#222;">Legend</div>'
         + blocks +
         '</div>'
     )
@@ -472,3 +726,26 @@ else:
 
 # timetracking viewer
 render_tracking_viewer(folder_path)
+
+# --- Export Report ---
+tracking_dir = os.path.join(folder_path, "tracking_results")
+if os.path.isdir(tracking_dir):
+    st.write("---")
+    _, location = dated_folders[selected_idx][1], dated_folders[selected_idx][2]
+    if st.button("Export Tracking Report (.html)"):
+        with st.spinner("Generating report..."):
+            html_bytes, filename = generate_tracking_report(
+                tracking_dir,
+                task_date=selected_folder_date,
+                task_name=location,
+                folder_path=folder_path,
+            )
+        if html_bytes:
+            st.download_button(
+                label="Download Report",
+                data=html_bytes,
+                file_name=filename,
+                mime="text/html",
+            )
+        else:
+            st.warning("No tracking results found to export.")
