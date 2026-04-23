@@ -137,7 +137,8 @@ def _poll_and_download(task_list, drive_service, token_path):
                     f"Task failed: {item['label']} — {status.get('error_message', '')}",
                     flush=True,
                 )
-                item["done"] = True
+                item["done"]   = True
+                item["failed"] = True
                 completed += 1
 
         if completed < len(task_list):
@@ -152,6 +153,11 @@ def _poll_and_download(task_list, drive_service, token_path):
     if ids_to_delete:
         print(f"Cleaning up {len(ids_to_delete)} file(s) from Google Drive...", flush=True)
         delete_drive_files(token_path, ids_to_delete)
+
+    # Raise if any tasks failed so pipeline reports PIPELINE_ERROR not PIPELINE_SUCCESS
+    failed = [item["label"] for item in task_list if item.get("failed")]
+    if failed:
+        raise RuntimeError(f"GEE task(s) failed: {', '.join(failed)}")
 
 
 def export_and_download(images_to_export, reference_date, aoi, token_path,

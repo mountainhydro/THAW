@@ -40,7 +40,15 @@ def sanitize_name(name: str) -> str:
     return safe.replace(" ", "_")
 
 def write_job_config(is_manual=True, task_name=""):
-    aoi_filename = "now_aoi.geojson" if is_manual else "sch_aoi.geojson"
+    if is_manual:
+        aoi_filename = "now_aoi.geojson"
+        cfg_file     = "now_config.json"
+    else:
+        # Use task name in filenames so multiple scheduled tasks don't overwrite each other
+        safe = sanitize_name(task_name) or "default"
+        aoi_filename = f"sch_aoi_{safe}.geojson"
+        cfg_file     = f"sch_config_{safe}.json"
+
     aoi_p = os.path.join(CONFIG_DIR, aoi_filename)
 
     with open(aoi_p, "w") as f:
@@ -65,7 +73,6 @@ def write_job_config(is_manual=True, task_name=""):
         "task_name": safe_name,
     }
 
-    cfg_file = "now_config.json" if is_manual else "sch_config.json"
     cfg_path = os.path.join(CONFIG_DIR, cfg_file)
 
     with open(cfg_path, "w") as f:
