@@ -18,7 +18,6 @@ import glob
 import time
 import ee
 import rasterio
-from rasterio.merge import merge as rio_merge
 from googleapiclient.http import MediaIoBaseDownload
 from rio_cogeo.cogeo import cog_translate
 from rio_cogeo.profiles import cog_profiles
@@ -30,10 +29,6 @@ class CancelledError(RuntimeError):
     """Raised when GEE tasks are cancelled by the user."""
     pass
 
-
-class CancelledError(RuntimeError):
-    """Raised when one or more GEE tasks were cancelled by the user."""
-    pass
 
 
 # ============================================================
@@ -102,6 +97,7 @@ def _poll_and_download(task_list, drive_service, token_path):
     """
     print(f"Waiting for {len(task_list)} GEE task(s)...", flush=True)
     completed = 0
+    downloaded = 0
 
     while completed < len(task_list):
         for item in task_list:
@@ -131,7 +127,8 @@ def _poll_and_download(task_list, drive_service, token_path):
                         done = False
                         while not done:
                             _, done = downloader.next_chunk()
-                    print(f"Downloaded: {fname}", flush=True)
+                    downloaded += 1
+                    print(f"Downloaded files: ({downloaded}/{len(task_list)})", flush=True)
                     item["drive_file_ids"] = [file_id]
                     item["done"] = True
                     completed += 1
@@ -225,6 +222,15 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
     ids_to_delete = []
     try:
         ids_to_delete = _poll_and_download(task_list, drive_service, token_path)
+    except (OSError, IOError) as e:
+        # Check if all files were actually downloaded despite the OS error
+        # (happens on Windows when Drive deletion triggers an auth cache write)
+        all_downloaded = all(os.path.exists(item["local_path"]) for item in task_list)
+        if all_downloaded:
+            print(f"Warning: Drive operation error ignored (all files downloaded): {e}", flush=True)
+            ids_to_delete = [fid for item in task_list for fid in item.get("drive_file_ids", [])]
+        else:
+            raise
     finally:
         if ids_to_delete:
             print(f"Cleaning up {len(ids_to_delete)} file(s) from Google Drive...", flush=True)
@@ -313,7 +319,7 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
                     "drive_file_ids": [],
                     "done":           False,
                 })
-                print(f"Task started: {local_filename}", flush=True)
+                #print(f"Task started: {local_filename}", flush=True)
             except Exception as e:
                 print(f"Failed to start task for {local_filename}: {e}", flush=True)
 
@@ -324,6 +330,13 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
     ids_to_delete = []
     try:
         ids_to_delete = _poll_and_download(task_list, drive_service, token_path)
+    except (OSError, IOError) as e:
+        all_downloaded = all(os.path.exists(item["local_path"]) for item in task_list)
+        if all_downloaded:
+            print(f"Warning: Drive operation error ignored (all files downloaded): {e}", flush=True)
+            ids_to_delete = [fid for item in task_list for fid in item.get("drive_file_ids", [])]
+        else:
+            raise
     finally:
         if ids_to_delete:
             print(f"Cleaning up {len(ids_to_delete)} file(s) from Google Drive...", flush=True)

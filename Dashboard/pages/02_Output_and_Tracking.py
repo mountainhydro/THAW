@@ -719,37 +719,57 @@ st.sidebar.header("Cluster tracking over time")
 base_date_dt = datetime.strptime(selected_folder_date, "%Y-%m-%d")
 days_back = st.sidebar.slider("Look-back period (days)", 1, 180, 90)
 calc_start = (base_date_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
-st.sidebar.write(f"**Period:** {calc_start} to {selected_folder_date}")
+calc_end   = (base_date_dt + timedelta(days=12)).strftime("%Y-%m-%d")
+st.sidebar.write(f"**Period:** {calc_start} to {calc_end}")
 
 if drawn_aoi:
     st.sidebar.success(f"AOI Defined: {len(selected_ids)} clusters selected.")
     if st.sidebar.button("Run Tracking Analysis", disabled=(tracking_status == "running")):
         try:
             cfg_p = write_timetrack_config(folder_path, drawn_aoi, calc_start,
-                                           selected_folder_date, selected_ids,
+                                           calc_end, selected_ids,
                                            project_id, DRIVE_TOKEN_FILE)
             script_rel_path = os.path.join("GEE", "tracking_headless.py")
-            subprocess.Popen(
+            process = subprocess.Popen(
                 [sys.executable, "-u", script_rel_path, cfg_p],
                 cwd=ROOT_DIR,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
             )
             tracking_status = "running"
-            st.sidebar.success("Tracking analysis launched!")
+            st.session_state["tracking_just_launched"] = True
+            status_container = st.empty()
+            status_container.info("Starting tracking analysis, please wait...")
+            full_log = ""
+            for line in iter(process.stdout.readline, ""):
+                full_log += line
+                status_container.code(full_log)
+            process.stdout.close()
+            if process.wait() == 0:
+                tracking_status = "success"
+            else:
+                tracking_status = "failed"
+            st.session_state.pop("tracking_just_launched", None)
         except Exception as e:
             st.sidebar.error(f"Error: {e}")
 else:
     st.sidebar.info("Draw an area of interest on the map to select clusters for tracking.")
 
-# Pipeline log expander
+if st.session_state.get("tracking_just_launched") and tracking_status == "running":
+    st.sidebar.success("Tracking analysis launched!")
+elif tracking_status != "running":
+    st.session_state.pop("tracking_just_launched", None)
+
+# Pipeline log expander — shown on refresh when not actively streaming
 st.write("### Analysis Progress")
 if tracking_status == "idle":
     st.info("No tracking analysis run yet for this folder.")
-else:
+elif not st.session_state.get("tracking_just_launched"):
     log_label = (
-        "[Running] Tracking Analysis"  if tracking_status == "running"  else
-        "[Done] Tracking Analysis"     if tracking_status == "success"  else
+        "[Running] Tracking Analysis" if tracking_status == "running" else
+        "[Done] Tracking Analysis"    if tracking_status == "success" else
         "[Failed] Tracking Analysis"
     )
     with st.expander(log_label, expanded=(tracking_status == "running")):
@@ -757,13 +777,13 @@ else:
             with open(tracking_log_files[-1], encoding="utf-8", errors="replace") as _f:
                 st.code(_f.read())
         else:
-            st.info("Starting analysis, please wait...")
+            st.info("Starting tracking analysis, please wait...")
 
-# Auto-refresh while running
-if tracking_status == "running":
-    _time.sleep(3)
-    st.rerun()
-else:
+    if tracking_status == "running":
+        _time.sleep(3)
+        st.rerun()
+
+if tracking_status != "running":
     render_tracking_viewer(folder_path)
 
     if os.path.isdir(tracking_dir):
