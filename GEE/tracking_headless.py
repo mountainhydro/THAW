@@ -35,8 +35,54 @@ from thinning import (
     get_glacier_thinning_correction,
 )
 from reporting import generate_lake_metrics_report
-from drive_io import Logger, export_images_via_drive
+from drive_io import Logger, export_images_via_drive, CancelledError
 from gee_auth import initialize_ee, build_drive_service
+
+
+# ============================================================
+# RETRY AND CHECKPOINT HELPERS
+# ============================================================
+
+CHECKPOINT_FILE = "tracking_checkpoint.json"
+
+def retry(fn, label, max_attempts=5, base_wait=30):
+    import time as _time
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except CancelledError:
+            print(f"{label} cancelled by user — not retrying.", flush=True)
+            raise
+        except Exception as e:
+            if attempt == max_attempts:
+                print(f"{label} failed after {max_attempts} attempts: {e}", flush=True)
+                raise
+            wait = base_wait * (2 ** (attempt - 1))
+            print(f"{label} failed (attempt {attempt}/{max_attempts}): {e}", flush=True)
+            print(f"Retrying in {wait}s...", flush=True)
+            _time.sleep(wait)
+
+def write_checkpoint(out_dir, **kwargs):
+    path = Path(out_dir) / CHECKPOINT_FILE
+    existing = {}
+    if path.exists():
+        with open(path) as f:
+            existing = json.load(f)
+    existing.update(kwargs)
+    with open(path, "w") as f:
+        json.dump(existing, f, indent=2)
+
+def read_checkpoint(out_dir):
+    path = Path(out_dir) / CHECKPOINT_FILE
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+def clear_checkpoint(out_dir):
+    path = Path(out_dir) / CHECKPOINT_FILE
+    if path.exists():
+        path.unlink()
 
 
 # ============================================================
@@ -79,6 +125,23 @@ def run_tracking_pipeline(config_path):
     print(f"AOI BBox:     {aoi_input}", flush=True)
     print(f"Output dir:   {final_out_dir_str}", flush=True)
     print("---------------------------------------", flush=True)
+
+    # ── Resume detection ────────────────────────────────────────────────────
+    ckpt = read_checkpoint(final_out_dir_str)
+    if ckpt and "download" in ckpt.get("steps_complete", []):
+        print(f"Resuming incomplete tracking pipeline from checkpoint.", flush=True)
+        done = ckpt.get("steps_complete", [])
+        if "reporting" not in done:
+            print("Step 2/2: Generating lake metrics report...", flush=True)
+            retry(
+                lambda: generate_lake_metrics_report(output_dir=final_out_dir_str),
+                label="Reporting", max_attempts=3, base_wait=10,
+            )
+            done.append("reporting")
+            write_checkpoint(final_out_dir_str, steps_complete=done)
+        clear_checkpoint(final_out_dir_str)
+        return "Tracking analysis complete (resumed)."
+    # ────────────────────────────────────────────────────────────────────────
 
     initialize_ee(cfg.get("drive_token_path"), project_id)
     drive_service = build_drive_service(cfg.get("drive_token_path"))
@@ -142,23 +205,47 @@ def run_tracking_pipeline(config_path):
 # ============================================================
     bands = ["VV_raw", "VV_corrected", "lake_likelihood"]
 
-    print("Launching GEE Drive export tasks...", flush=True)
-    export_images_via_drive(
-        s1_scored,
-        aoi,
-        token_path=cfg.get("drive_token_path"),
-        bands_to_export=bands,
-        output_dir=final_out_dir_str,
-        prefix="tracking_s1",
-    )
+    # Write initial checkpoint
+    write_checkpoint(final_out_dir_str, steps_complete=[])
+    ckpt = read_checkpoint(final_out_dir_str)
+    done = ckpt.get("steps_complete", [])
+
+    if "download" not in done:
+        print("Step 1/2: Launching GEE Drive export tasks...", flush=True)
+        retry(
+            lambda: export_images_via_drive(
+                s1_scored,
+                aoi,
+                token_path=cfg.get("drive_token_path"),
+                bands_to_export=bands,
+                output_dir=final_out_dir_str,
+                prefix="tracking_s1",
+            ),
+            label="Download",
+        )
+        done.append("download")
+        write_checkpoint(final_out_dir_str, steps_complete=done)
+    else:
+        print("Step 1/2: Download already complete, skipping.", flush=True)
 
 
 # ============================================================
 # REPORTING
 # ============================================================
-    print("Generating lake metrics report...", flush=True)
-    generate_lake_metrics_report(output_dir=final_out_dir_str)
+    if "reporting" not in done:
+        print("Step 2/2: Generating lake metrics report...", flush=True)
+        retry(
+            lambda: generate_lake_metrics_report(output_dir=final_out_dir_str),
+            label="Reporting",
+            max_attempts=3,
+            base_wait=10,
+        )
+        done.append("reporting")
+        write_checkpoint(final_out_dir_str, steps_complete=done)
+    else:
+        print("Step 2/2: Reporting already complete, skipping.", flush=True)
 
+    clear_checkpoint(final_out_dir_str)
     print("SUCCESS: Tracking analysis complete.", flush=True)
     return "Tracking analysis complete."
 
