@@ -286,7 +286,17 @@ if missing_now:
     for msg in missing_now:
         st.sidebar.warning(f"Note: {msg}")
 
-run_now_clicked = st.sidebar.button("Run job now", disabled=bool(missing_now))
+if "pipeline_running" not in st.session_state:
+    st.session_state.pipeline_running = False
+
+# Always reset on page load — if the user refreshed, streaming stopped
+# and the button should be clickable again for a new run
+st.session_state.pipeline_running = False
+
+run_now_clicked = st.sidebar.button(
+    "Run job now",
+    disabled=bool(missing_now),
+)
 st.sidebar.markdown("---")
 
 # 7. Sidebar Scheduling
@@ -328,20 +338,25 @@ schedule_clicked = st.sidebar.button("Schedule job", disabled=bool(missing_sch))
 
 # 8. Execution Manual Job
 if run_now_clicked:
+    st.session_state.pipeline_running = True
     cfg_p = write_job_config(is_manual=True, task_name=task_name_safe)
-    status_container = st.empty()
     script_p = os.path.join(GEE_DIR, "lakedetection_headless.py")
-    
-    process = subprocess.Popen([sys.executable, "-u", script_p, cfg_p], 
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    status_container = st.empty()
+    status_container.info("Starting pipeline, please wait...")
+
+    process = subprocess.Popen(
+        [sys.executable, "-u", script_p, cfg_p],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
     full_log = ""
     for line in iter(process.stdout.readline, ""):
         full_log += line
         status_container.code(full_log)
-    
-    if process.wait() == 0: 
+
+    st.session_state.pipeline_running = False
+    if process.wait() == 0:
         st.success("Manual run complete!")
-    else: 
+    else:
         st.error("Manual run failed.")
 
 # 9. Execution Task Scheduling
@@ -373,25 +388,61 @@ if schedule_clicked:
     else:
         st.sidebar.error("Failed to schedule task.")
 
-# 10. Active Tasks Display
+# 10. Pipeline Logs
+st.divider()
+st.subheader("Pipeline Logs")
+
+def _get_log_status(log_path):
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        content = f.read()
+    if "PIPELINE_SUCCESS" in content:
+        return "success", content
+    elif "PIPELINE_ERROR" in content:
+        return "failed", content
+    else:
+        return "running", content
+
+recent_folders = sorted(
+    [f for f, _ in dated_folders],
+    key=os.path.getmtime,
+    reverse=True
+)[:4]
+for folder in recent_folders:
+    folder_name = os.path.basename(folder)
+    log_files = sorted(glob.glob(os.path.join(folder, "pipeline_log_*.txt")))
+    if not log_files:
+        continue
+    status, content = _get_log_status(log_files[-1])
+    label = (
+        f"[Done] {folder_name}"    if status == "success" else
+        f"[Failed] {folder_name}"  if status == "failed"  else
+        f"[Running] {folder_name}"
+    )
+    with st.expander(label, expanded=(status == "running")):
+        st.code(content)
+
+# 11. Active Scheduled Tasks
 st.divider()
 st.subheader("Active Scheduled Tasks")
 st.caption("Note: Tasks missed while the computer is off will run after the system is turned back on.")
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _query_scheduled_tasks():
+    try:
+        return subprocess.check_output(
+            'schtasks /Query /FO CSV /V',
+            shell=True, text=True, encoding='cp1252', errors='replace'
+        )
+    except Exception:
+        return ""
+
 try:
-    output = subprocess.check_output(
-        'schtasks /Query /FO CSV /V', 
-        shell=True, 
-        text=True, 
-        encoding='cp1252', 
-        errors='replace'
-    )
-    
     import csv
     from io import StringIO
-    
+
+    output   = _query_scheduled_tasks()
     raw_data = list(csv.reader(StringIO(output)))
-    
+
     if len(raw_data) < 2:
         st.info("No scheduled tasks found.")
     else:
@@ -402,38 +453,32 @@ try:
 
         for t in lake_tasks:
             full_task_name = t[1]
-            clean_name = full_task_name.replace('\\', '')
-            
-            next_run = t[2]
-            status = t[3]
-            last_run_raw = t[5]
-            result_code = t[6].strip()
+            clean_name     = full_task_name.replace('\\', '')
+            next_run       = t[2]
+            status         = t[3]
+            last_run_raw   = t[5]
+            result_code    = t[6].strip()
 
             if "1999" in last_run_raw:
                 last_run_display = "Never Run"
-                result_display = "Pending first run"
+                result_display   = "Pending first run"
             else:
                 last_run_display = last_run_raw
-                if result_code == '0':
-                    result_display = "Success (0)"
-                else:
-                    result_display = f"Error ({result_code})"
+                result_display   = "Success (0)" if result_code == '0' else f"Error ({result_code})"
 
             with st.expander(f"Task: {clean_name}"):
                 col1, col2 = st.columns(2)
-                
                 with col1:
                     st.write(f"**Next Run:** {next_run}")
                     st.write(f"**Last Run:** {last_run_display}")
-                
                 with col2:
                     st.write(f"**Status:** {status}")
                     st.write(f"**Last Result:** {result_display}")
-                    
 
                 if st.button(f"Delete {clean_name}", key=f"del_{clean_name}"):
                     subprocess.run(f'schtasks /Delete /TN "{full_task_name}" /F', shell=True)
+                    st.cache_data.clear()
                     st.rerun()
-                
+
 except Exception as e:
     st.error(f"Could not retrieve task list: {e}")

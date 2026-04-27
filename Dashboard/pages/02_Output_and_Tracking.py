@@ -593,11 +593,38 @@ if geojson_files:
     geojson_files.sort(key=os.path.getmtime, reverse=True)
     with open(geojson_files[0], "r", encoding="utf-8") as fh:
         gj = json.load(fh)
-    # Only add tooltip fields that actually exist in the GeoJSON properties
+
+    # Inject centroid lat/lon into properties from geometry if not already present
+    for feat in gj.get("features", []):
+        props = feat.get("properties") or {}
+        if "centroid_lat" not in props or "centroid_lon" not in props:
+            geom = feat.get("geometry", {})
+            coords = geom.get("coordinates", [])
+            try:
+                if geom.get("type") == "Polygon" and coords:
+                    pts = coords[0]
+                    lon = sum(p[0] for p in pts) / len(pts)
+                    lat = sum(p[1] for p in pts) / len(pts)
+                elif geom.get("type") == "Point" and coords:
+                    lon, lat = coords[0], coords[1]
+                else:
+                    lon, lat = None, None
+                if lon is not None:
+                    props["centroid_lat"] = round(lat, 3)
+                    props["centroid_lon"] = round(lon, 3)
+                    feat["properties"] = props
+            except Exception:
+                pass
+
     _sample_props = next(
         (f["properties"] for f in gj.get("features", []) if f.get("properties")), {}
     )
-    _field_map = {"cluster_id": "ID", "area_m2": "Area (m²)"}
+    _field_map = {
+        "cluster_id":   "ID",
+        "area_m2":      "Area (m2)",
+        "centroid_lat": "Lat",
+        "centroid_lon": "Lon",
+    }
     _tooltip_fields  = [f for f in _field_map if f in _sample_props]
     _tooltip_aliases = [_field_map[f] for f in _tooltip_fields]
     _tooltip = folium.GeoJsonTooltip(fields=_tooltip_fields, aliases=_tooltip_aliases) if _tooltip_fields else None
@@ -671,9 +698,22 @@ st.dataframe(data_rows, width=1100, height=400, hide_index=True)
 
 
 # --- 8. Progress Tracking & Execution ---
-st.write("### Analysis Progress")
-progress_container = st.empty()
-progress_container.info("No time tracking analysis running, or running in the background. *(Refreshing stops streaming of messages — an issue to fix.)*")
+import time as _time
+
+tracking_dir = os.path.join(folder_path, "tracking_results")
+tracking_log_files = sorted(glob.glob(os.path.join(tracking_dir, "tracking_log_*.txt")))
+
+# Determine tracking run status from log file
+tracking_status = "idle"
+if tracking_log_files:
+    with open(tracking_log_files[-1], encoding="utf-8", errors="replace") as _f:
+        _log_content = _f.read()
+    if "PIPELINE_SUCCESS" in _log_content:
+        tracking_status = "success"
+    elif "PIPELINE_ERROR" in _log_content:
+        tracking_status = "failed"
+    else:
+        tracking_status = "running"
 
 st.sidebar.header("Cluster tracking over time")
 base_date_dt = datetime.strptime(selected_folder_date, "%Y-%m-%d")
@@ -683,69 +723,66 @@ st.sidebar.write(f"**Period:** {calc_start} to {selected_folder_date}")
 
 if drawn_aoi:
     st.sidebar.success(f"AOI Defined: {len(selected_ids)} clusters selected.")
-    if st.sidebar.button("Run Tracking Analysis"):
+    if st.sidebar.button("Run Tracking Analysis", disabled=(tracking_status == "running")):
         try:
-            # 1. Write Config (Includes Credentials)
-            cfg_p = write_timetrack_config(folder_path, drawn_aoi, calc_start, 
-                                           selected_folder_date, selected_ids, 
+            cfg_p = write_timetrack_config(folder_path, drawn_aoi, calc_start,
+                                           selected_folder_date, selected_ids,
                                            project_id, DRIVE_TOKEN_FILE)
-            
-            # 2. Path to script
             script_rel_path = os.path.join("GEE", "tracking_headless.py")
-            
-            # 3. Launch with PIPE
-            process = subprocess.Popen(
-                [sys.executable, "-u", script_rel_path, cfg_p], 
+            subprocess.Popen(
+                [sys.executable, "-u", script_rel_path, cfg_p],
                 cwd=ROOT_DIR,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
-
-            full_log = ""
-            with progress_container.container():
-                st.info("Initializing GEE tracking analysis...")
-                log_box = st.code("Streaming logs...")
-                
-                for line in iter(process.stdout.readline, ""):
-                    full_log += line
-                    log_box.code(full_log)
-            
-            process.stdout.close()
-            if process.wait() == 0:
-                st.sidebar.success("Analysis Complete!")
-            else:
-                st.sidebar.error("Analysis failed. Check logs above.")
-
+            tracking_status = "running"
+            st.sidebar.success("Tracking analysis launched!")
         except Exception as e:
             st.sidebar.error(f"Error: {e}")
 else:
     st.sidebar.info("Draw an area of interest on the map to select clusters for tracking.")
 
-
-# timetracking viewer
-render_tracking_viewer(folder_path)
-
-# --- Export Report ---
-tracking_dir = os.path.join(folder_path, "tracking_results")
-if os.path.isdir(tracking_dir):
-    st.write("---")
-    _, location = dated_folders[selected_idx][1], dated_folders[selected_idx][2]
-    if st.button("Export Tracking Report (.html)"):
-        with st.spinner("Generating report..."):
-            html_bytes, filename = generate_tracking_report(
-                tracking_dir,
-                task_date=selected_folder_date,
-                task_name=location,
-                folder_path=folder_path,
-            )
-        if html_bytes:
-            st.download_button(
-                label="Download Report",
-                data=html_bytes,
-                file_name=filename,
-                mime="text/html",
-            )
+# Pipeline log expander
+st.write("### Analysis Progress")
+if tracking_status == "idle":
+    st.info("No tracking analysis run yet for this folder.")
+else:
+    log_label = (
+        "[Running] Tracking Analysis"  if tracking_status == "running"  else
+        "[Done] Tracking Analysis"     if tracking_status == "success"  else
+        "[Failed] Tracking Analysis"
+    )
+    with st.expander(log_label, expanded=(tracking_status == "running")):
+        if tracking_log_files:
+            with open(tracking_log_files[-1], encoding="utf-8", errors="replace") as _f:
+                st.code(_f.read())
         else:
-            st.warning("No tracking results found to export.")
+            st.info("Starting analysis, please wait...")
+
+# Auto-refresh while running
+if tracking_status == "running":
+    _time.sleep(3)
+    st.rerun()
+else:
+    render_tracking_viewer(folder_path)
+
+    if os.path.isdir(tracking_dir):
+        st.write("---")
+        _, location = dated_folders[selected_idx][1], dated_folders[selected_idx][2]
+        if st.button("Export Tracking Report (.html)"):
+            with st.spinner("Generating report..."):
+                html_bytes, filename = generate_tracking_report(
+                    tracking_dir,
+                    task_date=selected_folder_date,
+                    task_name=location,
+                    folder_path=folder_path,
+                )
+            if html_bytes:
+                st.download_button(
+                    label="Download Report",
+                    data=html_bytes,
+                    file_name=filename,
+                    mime="text/html",
+                )
+            else:
+                st.warning("No tracking results found to export.")
