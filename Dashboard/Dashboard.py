@@ -166,9 +166,10 @@ if not st.session_state.authenticated:
         3. Fill in the form:
            - **App name** → type `THAW`
            - **User support email** → select your own email address
-           - **Audience** → Select *Internal*
+           - **Audience** → Select *External*
            - **Contact Information** → type your email address again
-        4. Continue, agree to the terms, and click **Create**.
+        5. Continue, agree to the terms, and click **Create**.
+        6. Go here (https://console.cloud.google.com/auth/audience) and add yourself as a **test user** with your email address.
         """)
 
     with st.expander("Step 4: Download your secret key file"):
