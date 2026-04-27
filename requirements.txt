@@ -20,6 +20,7 @@ pyarrow
 google-api-python-client==2.188.0
 google-auth==2.41.1
 google-auth-oauthlib
+filelock
 
 # Data (Pinned for stability)
 numpy==1.26.4

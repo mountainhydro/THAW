@@ -30,6 +30,11 @@ class CancelledError(RuntimeError):
     pass
 
 
+class CancelledError(RuntimeError):
+    """Raised when GEE tasks are cancelled by the user."""
+    pass
+
+
 
 # ============================================================
 # LOGGER
@@ -48,14 +53,7 @@ class Logger:
         Path to the log file. Opened in append mode.
     """
     def __init__(self, filename):
-        import io as _io
-        # Wrap terminal in a UTF-8 writer so Unicode characters don't crash on
-        # Windows where the default console encoding is cp1252.
-        raw = sys.stdout
-        if hasattr(raw, 'buffer'):
-            self.terminal = _io.TextIOWrapper(raw.buffer, encoding='utf-8', errors='replace', line_buffering=True)
-        else:
-            self.terminal = raw
+        self.terminal = sys.stdout
         self.log = open(filename, "a", encoding="utf-8")
 
     def write(self, message):
@@ -222,15 +220,6 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
     ids_to_delete = []
     try:
         ids_to_delete = _poll_and_download(task_list, drive_service, token_path)
-    except (OSError, IOError) as e:
-        # Check if all files were actually downloaded despite the OS error
-        # (happens on Windows when Drive deletion triggers an auth cache write)
-        all_downloaded = all(os.path.exists(item["local_path"]) for item in task_list)
-        if all_downloaded:
-            print(f"Warning: Drive operation error ignored (all files downloaded): {e}", flush=True)
-            ids_to_delete = [fid for item in task_list for fid in item.get("drive_file_ids", [])]
-        else:
-            raise
     finally:
         if ids_to_delete:
             print(f"Cleaning up {len(ids_to_delete)} file(s) from Google Drive...", flush=True)
@@ -327,18 +316,19 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
         print("No tasks to run (all files already exist or none launched).", flush=True)
         return
 
+    os_error_occurred = False
     ids_to_delete = []
     try:
         ids_to_delete = _poll_and_download(task_list, drive_service, token_path)
     except (OSError, IOError) as e:
         all_downloaded = all(os.path.exists(item["local_path"]) for item in task_list)
         if all_downloaded:
-            print(f"Warning: Drive operation error ignored (all files downloaded): {e}", flush=True)
-            ids_to_delete = [fid for item in task_list for fid in item.get("drive_file_ids", [])]
+            print(f"Warning: Drive cleanup error ignored (all files downloaded): {e}", flush=True)
+            os_error_occurred = True
         else:
             raise
     finally:
-        if ids_to_delete:
+        if ids_to_delete and not os_error_occurred:
             print(f"Cleaning up {len(ids_to_delete)} file(s) from Google Drive...", flush=True)
             try:
                 delete_drive_files(token_path, ids_to_delete)

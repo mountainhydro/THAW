@@ -11,6 +11,7 @@ and covers both the Earth Engine and Drive scopes.
 """
 
 import os
+import time
 import ee
 from googleapiclient.discovery import build
 
@@ -47,9 +48,33 @@ def load_credentials(token_path):
     creds = Credentials.from_authorized_user_file(token_path, SCOPES)
 
     if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        with open(token_path, "w") as f:
-            f.write(creds.to_json())
+        lock_path = token_path + ".lock"
+        # Remove stale lock file left by a crashed process (older than 60s)
+        try:
+            if os.path.exists(lock_path) and (time.time() - os.path.getmtime(lock_path)) > 60:
+                os.remove(lock_path)
+        except OSError:
+            pass
+        # Spin-wait to acquire lock using O_EXCL (atomic on all OSes)
+        for _ in range(10):
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                break
+            except FileExistsError:
+                time.sleep(1)
+        try:
+            # Re-read inside lock in case another process already refreshed
+            creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+            if creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                with open(token_path, "w") as f:
+                    f.write(creds.to_json())
+        finally:
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
 
     return creds
 
