@@ -254,12 +254,10 @@ def get_historical_collection(s1, orbit_pass, doy, window, yearsBack, reference_
     -------
     ee.ImageCollection
     """
-    # Anchor to today so the full Sentinel-1 archive is used regardless of
-    # the processing date. Avoids empty historical collections when running
-    # the pipeline on historical dates (e.g. 2016) where only 1-2 years of
-    # prior data would exist if anchored to reference_date.
+    # Use the full Sentinel-1 archive (from 2016) up to today,
+    # excluding only the year of the target date itself.
     today = datetime.datetime.utcnow()
-    yearList = range(today.year - yearsBack, today.year)
+    yearList = [y for y in range(2016, today.year + 1) if y != reference_date.year]
     seasonal_list = []
     for y in yearList:
         target = datetime.datetime(y, 1, 1) + datetime.timedelta(days=doy - 1)
