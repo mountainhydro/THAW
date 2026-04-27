@@ -232,7 +232,12 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
         })
         print(f"Started GEE task: {name}", flush=True)
 
-    _poll_and_download(task_list, drive_service, token_path)
+    try:
+        _poll_and_download(task_list, drive_service, token_path)
+    except (OSError, IOError) as e:
+        # Swallow OS-level errors from Drive file deletion (e.g. [Errno 22] on Windows)
+        # Downloads are already complete at this point — pipeline can continue
+        print(f"Warning: Drive cleanup error ignored: {e}", flush=True)
     return local_dir
 
 
@@ -322,7 +327,10 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
         print("No tasks to run (all files already exist or none launched).", flush=True)
         return
 
-    _poll_and_download(task_list, drive_service, token_path)
+    try:
+        _poll_and_download(task_list, drive_service, token_path)
+    except (OSError, IOError) as e:
+        print(f"Warning: Drive cleanup error ignored: {e}", flush=True)
 
 
 # ============================================================
