@@ -30,9 +30,25 @@ class CancelledError(RuntimeError):
     pass
 
 
-class CancelledError(RuntimeError):
-    """Raised when GEE tasks are cancelled by the user."""
-    pass
+def _download_file_with_retry(drive_service, file_id, local_path, max_attempts=5, base_wait=30):
+    """Download a single Drive file with exponential-backoff retry on connection errors."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            request = drive_service.files().get_media(fileId=file_id)
+            with io.FileIO(local_path, "wb") as fh:
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+            return  # success
+        except (OSError, IOError) as e:
+            raise  # OS errors (e.g. bad path) are not retriable
+        except Exception as e:
+            if attempt == max_attempts:
+                raise
+            wait = base_wait * (2 ** (attempt - 1))
+            print(f"Download attempt {attempt}/{max_attempts} failed: {e} — retrying in {wait}s...", flush=True)
+            time.sleep(wait)
 
 
 
@@ -119,12 +135,7 @@ def _poll_and_download(task_list, drive_service, token_path):
                         item["done"] = True
                         completed += 1
                         continue
-                    request = drive_service.files().get_media(fileId=file_id)
-                    with io.FileIO(item["local_path"], "wb") as fh:
-                        downloader = MediaIoBaseDownload(fh, request)
-                        done = False
-                        while not done:
-                            _, done = downloader.next_chunk()
+                    _download_file_with_retry(drive_service, file_id, item["local_path"])
                     downloaded += 1
                     print(f"Downloaded files: ({downloaded}/{len(task_list)})", flush=True)
                     item["drive_file_ids"] = [file_id]
