@@ -550,6 +550,8 @@ if tif_files:
         for tif in tif_files:
             basename = os.path.basename(tif)
             vis = get_vis_params(basename)
+            # Use readable label from VIS_BY_LAYER instead of raw filename
+            layer_label = next((k.replace("_", " ").title() for k in VIS_BY_LAYER if k in basename), basename)
             result = _render_tif(tif, vis['min'], vis['max'], vis['palette'],
                                  'potential_water' in basename, os.path.getmtime(tif))
             if result:
@@ -557,7 +559,7 @@ if tif_files:
                 folium.raster_layers.ImageOverlay(
                     image=f"data:image/png;base64,{img_b64}",
                     bounds=[[south, west], [north, east]],
-                    name=basename, opacity=0.7, interactive=False
+                    name=layer_label, opacity=0.7, interactive=False
                 ).add_to(m)
     if fit_bounds:
         m.fit_bounds(fit_bounds)
