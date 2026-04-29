@@ -188,7 +188,7 @@ if not st.session_state.authenticated:
         3. Copy the full path to that file (for example `C:\\Users\\YourName\\Documents\\client_secret.json`)
            and paste it into the **OAuth Client Secret JSON Path** field at the top of this page.
            Do not include any quotation marks (`"`).
-        4. Now click the **Login & Remember Me** button at the top of this page.
+        4. Everything set. You can now click the **Login & Remember Me** button.
                     
         > **What happens when you log in for the first time:**
         > A browser window will open and ask you to confirm that THAW may access Earth Engine.

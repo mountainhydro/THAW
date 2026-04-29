@@ -196,11 +196,11 @@ def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
 
         # Find candidate pixels at mid threshold for DBSCAN
         valid = np.isfinite(data)
-        candidate = valid & (data >= mid_thresh)
+        candidate = valid & (data >= lower_thresh)
         ys, xs = np.nonzero(candidate)
 
         if len(ys) == 0:
-            print(f"  No clusters found above {mid_thresh}.", flush=True)
+            print(f"  No clusters found above {lower_thresh}.", flush=True)
             dates.append(date_str)
             areas_mean.append(0.0)
             areas_lower.append(0.0)
@@ -248,28 +248,7 @@ def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
     })
 
 
-# ============================================================
-# GROWTH TREND FLAGGING
-# ============================================================
 
-def flag_growth_trend(areas, dates, threshold_km2=0.05):
-    """
-    Flag whether the most recent frame shows lake growth above a threshold.
-
-    Parameters
-    ----------
-    areas        : list[float] — lake area values in km2, ordered by date
-    dates        : list[str]   — corresponding date strings
-    threshold_km2: float       — minimum area increase to flag as growth
-
-    Returns
-    -------
-    bool: True if growth exceeds threshold, False otherwise.
-    """
-    if len(areas) < 2:
-        return False
-    growth = areas[-1] - areas[-2]
-    return growth > threshold_km2
 
 
 # ============================================================
@@ -312,7 +291,7 @@ def generate_lake_metrics_report(
 ):
     """
     Compute cluster-based lake area metrics from downloaded likelihood TIFs,
-    save CSV + plot, flag growth trend, and build animated GIF.
+    save CSV + plot, and build animated GIF.
 
     Parameters
     ----------
@@ -334,17 +313,8 @@ def generate_lake_metrics_report(
     print("Computing cluster-based lake metrics...", flush=True)
     metrics_df = extract_cluster_area_timeseries(output_dir, thresholds=thresholds)
 
-    # 2. Flag growth trend
-    growing = flag_growth_trend(
-        metrics_df['mean_area_km2'].tolist(),
-        metrics_df['date'].tolist(),
-    )
-    if growing:
-        print("Growth trend detected: lake area increased beyond threshold.", flush=True)
-    else:
-        print("No significant growth trend detected.", flush=True)
 
-    # 3. Save CSV and plot
+    # 2. Save CSV and plot
     save_lake_metrics_plot_and_csv(
         metrics_df,
         output_csv=csv_filename,
