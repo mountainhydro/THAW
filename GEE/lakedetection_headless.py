@@ -273,7 +273,7 @@ def run_pipeline(config_path):
     done = ckpt.get("steps_complete", [])
 
     if "download" not in done:
-        print("Step 1/3: Exporting and downloading from GEE...", flush=True)
+        print("Step 1/3: Launching tasks on Google Earth Engine...", flush=True)
         local_path = retry(
             lambda: export_and_download(
                 exports, ref_date, aoi, token_path,
@@ -339,7 +339,7 @@ if __name__ == "__main__":
 
     config_path = sys.argv[1]  # <-- consistent with Streamlit
     try:
-        print("Starting pipeline...", flush=True)
+        print("Starting pipeline... this can take a few minutes", flush=True)
         msg = run_pipeline(config_path)
         print(f"PIPELINE_SUCCESS: {msg}", flush=True)
     except Exception as e:

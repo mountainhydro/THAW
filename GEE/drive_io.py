@@ -137,7 +137,7 @@ def _poll_and_download(task_list, drive_service, token_path):
                         continue
                     _download_file_with_retry(drive_service, file_id, item["local_path"])
                     downloaded += 1
-                    print(f"Downloaded files: ({downloaded}/{len(task_list)})", flush=True)
+                    print(f"Downloaded file from Google Drive: ({downloaded}/{len(task_list)})", flush=True)
                     item["drive_file_ids"] = [file_id]
                     item["done"] = True
                     completed += 1
