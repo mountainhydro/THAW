@@ -98,6 +98,7 @@ def run_tracking_pipeline(config_path):
     end_date    = cfg.get("end_date")
     project_id  = cfg.get("project_id")
     rel_out_dir = cfg.get("rel_output_dir")
+    task_name   = cfg.get("task_name", "tracking")
 
     # ROOT_DIR is the cwd when launched by the dashboard.
     # Explicitly chdir to it so relative paths inside inputs.py
@@ -120,6 +121,10 @@ def run_tracking_pipeline(config_path):
     sys.stdout = Logger(str(log_file))
     sys.stderr = sys.stdout
 
+    # Write PID so dashboard can detect if this process dies
+    pid_file = final_out_dir / "pipeline.pid"
+    pid_file.write_text(str(os.getpid()))
+
     print("--- THAW Tracking Analysis Started ---", flush=True)
     print(f"Time Range:   {start_date} to {end_date}", flush=True)
     print(f"AOI BBox:     {aoi_input}", flush=True)
@@ -140,6 +145,10 @@ def run_tracking_pipeline(config_path):
             done.append("reporting")
             write_checkpoint(final_out_dir_str, steps_complete=done)
         clear_checkpoint(final_out_dir_str)
+        try:
+            pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
         return "Tracking analysis complete (resumed)."
     # ────────────────────────────────────────────────────────────────────────
 
@@ -155,22 +164,25 @@ def run_tracking_pipeline(config_path):
     glacier_geom = load_glacier_mask(aoi, buffer_m=100, output_dir=final_out_dir_str)
     dem, slope_rad, aspect, terrain_mask = load_dem(aoi)
 
-    # Headless mode always clips to the glacier geometry
-    print("Clipping analysis to buffered glacier geometry...", flush=True)
-    refined_aoi = glacier_geom
+    if glacier_geom is None:
+        refined_aoi = aoi
+        thinning_correction = 0.0
+        print("No glacier mask — thinning correction set to 0.", flush=True)
+    else:
+        print("Clipping analysis to buffered glacier geometry...", flush=True)
+        refined_aoi = glacier_geom
 
-    try:
-        target_year = (int(start_date[:4]) + int(end_date[:4])) // 2
-    except (ValueError, TypeError):
-        target_year = datetime.datetime.now().year
+        try:
+            target_year = (int(start_date[:4]) + int(end_date[:4])) // 2
+        except (ValueError, TypeError):
+            target_year = datetime.datetime.now().year
 
-    # Cast to plain float to prevent numpy float32 JSON-serialisation error
-    thinning_correction = float(get_glacier_thinning_correction(
-        refined_aoi, target_year, dem,
-        cache_dir=str(thinning_cache_dir),
-        output_dir=final_out_dir_str,
-    ))
-    print(f"Glacier thinning correction (m): {thinning_correction:.3f}", flush=True)
+        thinning_correction = float(get_glacier_thinning_correction(
+            refined_aoi, target_year, dem,
+            cache_dir=str(thinning_cache_dir),
+            output_dir=final_out_dir_str,
+        ))
+        print(f"Glacier thinning correction (m): {thinning_correction:.3f}", flush=True)
 
 
 
@@ -180,7 +192,7 @@ def run_tracking_pipeline(config_path):
     print("Preprocessing Sentinel-1 collection...", flush=True)
     s1_preprocessed = preprocess_s1_collection(
         refined_aoi, start_date, end_date,
-        slope_rad, dem, aspect, glacier_geom,
+        slope_rad, dem, aspect, glacier_geom or refined_aoi,
         terrain_mask, thinning_correction,
     )
 
@@ -212,6 +224,11 @@ def run_tracking_pipeline(config_path):
 
     if "download" not in done:
         print("Step 1/2: Launching GEE Drive export tasks...", flush=True)
+        submission_date = datetime.datetime.now().strftime("%Y%m%d")
+        _center_lon = (aoi_input[0] + aoi_input[2]) / 2
+        _center_lat = (aoi_input[1] + aoi_input[3]) / 2
+        coord_tag = f"{int(round(_center_lat * 1000))}_{int(round(_center_lon * 1000))}"
+        prefix = f"{task_name}_{submission_date}_{coord_tag}"
         retry(
             lambda: export_images_via_drive(
                 s1_scored,
@@ -219,7 +236,7 @@ def run_tracking_pipeline(config_path):
                 token_path=cfg.get("drive_token_path"),
                 bands_to_export=bands,
                 output_dir=final_out_dir_str,
-                prefix="tracking_s1",
+                prefix=prefix,
             ),
             label="Download",
         )
@@ -246,6 +263,10 @@ def run_tracking_pipeline(config_path):
         print("Step 2/2: Reporting already complete, skipping.", flush=True)
 
     clear_checkpoint(final_out_dir_str)
+    try:
+        pid_file.unlink(missing_ok=True)
+    except Exception:
+        pass
     print("SUCCESS: Tracking analysis complete.", flush=True)
     return "Tracking analysis complete."
 

@@ -12,24 +12,20 @@ Created on Feb 2 2026
 
 import os
 import sys
-import math
 import ee
 import datetime
 import time
-import io
 import json
 import glob
-import numpy as np
-import rasterio
 
 # Path resolution for local imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 # Local imports
-from gee_auth import initialize_ee, build_drive_service
-from drive_io import Logger, export_and_download, resume_download, convert_to_cog, delete_drive_files, CancelledError
-from gee_core import get_radar_mask, apply_radar_mask_to_collection, get_historical_collection
+from gee_auth import initialize_ee
+from drive_io import Logger, export_and_download, convert_to_cog, CancelledError
+from gee_core import apply_radar_mask_to_collection, get_historical_collection
 from reporting import cluster_processing
 
 
@@ -112,17 +108,44 @@ def run_pipeline(config_path):
     local_dir = os.path.join(cfg["output_root"], f'Outputs_{date_str}{name_suffix}')
     os.makedirs(local_dir, exist_ok=True)
 
+    # Compute AOI center for filename uniqueness (no EE call needed — just parse GeoJSON)
+    with open(cfg["aoi_geojson"]) as _f:
+        _aoi_for_coords = json.load(_f)
+    _ring = _aoi_for_coords["features"][0]["geometry"]["coordinates"][0]
+    _lons = [p[0] for p in _ring]
+    _lats = [p[1] for p in _ring]
+    _center_lat = (min(_lats) + max(_lats)) / 2
+    _center_lon = (min(_lons) + max(_lons)) / 2
+    coord_tag = f"{int(round(_center_lat * 1000))}_{int(round(_center_lon * 1000))}"
+
     # logging of console outputs
     log_file = os.path.join(local_dir, f"pipeline_log_{timestamp}.txt")
     sys.stdout = Logger(log_file)
     sys.stderr = sys.stdout
 
-    # ── Resume detection ────────────────────────────────────────────────────
+    # Write PID so dashboard can detect if this process dies
+    pid_file = os.path.join(local_dir, "pipeline.pid")
+    with open(pid_file, "w") as _pf:
+        _pf.write(str(os.getpid()))
+
+    # Read checkpoint early — used for both resume detection and run_label restore
     ckpt = read_checkpoint(local_dir)
+
+    # Determine run_label: restore from checkpoint only when the saved label uses the
+    # current coord_tag (guards against stale checkpoints from old naming conventions).
+    # Only count files ≥ 100 KB as valid — partial downloads don't increment run_id.
+    if ckpt and "run_label" in ckpt and coord_tag in ckpt["run_label"]:
+        run_label = ckpt["run_label"]
+    else:
+        existing = [f for f in glob.glob(os.path.join(local_dir, f"z_score_{date_str}_{coord_tag}_*.tif"))
+                    if not f.endswith("_cog.tif") and os.path.getsize(f) > 100_000]
+        run_id    = len(existing) + 1
+        run_label = f"{date_str}_{coord_tag}_{run_id:03d}"
+
+    # ── Resume detection ────────────────────────────────────────────────────
     if ckpt and "download" in ckpt.get("steps_complete", []):
         print(f"Resuming incomplete pipeline from checkpoint in {local_dir}", flush=True)
         done = ckpt.get("steps_complete", [])
-
         local_path = local_dir
 
         if "cog" not in done:
@@ -133,11 +156,10 @@ def run_pipeline(config_path):
 
         if "cluster" not in done:
             print("Step 3/3: Running cluster analysis...", flush=True)
-            saved_ts = ckpt.get("timestamp", timestamp)
-            z_score_files = glob.glob(os.path.join(local_path, "z_score*.tif"))
+            z_score_files = glob.glob(os.path.join(local_path, "z_score_*.tif"))
             z_score_files = [f for f in z_score_files if not f.endswith("_cog.tif")]
             if z_score_files:
-                retry(lambda: cluster_processing(z_score_files[0], saved_ts), label="Clustering", max_attempts=3, base_wait=10)
+                retry(lambda: cluster_processing(z_score_files[0], run_label), label="Clustering", max_attempts=3, base_wait=10)
             done.append("cluster")
             write_checkpoint(local_dir, steps_complete=done)
 
@@ -232,7 +254,7 @@ def run_pipeline(config_path):
     # water/land transition between -14(very likely land -> likelyhood water = 0) and -18(very likely water -> likelyhood water = 1)
     potential_water = masked_mean.select('VV').subtract(-14).divide(-4)
     focal_mean = potential_water.focal_mean(3) # spatial clustering: focal mean of potential water
-    masked_diff = mean_diff.updateMask(focal_mean)
+    mean_diff.updateMask(focal_mean)  # masked diff (computed but not exported)
 
     latest_asc_anomaly = latest_asc.select('VV') \
         .subtract(hist_asc_stats.select('VV_mean')) \
@@ -263,25 +285,25 @@ def run_pipeline(config_path):
     # Write initial checkpoint so dashboard can detect this run
     write_checkpoint(local_dir,
         timestamp=timestamp,
+        run_label=run_label,
         task_name=task_name,
         ref_date=date_str,
         export_names=export_names,
         steps_complete=[],
     )
 
-    ckpt = read_checkpoint(local_dir)
-    done = ckpt.get("steps_complete", [])
+    done = []
 
     if "download" not in done:
         print("Step 1/3: Launching tasks on Google Earth Engine...", flush=True)
         local_path = retry(
             lambda: export_and_download(
                 exports, ref_date, aoi, token_path,
-                cfg["output_root"], timestamp, task_name
+                cfg["output_root"], run_label, task_name,
             ),
             label="Download",
         )
-        write_checkpoint(local_dir, steps_complete=done + ["download"])
+        write_checkpoint(local_dir, steps_complete=["download"])
         done.append("download")
     else:
         print("Step 1/3: Download already complete, skipping.", flush=True)
@@ -310,12 +332,12 @@ def run_pipeline(config_path):
 # ============================================================
     if "cluster" not in done:
         print("Step 3/3: Running cluster analysis...", flush=True)
-        z_score_files = glob.glob(os.path.join(local_path, "z_score*.tif"))
+        z_score_files = glob.glob(os.path.join(local_path, "z_score_*.tif"))
         z_score_files = [f for f in z_score_files if not f.endswith("_cog.tif")]
         if z_score_files:
             z_score_tif = z_score_files[0]
             retry(
-                lambda: cluster_processing(z_score_tif, timestamp),
+                lambda: cluster_processing(z_score_tif, run_label),
                 label="Clustering",
                 max_attempts=3,
                 base_wait=10,
@@ -326,6 +348,10 @@ def run_pipeline(config_path):
         print("Step 3/3: Clustering already complete, skipping.", flush=True)
 
     clear_checkpoint(local_dir)
+    try:
+        if os.path.exists(pid_file): os.remove(pid_file)
+    except Exception:
+        pass
     return "Processing complete."
 
 # ============================================================
