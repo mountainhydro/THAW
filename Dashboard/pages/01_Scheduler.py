@@ -14,6 +14,7 @@ import json
 import subprocess
 import sys
 import time as _time
+import requests
 import pandas as pd  # Added for GLOF CSV processing
 import rasterio
 from rasterio.warp import transform_bounds
@@ -110,7 +111,6 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 DASH_DIR = os.path.dirname(CURRENT_DIR)                 
 ROOT_DIR = os.path.dirname(DASH_DIR)                    
 TEMP_DIR = os.path.join(ROOT_DIR, "temp")
-DOCS_DIR = os.path.join(ROOT_DIR, "docs")  # Defined for GLOF CSV
 CRED_FILE = os.path.join(TEMP_DIR, "gee_credentials.txt")
 DRIVE_TOKEN_FILE = os.path.join(TEMP_DIR, "drive_token.json")
 GEE_DIR = os.path.join(ROOT_DIR, "GEE")
@@ -178,38 +178,46 @@ folium.TileLayer("https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
                  attr="Google", name="Satellite").add_to(m)
 
 # Overlay Layer: Past GLOF Events
-glof_file = os.path.join(DOCS_DIR, "GLOFevents2015-.csv")
-if os.path.exists(glof_file):
-    try:
-        # Fixed encoding to cp1252 to handle special characters/non-breaking spaces
-        df_events = pd.read_csv(glof_file, encoding='cp1252')
-        glof_group = folium.FeatureGroup(name="Past GLOF Events")
-        
-        for _, row in df_events.iterrows():
-            if pd.notna(row['Lat_lake']) and pd.notna(row['Lon_lake']):
-                # Construct Label: Lake Name (YYYY-MM-DD)
-                name = str(row['Lake_name']) if pd.notna(row['Lake_name']) else "Unknown"
-                y = str(int(row['Year_exact'])) if pd.notna(row['Year_exact']) else "XXXX"
-                mv = str(int(row['Month'])).zfill(2) if pd.notna(row['Month']) else "XX"
-                dv = str(int(row['Day'])).zfill(2) if pd.notna(row['Day']) else "XX"
-                
-                label = f"{name} ({y}-{mv}-{dv})"
-                
-                folium.CircleMarker(
-                    location=[row['Lat_lake'], row['Lon_lake']],
-                    radius=5,
-                    color="red",
-                    weight=2,
-                    fill=True,
-                    fill_color="red",
-                    fill_opacity=0.6,
-                    tooltip=label,
-                    popup=label
-                ).add_to(glof_group)
-        
-        glof_group.add_to(m)
-    except Exception as e:
-        st.warning(f"Could not load GLOF markers: {e}")
+GLOF_CSV_URL = "https://raw.githubusercontent.com/fidelsteiner/HMAGLOFDB/main/Database/GLOFs/HMAGLOFDB.csv"
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_glof_df():
+    resp = requests.get(GLOF_CSV_URL, timeout=15)
+    resp.raise_for_status()
+    from io import StringIO
+    return pd.read_csv(StringIO(resp.text))
+
+try:
+    df_events = _load_glof_df()
+    glof_recent = folium.FeatureGroup(name="GLOF Events 2014–present", show=False)
+    glof_historic = folium.FeatureGroup(name="GLOF Events before 2014", show=False)
+
+    for _, row in df_events.iterrows():
+        if not (pd.notna(row['Lat_lake']) and pd.notna(row['Lon_lake']) and pd.notna(row['Year_exact'])):
+            continue
+        name = str(row['Lake_name']) if pd.notna(row['Lake_name']) else "Unknown"
+        y = str(int(row['Year_exact']))
+        mv = str(int(row['Month'])).zfill(2) if pd.notna(row['Month']) else "XX"
+        dv = str(int(row['Day'])).zfill(2) if pd.notna(row['Day']) else "XX"
+        label = f"{name} ({y}-{mv}-{dv})"
+
+        target_group = glof_recent if int(row['Year_exact']) >= 2014 else glof_historic
+        folium.CircleMarker(
+            location=[row['Lat_lake'], row['Lon_lake']],
+            radius=5,
+            color="red",
+            weight=2,
+            fill=True,
+            fill_color="red",
+            fill_opacity=0.6,
+            tooltip=label,
+            popup=label
+        ).add_to(target_group)
+
+    glof_recent.add_to(m)
+    glof_historic.add_to(m)
+except Exception as e:
+    st.warning(f"Could not load GLOF markers: {e}")
 
 # Layer Selector
 folium.LayerControl(position='topright', collapsed=False).add_to(m)
@@ -342,6 +350,7 @@ if run_now_clicked:
     )
     st.session_state.pipeline_running = False
     st.session_state.pipeline_just_launched = True
+    _time.sleep(5)
     st.rerun()
 
 # 9. Execution Task Scheduling
