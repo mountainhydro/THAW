@@ -376,7 +376,9 @@ if schedule_clicked:
         )
         
         if os.system(powershell_fix) == 0:
-            st.sidebar.success(f"Scheduled '{task_name}' successfully!")
+            st.sidebar.success(f"Scheduled '{task_name}' successfully! New task will be listed under *Active Scheduled Tasks* within the next minute.")
+            _time.sleep(60)
+            st.rerun()     
         else:
             st.sidebar.warning("Task created, but 'Start When Available' setting failed. Check admin rights.")
     else:
