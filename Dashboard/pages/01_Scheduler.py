@@ -13,6 +13,7 @@ import glob
 import json
 import subprocess
 import sys
+import time as _time
 import pandas as pd  # Added for GLOF CSV processing
 import rasterio
 from rasterio.warp import transform_bounds
@@ -172,18 +173,9 @@ center    = st.session_state.get("map_center", center)
 fit_bounds = st.session_state.get("map_fit_bounds", None)
 
 # Map
-m = folium.Map(location=center, zoom_start=5, tiles=None)
-
-# OSM first (so it appears below satellite in layer control)
-folium.TileLayer("openstreetmap", name="OpenStreetMap", overlay=False).add_to(m)
-
-# Satellite last — Folium makes the last base layer the active default
-folium.TileLayer(
-    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-    name="Satellite",
-    attr="Esri",
-    overlay=False,
-).add_to(m)
+m = folium.Map(location=center, zoom_start=5)
+folium.TileLayer("https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+                 attr="Google", name="Satellite").add_to(m)
 
 # Overlay Layer: Past GLOF Events
 glof_file = os.path.join(DOCS_DIR, "GLOFevents2015-.csv")
@@ -346,18 +338,11 @@ if run_now_clicked:
 
     process = subprocess.Popen(
         [sys.executable, "-u", script_p, cfg_p],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    full_log = ""
-    for line in iter(process.stdout.readline, ""):
-        full_log += line
-        status_container.code(full_log)
-
     st.session_state.pipeline_running = False
-    if process.wait() == 0:
-        st.success("Manual run complete!")
-    else:
-        st.error("Manual run failed.")
+    st.session_state.pipeline_just_launched = True
+    st.rerun()
 
 # 9. Execution Task Scheduling
 if schedule_clicked:
@@ -402,24 +387,68 @@ def _get_log_status(log_path):
     else:
         return "running", content
 
+def _is_pid_running(pid):
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            stderr=subprocess.DEVNULL, text=True
+        )
+        return str(pid) in out
+    except Exception:
+        return False
+
 recent_folders = sorted(
     [f for f, _ in dated_folders],
     key=os.path.getmtime,
     reverse=True
 )[:4]
+any_running = False
 for folder in recent_folders:
     folder_name = os.path.basename(folder)
     log_files = sorted(glob.glob(os.path.join(folder, "pipeline_log_*.txt")))
     if not log_files:
+        if st.session_state.get("pipeline_just_launched"):
+            with st.expander(f"[Starting] {folder_name}", expanded=True):
+                st.info("Pipeline starting, please wait...")
+            _time.sleep(2)
+            st.rerun()
         continue
+    st.session_state.pop("pipeline_just_launched", None)
     status, content = _get_log_status(log_files[-1])
+
+    pid_file = os.path.join(folder, "pipeline.pid")
+
+    if status == "running":
+        any_running = True
+
     label = (
         f"[Done] {folder_name}"    if status == "success" else
         f"[Failed] {folder_name}"  if status == "failed"  else
         f"[Running] {folder_name}"
     )
     with st.expander(label, expanded=(status == "running")):
+        if status == "success":
+            st.success(f"Pipeline complete! Files saved in: {folder}")
         st.code(content)
+        if status == "running" and os.path.exists(pid_file):
+            try:
+                _pid = int(open(pid_file).read().strip())
+                if st.button("Cancel", key=f"cancel_{folder_name}"):
+                    if _is_pid_running(_pid):
+                        subprocess.call(["taskkill", "/F", "/PID", str(_pid)])
+                    try:
+                        os.remove(pid_file)
+                    except Exception:
+                        pass
+                    with open(log_files[-1], "a", encoding="utf-8") as _lf:
+                        _lf.write("\nPIPELINE_ERROR: Cancelled by user.\n")
+                    st.rerun()
+            except Exception:
+                pass
+
+if any_running:
+    _time.sleep(3)
+    st.rerun()
 
 # 11. Active Scheduled Tasks
 st.divider()

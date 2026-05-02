@@ -86,6 +86,7 @@ def load_glacier_mask(aoi, buffer_m=200, output_dir="outputs"):
     """
     Load GLIMS glacier outlines within the AOI, buffer them, and return
     a single clipped ee.Geometry. Also exports the result as GeoJSON.
+    Falls back to the AOI itself if no glacier outlines are found.
 
     Parameters
     ----------
@@ -100,19 +101,24 @@ def load_glacier_mask(aoi, buffer_m=200, output_dir="outputs"):
     ee.Geometry
     """
     rgi = ee.FeatureCollection("GLIMS/20230607").filterBounds(aoi)
+
+    if rgi.size().getInfo() == 0:
+        print("Warning: no glacier outlines found in AOI — skipping glacier mask and thinning correction.", flush=True)
+        return None
+
     buffered = rgi.map(lambda f: f.buffer(buffer_m))
     unioned = buffered.union().geometry()
-    clipped = unioned.intersection(aoi)
+    geom = unioned.intersection(aoi)
 
     os.makedirs(output_dir, exist_ok=True)
-    shapely_glacier_geom = ee_to_shapely(clipped)
+    shapely_glacier_geom = ee_to_shapely(geom)
     export_glacier_polygon(
         shapely_glacier_geom,
         crs_epsg=4326,
         output_path=os.path.join(output_dir, "glacier_geom.geojson")
     )
 
-    return clipped
+    return geom
 
 
 # ============================================================

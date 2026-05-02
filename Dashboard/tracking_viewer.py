@@ -122,7 +122,7 @@ def render_tracking_viewer(folder_path):
             "Date",
             options=dates,
             value=dates[0],
-            key="tracking_slider",
+            key=f"tracking_slider_{os.path.basename(folder_path)}",
         )
         idx = dates.index(selected_date)
         st.caption(f"Image {idx + 1} of {len(frames)}")

@@ -20,6 +20,17 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 # --- 1. Function Definitions ---
+
+def _is_pid_running(pid):
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            stderr=subprocess.DEVNULL, text=True
+        )
+        return str(pid) in out
+    except Exception:
+        return False
+
 def load_gee_creds():
     """Reads stored GEE credentials from the temp file."""
     if os.path.exists(CRED_FILE):
@@ -346,12 +357,18 @@ def write_timetrack_config(folder_path, aoi, start_date, end_date, selected_ids,
     # Convert the absolute folder_path to a path relative to ROOT_DIR
     rel_output_path = os.path.relpath(folder_path, ROOT_DIR)
 
+    # Extract task_name from folder name: "Outputs_YYYY-MM-DD_TaskName" → "TaskName"
+    folder_base = os.path.basename(folder_path)
+    parts = folder_base.split("_", 2)
+    task_name = parts[2] if len(parts) > 2 else "tracking"
+
     config_data = {
         "aoi_bbox": aoi,
         "start_date": start_date,
         "end_date": end_date,
         "cluster_ids": selected_ids,
-        "rel_output_dir": rel_output_path, 
+        "rel_output_dir": rel_output_path,
+        "task_name": task_name,
         "project_id": proj_id,
         "drive_token_path": drive_token_path,
         "processed_at": datetime.now().isoformat()
@@ -473,7 +490,7 @@ if tif_files:
         pass
 
 m = folium.Map(location=center, zoom_start=12)
-folium.TileLayer("https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}", 
+folium.TileLayer("https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
                   attr="Google", name="Satellite").add_to(m)
 
 draw = Draw(
@@ -642,7 +659,7 @@ Fullscreen(
     force_separate_button=True,
 ).add_to(m)
 folium.LayerControl(collapsed=False).add_to(m)
-map_output = st_folium(m, width="100%", height=620, returned_objects=["all_drawings"])
+map_output = st_folium(m, width="100%", height=620, returned_objects=["all_drawings"], key=f"map_{folder_path}")
 
 # Extract drawn AOI from map regardless of whether clusters exist
 drawn_aoi = None
@@ -702,6 +719,11 @@ st.dataframe(data_rows, width=1100, height=400, hide_index=True)
 # --- 8. Progress Tracking & Execution ---
 import time as _time
 
+# Clear "just launched" flag when the user switches to a different folder
+if st.session_state.get("tracking_launched_for") != folder_path:
+    st.session_state.pop("tracking_just_launched", None)
+    st.session_state.pop("tracking_launched_for", None)
+
 tracking_dir = os.path.join(folder_path, "tracking_results")
 tracking_log_files = sorted(glob.glob(os.path.join(tracking_dir, "tracking_log_*.txt")))
 
@@ -726,6 +748,8 @@ st.sidebar.write(f"**Period:** {calc_start} to {calc_end}")
 
 if drawn_aoi:
     st.sidebar.success(f"AOI Defined: {len(selected_ids)} clusters selected.")
+    if tracking_status == "running":
+        st.sidebar.caption("A tracking analysis is already running.")
     if st.sidebar.button("Run Tracking Analysis", disabled=(tracking_status == "running")):
         try:
             cfg_p = write_timetrack_config(folder_path, drawn_aoi, calc_start,
@@ -735,51 +759,59 @@ if drawn_aoi:
             process = subprocess.Popen(
                 [sys.executable, "-u", script_rel_path, cfg_p],
                 cwd=ROOT_DIR,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
             tracking_status = "running"
             st.session_state["tracking_just_launched"] = True
-            status_container = st.empty()
-            status_container.info("Starting tracking analysis, please wait...")
-            full_log = ""
-            for line in iter(process.stdout.readline, ""):
-                full_log += line
-                status_container.code(full_log)
-            process.stdout.close()
-            if process.wait() == 0:
-                tracking_status = "success"
-            else:
-                tracking_status = "failed"
-            st.session_state.pop("tracking_just_launched", None)
+            st.session_state["tracking_launched_for"] = folder_path
+            st.rerun()
         except Exception as e:
             st.sidebar.error(f"Error: {e}")
 else:
     st.sidebar.info("Draw an area of interest on the map to select clusters for tracking.")
 
-if st.session_state.get("tracking_just_launched") and tracking_status == "running":
-    st.sidebar.success("Tracking analysis launched!")
-elif tracking_status != "running":
-    st.session_state.pop("tracking_just_launched", None)
-
-# Pipeline log expander — shown on refresh when not actively streaming
+# Pipeline log expander
 st.write("### Analysis Progress")
 if tracking_status == "idle":
-    st.info("No tracking analysis run yet for this folder.")
-elif not st.session_state.get("tracking_just_launched"):
+    if st.session_state.get("tracking_just_launched"):
+        st.info("Tracking analysis starting, please wait...")
+        _time.sleep(2)
+        st.rerun()
+    else:
+        st.info("No tracking analysis run yet for this folder.")
+elif tracking_status != "idle":
     log_label = (
         "[Running] Tracking Analysis" if tracking_status == "running" else
         "[Done] Tracking Analysis"    if tracking_status == "success" else
         "[Failed] Tracking Analysis"
     )
+    if tracking_status == "success":
+        st.success(f"Tracking analysis complete! Files saved in: {tracking_dir}")
     with st.expander(log_label, expanded=(tracking_status == "running")):
         if tracking_log_files:
             with open(tracking_log_files[-1], encoding="utf-8", errors="replace") as _f:
                 st.code(_f.read())
         else:
             st.info("Starting tracking analysis, please wait...")
+        if tracking_status == "running":
+            _pid_file = os.path.join(tracking_dir, "pipeline.pid")
+            if os.path.exists(_pid_file):
+                try:
+                    _pid = int(open(_pid_file).read().strip())
+                    if st.button("Cancel", key="cancel_tracking"):
+                        if _is_pid_running(_pid):
+                            subprocess.call(["taskkill", "/F", "/PID", str(_pid)])
+                        try:
+                            os.remove(_pid_file)
+                        except Exception:
+                            pass
+                        if tracking_log_files:
+                            with open(tracking_log_files[-1], "a", encoding="utf-8") as _lf:
+                                _lf.write("\nPIPELINE_ERROR: Cancelled by user.\n")
+                        st.rerun()
+                except Exception:
+                    pass
 
     if tracking_status == "running":
         _time.sleep(3)

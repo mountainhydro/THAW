@@ -3,7 +3,7 @@
 THAW - Google Drive I/O module
 
 Handles all GEE export → Drive → local download operations, COG conversion,
-and Drive cleanup. 
+and Drive cleanup.
 
 GEE Processing code: Dr. Evan Miles
 Tool/Operationalization: Dr. Stefan Fugger
@@ -16,6 +16,8 @@ import io
 import sys
 import glob
 import time
+import socket
+import datetime
 import ee
 import rasterio
 from googleapiclient.http import MediaIoBaseDownload
@@ -30,26 +32,75 @@ class CancelledError(RuntimeError):
     pass
 
 
-def _download_file_with_retry(drive_service, file_id, local_path, max_attempts=5, base_wait=30):
-    """Download a single Drive file with exponential-backoff retry on connection errors."""
+def _is_valid_tif(path):
+    """Return True only if path exists, is non-trivially sized, and rasterio can open it."""
+    if not os.path.exists(path):
+        return False
+    if os.path.getsize(path) < 1024:
+        return False
+    try:
+        with rasterio.open(path):
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _download_file_with_retry(drive_service, file_id, local_path, max_attempts=8, base_wait=30, file_prefix=None):
+    """Download a single Drive file with exponential-backoff retry.
+    On 404, re-queries Drive for a fresh file ID using file_prefix.
+    If re-query returns the same ID that just failed, gives up immediately
+    (same ID = unrecoverable, not a transient error).
+    Returns True on success, False on final failure."""
+    last_404_id = None
     for attempt in range(1, max_attempts + 1):
         try:
-            request = drive_service.files().get_media(fileId=file_id)
+            socket.setdefaulttimeout(300)  # 5-minute timeout per chunk — prevents silent hang
+            request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
             with io.FileIO(local_path, "wb") as fh:
                 downloader = MediaIoBaseDownload(fh, request)
                 done = False
                 while not done:
                     _, done = downloader.next_chunk()
-            return  # success
-        except (OSError, IOError) as e:
-            raise  # OS errors (e.g. bad path) are not retriable
+            return True
         except Exception as e:
+            is_404 = "404" in str(e) or "notFound" in str(e)
+            if is_404 and file_prefix:
+                # Re-query Drive for a fresh file ID — old one may be deleted
+                try:
+                    safe_prefix = file_prefix.replace("'", "\\'")
+                    res = drive_service.files().list(
+                        q=f"name contains '{safe_prefix}' and trashed=false",
+                        fields="files(id, name)",
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                    ).execute()
+                    fresh_files = res.get("files", [])
+                    if fresh_files:
+                        exact = [f for f in fresh_files if f["name"] == f"{file_prefix}.tif"]
+                        chosen = exact[0] if exact else fresh_files[0]
+                        new_id = chosen["id"].strip().rstrip("-")
+                        if new_id == last_404_id:
+                            # Same dead ID returned again — unrecoverable, stop immediately
+                            print(f"Warning: file persistently not accessible on Drive, skipping: {os.path.basename(local_path)}", flush=True)
+                            return False
+                        last_404_id = file_id
+                        file_id = new_id
+                        print(f"Re-queried Drive, got fresh file ID: {file_id}", flush=True)
+                except Exception:
+                    pass
+            # Remove partial file before retrying so it won't be mistaken for a complete download
+            if os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
             if attempt == max_attempts:
-                raise
+                print(f"Warning: download failed after {max_attempts} attempts for {os.path.basename(local_path)}: {e}", flush=True)
+                return False
             wait = base_wait * (2 ** (attempt - 1))
             print(f"Download attempt {attempt}/{max_attempts} failed: {e} — retrying in {wait}s...", flush=True)
             time.sleep(wait)
-
 
 
 # ============================================================
@@ -73,13 +124,20 @@ class Logger:
         self.log = open(filename, "a", encoding="utf-8")
 
     def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
+        self.log.write(message)   # log file first — must not be lost
         self.log.flush()
+        try:
+            self.terminal.write(message)
+            self.terminal.flush()
+        except Exception:
+            pass  # broken or full pipe must never block or crash the pipeline
 
     def flush(self):
-        self.terminal.flush()
         self.log.flush()
+        try:
+            self.terminal.flush()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -110,41 +168,82 @@ def _poll_and_download(task_list, drive_service, token_path):
     then permanently delete all downloaded files from Drive.
     """
     print(f"Waiting for {len(task_list)} GEE task(s)...", flush=True)
-    completed = 0
+    completed  = 0
     downloaded = 0
+    stall_counts = {i: 0 for i in range(len(task_list))}
 
     while completed < len(task_list):
-        for item in task_list:
+        # Rebuild drive service each pass to prevent stale connections
+        try:
+            drive_service = build_drive_service(token_path)
+        except Exception as e:
+            print(f"Warning: could not refresh Drive service: {e}", flush=True)
+
+        pass_states = {}  # cache states from this pass — no re-querying
+
+        for idx, item in enumerate(task_list):
             if item["done"]:
                 continue
 
-            status = item["task"].status()
+            try:
+                status = item["task"].status()
+                state  = status.get("state", "UNKNOWN")
+            except Exception as e:
+                print(f"Warning: could not get task status for {item['label']}: {e}", flush=True)
+                state = "UNKNOWN"
+                status = {}
 
-            if status["state"] == "COMPLETED":
-                fname = f"{item['file_prefix']}.tif"
-                safe_fname = fname.replace("'", "\\'")
-                res = drive_service.files().list(
-                    q=f"name='{safe_fname}' and trashed=false",
-                    fields="files(id)",
-                ).execute()
-                files = res.get("files", [])
+            pass_states[idx] = state
+
+            if state == "COMPLETED":
+                try:
+                    safe_prefix = item['file_prefix'].replace("'", "\\'")
+                    res = drive_service.files().list(
+                        q=f"name contains '{safe_prefix}' and trashed=false",
+                        fields="files(id, name)",
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                    ).execute()
+                    files = res.get("files", [])
+                except Exception as e:
+                    print(f"Warning: Drive query failed for {item['label']}: {e}", flush=True)
+                    continue
 
                 if files:
-                    file_id = files[0]["id"].strip().rstrip("-")
+                    stall_counts[idx] = 0
+                    exact = [f for f in files if f["name"] == f"{item['file_prefix']}.tif"]
+                    chosen = exact[0] if exact else files[0]
+                    file_id = chosen["id"].strip().rstrip("-")
                     if not file_id:
                         item["done"] = True
                         completed += 1
                         continue
-                    _download_file_with_retry(drive_service, file_id, item["local_path"])
+                    _download_file_with_retry(drive_service, file_id, item["local_path"],
+                                              file_prefix=item["file_prefix"])
+                    if not _is_valid_tif(item["local_path"]):
+                        print(f"Warning: downloaded file is corrupt or unreadable, skipping: {os.path.basename(item['local_path'])}", flush=True)
+                        try:
+                            os.remove(item["local_path"])
+                        except OSError:
+                            pass
+                        item["done"] = True
+                        completed += 1
+                        continue
                     downloaded += 1
-                    print(f"Downloaded file from Google Drive: ({downloaded}/{len(task_list)})", flush=True)
+                    print(f"Downloaded files: ({downloaded}/{len(task_list)})", flush=True)
                     item["drive_file_ids"] = [file_id]
                     item["done"] = True
                     completed += 1
-                # File not yet visible in Drive — retry on next pass
+                    pass_states[idx] = "DOWNLOADED"
+                else:
+                    stall_counts[idx] += 1
+                    if stall_counts[idx] >= 10:
+                        print(f"Warning: file never appeared in Drive for {item['label']}, skipping.", flush=True)
+                        item["done"]   = True
+                        item["failed"] = True
+                        completed += 1
 
-            elif status["state"] in ["FAILED", "CANCELLED"]:
-                state = status["state"]
+            elif state in ["FAILED", "CANCELLED"]:
                 print(
                     f"Task {state.lower()}: {item['label']} — {status.get('error_message', '')}",
                     flush=True,
@@ -155,6 +254,15 @@ def _poll_and_download(task_list, drive_service, token_path):
                 completed += 1
 
         if completed < len(task_list):
+            # Use cached states — no extra API calls
+            pending_states = [pass_states.get(i, "UNKNOWN")
+                              for i, item in enumerate(task_list) if not item["done"]]
+            state_counts = {}
+            for s in pending_states:
+                label = "processing" if s == "RUNNING" else "queued" if s == "READY" else s.lower()
+                state_counts[label] = state_counts.get(label, 0) + 1
+            state_str = ", ".join(f"{v} {k}" for k, v in state_counts.items())
+            print(f"Waiting... {len(pending_states)} file(s) remaining ({state_str}).", flush=True)
             time.sleep(30)
 
     # Raise if any tasks failed
@@ -171,7 +279,7 @@ def _poll_and_download(task_list, drive_service, token_path):
 
 
 def export_and_download(images_to_export, reference_date, aoi, token_path,
-                        output_root, timestamp, task_name=""):
+                        output_root, run_label, task_name=""):
     """
     Export a dict of GEE images to Drive, download them locally, then delete
     from Drive. Used by the lakedetection pipeline.
@@ -188,8 +296,8 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
         Path to drive_token.json.
     output_root : str
         Parent directory; a dated subfolder is created inside it.
-    timestamp : str
-        Run timestamp string (YYYYMMDD_HHMM) used in filenames.
+    run_label : str
+        Label used in filenames, e.g. '2026-05-01_001'.
     task_name : str, optional
         Optional suffix appended to the output folder name.
 
@@ -204,10 +312,72 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
     os.makedirs(local_dir, exist_ok=True)
 
     drive_service = build_drive_service(token_path)
-    task_list = []
 
+    # Separate files already valid on disk from those needing download
+    missing = {}
     for name, img in images_to_export.items():
-        file_prefix = f"{name}_{timestamp}"
+        file_prefix = f"{name}_{run_label}"
+        local_path  = os.path.join(local_dir, f"{file_prefix}.tif")
+        if _is_valid_tif(local_path):
+            print(f"Already exists locally, skipping: {file_prefix}.tif", flush=True)
+        else:
+            if os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+            missing[name] = (img, file_prefix, local_path)
+
+    if not missing:
+        return local_dir
+
+    # Check Drive for files already exported (avoids re-submitting GEE tasks on retry)
+    drive_available = []  # (file_prefix, local_path, file_id)
+    need_gee = {}         # name → (img, file_prefix, local_path)
+
+    print(f"Checking Google Drive for {len(missing)} missing file(s)...", flush=True)
+    for name, (img, file_prefix, local_path) in missing.items():
+        try:
+            safe_prefix = file_prefix.replace("'", "\\'")
+            res = drive_service.files().list(
+                q=f"name contains '{safe_prefix}' and trashed=false",
+                fields="files(id, name)",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            files = res.get("files", [])
+            if files:
+                exact = [f for f in files if f["name"] == f"{file_prefix}.tif"]
+                chosen = exact[0] if exact else files[0]
+                file_id = chosen["id"].strip().rstrip("-")
+                if file_id:
+                    try:
+                        drive_service.files().get(fileId=file_id, fields="id", supportsAllDrives=True).execute()
+                        drive_available.append((file_prefix, local_path, file_id))
+                        continue
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        need_gee[name] = (img, file_prefix, local_path)
+
+    if drive_available:
+        print(f"Found {len(drive_available)} file(s) already in Drive — downloading directly.", flush=True)
+        ids_downloaded = []
+        for file_prefix, local_path, file_id in drive_available:
+            ok = _download_file_with_retry(drive_service, file_id, local_path,
+                                           file_prefix=file_prefix)
+            if ok:
+                ids_downloaded.append(file_id)
+        if ids_downloaded:
+            delete_drive_files(token_path, ids_downloaded)
+
+    if not need_gee:
+        return local_dir
+
+    # Submit GEE tasks only for files not found anywhere
+    task_list = []
+    for name, (img, file_prefix, local_path) in need_gee.items():
         task = ee.batch.Export.image.toDrive(
             image=img,
             description=file_prefix,
@@ -221,7 +391,7 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
         task_list.append({
             "task":           task,
             "file_prefix":    file_prefix,
-            "local_path":     os.path.join(local_dir, f"{file_prefix}.tif"),
+            "local_path":     local_path,
             "label":          name,
             "drive_file_ids": [],
             "done":           False,
@@ -238,6 +408,7 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
                 delete_drive_files(token_path, ids_to_delete)
             except Exception as e:
                 print(f"Warning: Drive cleanup failed (files may remain): {e}", flush=True)
+
     return local_dir
 
 
@@ -247,7 +418,7 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
 
 def export_images_via_drive(s1_collection, aoi_ee, token_path,
                             bands_to_export=None, output_dir="outputs",
-                            prefix="S1", scale=10, drive_folder="GEE_Exports"):
+                            prefix="tracking", scale=10, drive_folder="GEE_Exports"):
     """
     Export each image × band from a Sentinel-1 collection to Drive, download
     locally, then delete from Drive. Used by the tracking pipeline.
@@ -265,7 +436,8 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
     output_dir : str, optional
         Local directory for downloaded files (default 'outputs').
     prefix : str, optional
-        Filename prefix (default 'S1').
+        Filename prefix including task name and submission date,
+        e.g. 'Khumbu_20260502'.
     scale : int, optional
         Export resolution in metres (default 10).
     drive_folder : str, optional
@@ -279,49 +451,116 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
 
     count = s1_collection.size().getInfo()
     s1_list = s1_collection.toList(count)
-    task_list = []
 
     import re as _re
 
+    # Build expected file list: get image date from system:time_start
+    expected = []
     for i in range(count):
         img = ee.Image(s1_list.get(i))
-        img_id = (img.id().getInfo() or f"img{i:03d}").replace("/", "_")
-
+        try:
+            img_time = img.get('system:time_start').getInfo()
+            img_date = datetime.datetime.fromtimestamp(img_time / 1000, tz=datetime.timezone.utc).strftime('%Y-%m-%d')
+        except Exception:
+            img_date = f"img{i:03d}"
         for band in bands_to_export:
-            local_filename = f"{prefix}_{band}_{img_id}.tif"
-            local_path = os.path.join(output_dir, local_filename)
+            local_filename = f"{prefix}_{img_date}_{band}.tif"
+            local_path     = os.path.join(output_dir, local_filename)
+            file_prefix    = local_filename[:-4]
+            expected.append((local_path, file_prefix, i, band, img, img_date))
 
-            if os.path.exists(local_path):
-                print(f"File exists, skipping: {local_filename}", flush=True)
-                continue
-
-            file_prefix = local_filename[:-4]  # GEE appends .tif automatically
-
+    # Validity check — delete and re-download invalid files
+    for local_path, *_ in expected:
+        if os.path.exists(local_path) and not _is_valid_tif(local_path):
+            print(f"Invalid file detected, removing: {os.path.basename(local_path)}", flush=True)
             try:
-                band_image = img.select(band).clip(aoi_ee)
-                # Colons in timestamps cause [Errno 22] on Windows via the GEE API
-                safe_desc = _re.sub(r'[^A-Za-z0-9_\-]', '_', file_prefix)[:100]
-                task = ee.batch.Export.image.toDrive(
-                    image=band_image,
-                    description=safe_desc,
-                    folder=drive_folder,
-                    fileNamePrefix=file_prefix,
-                    region=aoi_ee.bounds(),
-                    scale=scale,
-                    maxPixels=1e12,
-                )
-                task.start()
-                task_list.append({
-                    "task":           task,
-                    "file_prefix":    file_prefix,
-                    "local_path":     local_path,
-                    "label":          local_filename,
-                    "drive_file_ids": [],
-                    "done":           False,
-                })
-                #print(f"Task started: {local_filename}", flush=True)
-            except Exception as e:
-                print(f"Failed to start task for {local_filename}: {e}", flush=True)
+                os.remove(local_path)
+            except OSError:
+                pass
+
+    missing_locally   = [(lp, fp, i, b, im, id_) for lp, fp, i, b, im, id_ in expected if not _is_valid_tif(lp)]
+    already_local     = len(expected) - len(missing_locally)
+    if already_local:
+        print(f"{already_local} file(s) already on disk, skipping.", flush=True)
+
+    # Check Drive for the locally-missing files
+    drive_available = []   # (local_path, file_prefix, file_id) — found in Drive
+    need_gee        = []   # (local_path, file_prefix, i, band, img, img_date) — need GEE export
+
+    if missing_locally:
+        print(f"Checking Google Drive for {len(missing_locally)} missing file(s)...", flush=True)
+        for local_path, file_prefix, i, band, img, img_date in missing_locally:
+            try:
+                safe_prefix = file_prefix.replace("'", "\\'")
+                res = drive_service.files().list(
+                    q=f"name contains '{safe_prefix}' and trashed=false",
+                    fields="files(id, name)",
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                ).execute()
+                files = res.get("files", [])
+                if files:
+                    exact = [f for f in files if f["name"] == f"{file_prefix}.tif"]
+                    chosen = exact[0] if exact else files[0]
+                    file_id = chosen["id"].strip().rstrip("-")
+                    if file_id:
+                        try:
+                            drive_service.files().get(fileId=file_id, fields="id", supportsAllDrives=True).execute()
+                            drive_available.append((local_path, file_prefix, file_id))
+                            continue
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            need_gee.append((local_path, file_prefix, i, band, img, img_date))
+
+        if drive_available:
+            print(f"Found {len(drive_available)} file(s) already in Drive — downloading directly.", flush=True)
+            dl_count = 0
+            ids_downloaded = []
+            for local_path, file_prefix, file_id in drive_available:
+                ok = _download_file_with_retry(drive_service, file_id, local_path,
+                                               file_prefix=file_prefix, max_attempts=8)
+                if ok:
+                    dl_count += 1
+                    ids_downloaded.append(file_id)
+            print(f"Downloaded {dl_count}/{len(drive_available)} file(s) from Drive.", flush=True)
+            if ids_downloaded:
+                delete_drive_files(token_path, ids_downloaded)
+
+        if not need_gee:
+            print("All files accounted for — no GEE tasks needed.", flush=True)
+            return
+
+        print(f"Submitting {len(need_gee)} GEE task(s) for remaining files...", flush=True)
+
+    task_list = []
+    items_to_submit = need_gee if missing_locally else \
+        [(lp, fp, i, b, im, id_) for lp, fp, i, b, im, id_ in expected if not _is_valid_tif(lp)]
+    for local_path, file_prefix, i, band, img, img_date in items_to_submit:
+        try:
+            band_image = img.select(band).clip(aoi_ee)
+            safe_desc  = _re.sub(r'[^A-Za-z0-9_\-]', '_', file_prefix)[:100]
+            task = ee.batch.Export.image.toDrive(
+                image=band_image,
+                description=safe_desc,
+                folder=drive_folder,
+                fileNamePrefix=file_prefix,
+                region=aoi_ee.bounds(),
+                scale=scale,
+                maxPixels=1e12,
+            )
+            task.start()
+            task_list.append({
+                "task":           task,
+                "file_prefix":    file_prefix,
+                "local_path":     local_path,
+                "label":          os.path.basename(local_path),
+                "drive_file_ids": [],
+                "done":           False,
+            })
+        except Exception as e:
+            print(f"Failed to start task for {file_prefix}: {e}", flush=True)
 
     if not task_list:
         print("No tasks to run (all files already exist or none launched).", flush=True)
@@ -332,7 +571,7 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
     try:
         ids_to_delete = _poll_and_download(task_list, drive_service, token_path)
     except (OSError, IOError) as e:
-        all_downloaded = all(os.path.exists(item["local_path"]) for item in task_list)
+        all_downloaded = all(_is_valid_tif(item["local_path"]) for item in task_list)
         if all_downloaded:
             print(f"Warning: Drive cleanup error ignored (all files downloaded): {e}", flush=True)
             os_error_occurred = True
@@ -345,69 +584,6 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
                 delete_drive_files(token_path, ids_to_delete)
             except Exception as e:
                 print(f"Warning: Drive cleanup failed (files may remain): {e}", flush=True)
-
-
-# ============================================================
-# RESUME DOWNLOAD
-# ============================================================
-
-def resume_download(export_names, reference_date, token_path, output_root,
-                    timestamp, task_name=""):
-    """
-    Resume a failed lakedetection download without re-running GEE tasks.
-
-    Use when GEE exports completed and files are still in Drive but the
-    pipeline crashed before finishing download/COG/cluster steps.
-    Files already present locally are skipped automatically.
-
-    Parameters
-    ----------
-    export_names   : list[str]  — e.g. ['potential_water', 'z_score']
-    reference_date : datetime.datetime
-    token_path     : str
-    output_root    : str
-    timestamp      : str        — YYYYMMDD_HHMM from the failed run
-    task_name      : str, optional
-
-    Returns
-    -------
-    str  — path to the local output directory
-    """
-    date_str    = reference_date.strftime("%Y-%m-%d")
-    name_suffix = f"_{task_name}" if task_name else ""
-    local_dir   = os.path.join(output_root, f"Outputs_{date_str}{name_suffix}")
-    os.makedirs(local_dir, exist_ok=True)
-
-    drive_service = build_drive_service(token_path)
-
-    for name in export_names:
-        file_prefix = f"{name}_{timestamp}"
-        local_path  = os.path.join(local_dir, f"{file_prefix}.tif")
-
-        if os.path.exists(local_path):
-            print(f"Already exists, skipping: {os.path.basename(local_path)}", flush=True)
-            continue
-
-        print(f"Resuming download: {file_prefix}", flush=True)
-        res = drive_service.files().list(
-            q=f"name='{file_prefix}.tif' and trashed=false",
-            fields="files(id)",
-        ).execute()
-        files = res.get("files", [])
-        if not files:
-            print(f"Warning: no Drive file found for {file_prefix} — may have been deleted.", flush=True)
-            continue
-        file_id = files[0]["id"]
-        request = drive_service.files().get_media(fileId=file_id)
-        with io.FileIO(local_path, "wb") as fh:
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-        print(f"Downloaded: {file_prefix}.tif", flush=True)
-        delete_drive_files(token_path, [file_id])
-
-    return local_dir
 
 
 # ============================================================

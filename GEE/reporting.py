@@ -165,18 +165,27 @@ def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
     areas_upper = []
 
     for tif_path in tif_files:
-        # Extract date from filename — GEE asset IDs contain YYYYMMDDTHHMMSS
-        match = re.search(r'(\d{4})(\d{2})(\d{2})T\d{6}', os.path.basename(tif_path))
-        date_str = f"{match.group(1)}-{match.group(2)}-{match.group(3)}" if match else os.path.basename(tif_path)
+        # Extract date from filename — supports both YYYY-MM-DD and legacy YYYYMMDDThhmmss formats
+        basename = os.path.basename(tif_path)
+        match = re.search(r'(\d{4}-\d{2}-\d{2})', basename)
+        if not match:
+            match2 = re.search(r'(\d{4})(\d{2})(\d{2})T\d{6}', basename)
+            date_str = f"{match2.group(1)}-{match2.group(2)}-{match2.group(3)}" if match2 else basename
+        else:
+            date_str = match.group(1)
 
-        print(f"Processing frame: {date_str}", flush=True)
+        print(f"Processing frame: {basename}", flush=True)
 
-        with rasterio.open(tif_path) as src:
-            data = src.read(1).astype(float)
-            transform = src.transform
-            res_x, res_y = src.res
-            src_crs = src.crs
-            nodata = src.nodata
+        try:
+            with rasterio.open(tif_path) as src:
+                data = src.read(1).astype(float)
+                transform = src.transform
+                res_x, res_y = src.res
+                src_crs = src.crs
+                nodata = src.nodata
+        except Exception as e:
+            print(f"Warning: skipping {basename} — cannot read file: {e}", flush=True)
+            continue
 
         # Mask nodata
         if nodata is not None:
@@ -379,16 +388,15 @@ def build_lake_monitoring_gif(out_dir, dates, areas_km2,
     if gif_filename is None:
         gif_filename = os.path.join(out_dir, "lake_monitoring.gif")
 
-    band_files = {
-        band: sorted(glob.glob(os.path.join(out_dir, f"*{band}*.tif")))
-        for band in bands
-    }
-
-    count = len(dates)
+    # Build date → {band: path} so missing files for one date don't misalign other bands
+    date_band_files = {}
     for band in bands:
-        n = len(band_files[band])
-        if n < count:
-            print(f"Warning: found {n} files for band '{band}', expected {count}.", flush=True)
+        for path in glob.glob(os.path.join(out_dir, f"*{band}*.tif")):
+            m = re.search(r'(\d{4}-\d{2}-\d{2})', os.path.basename(path))
+            if m:
+                date_band_files.setdefault(m.group(1), {})[band] = path
+
+    date_area = dict(zip(dates, areas_km2))
 
     try:
         font       = ImageFont.truetype(font_path or "arial.ttf", 22)
@@ -398,19 +406,25 @@ def build_lake_monitoring_gif(out_dir, dates, areas_km2,
         font_small = font
 
     frames = []
+    count = len(dates)
 
-    for i in range(count):
-        if any(i >= len(band_files[band]) for band in bands):
-            print(f"Missing files for frame {i} ({dates[i]}), skipping.", flush=True)
+    for i, date in enumerate(dates):
+        band_paths = date_band_files.get(date, {})
+        missing = [b for b in bands if b not in band_paths]
+        if missing:
+            print(f"Missing {missing} for date {date}, skipping frame.", flush=True)
             continue
 
-        vv_raw  = _read_masked(band_files['VV_raw'][i])
+        try:
+            vv_raw  = _read_masked(band_paths['VV_raw'])
+            vv_corr = _read_masked(band_paths['VV_corrected'])
+            lkl     = _read_masked(band_paths['lake_likelihood'])
+        except Exception as e:
+            print(f"Warning: skipping frame {date} — cannot read file: {e}", flush=True)
+            continue
+
         im_raw  = _render_band(vv_raw,  plt.cm.gray,   vmin=-25, vmax=0, nan_fill=0.5)
-
-        vv_corr = _read_masked(band_files['VV_corrected'][i])
         im_corr = _render_band(vv_corr, plt.cm.gray,   vmin=-25, vmax=0, nan_fill=0.5)
-
-        lkl     = _read_masked(band_files['lake_likelihood'][i])
         im_lkl  = _render_band(lkl,    plt.cm.viridis, vmin=0,   vmax=1, nan_fill=0.0)
 
         target_h = max(im_raw.height, im_corr.height, im_lkl.height)
@@ -437,17 +451,17 @@ def build_lake_monitoring_gif(out_dir, dates, areas_km2,
             draw.text((x, 6), label, font=font_small, fill='white',
                       stroke_width=1, stroke_fill='black')
 
-        draw.text((10, 28), dates[i], font=font, fill='white',
+        draw.text((10, 28), date, font=font, fill='white',
                   stroke_width=2, stroke_fill='black')
 
-        area_text = f"Lake area: {areas_km2[i]:.4f} km2"
+        area_text = f"Lake area: {date_area.get(date, 0.0):.4f} km2"
         bbox = draw.textbbox((0, 0), area_text, font=font)
         y    = combined.height - (bbox[3] - bbox[1]) - 10
         draw.text((10, y), area_text, font=font, fill='white',
                   stroke_width=2, stroke_fill='black')
 
         frames.append(combined)
-        print(f"  Frame {i+1}/{count}: {dates[i]}", flush=True)
+        print(f"  Frame {i+1}/{count}: {date}", flush=True)
 
     if frames:
         frames[0].save(
