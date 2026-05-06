@@ -22,6 +22,8 @@ from datetime import datetime, date as dt_date
 import streamlit as st
 import folium
 from folium.plugins import Draw
+from folium import MacroElement
+from jinja2 import Template
 from streamlit_folium import st_folium
 
 # 1. Function Definitions
@@ -122,6 +124,7 @@ os.makedirs(CONFIG_DIR, exist_ok=True)
 project_id, service_account_path = load_gee_creds()
 
 st.set_page_config(layout="wide", page_title="Job Scheduler")
+st.markdown("<style>[data-stale='true']{opacity:1!important;transition:none!important;}</style>", unsafe_allow_html=True)
 
 if not project_id:
     st.error("**No Credentials Found.** Please go to the Home page and log in first.")
@@ -168,6 +171,7 @@ if zoom_clicked:
         [zoom_lat + 0.1, zoom_lon + 0.1],
     ]
     st.session_state["map_key"] = st.session_state.get("map_key", 0) + 1
+    st.session_state["zoom_pin"] = [zoom_lat, zoom_lon]
 
 center    = st.session_state.get("map_center", center)
 fit_bounds = st.session_state.get("map_fit_bounds", None)
@@ -176,6 +180,26 @@ fit_bounds = st.session_state.get("map_fit_bounds", None)
 m = folium.Map(location=center, zoom_start=5)
 folium.TileLayer("https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
                  attr="Google", name="Satellite").add_to(m)
+
+# Pin at zoom-to-location target
+zoom_pin = st.session_state.get("zoom_pin")
+if zoom_pin:
+    pin_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="48" viewBox="0 0 32 48">'
+        '<path d="M16 0C7.2 0 0 7.2 0 16c0 12 16 32 16 32S32 28 32 16C32 7.2 24.8 0 16 0z"'
+        ' fill="#e00" stroke="#900" stroke-width="1.5"/>'
+        '<circle cx="16" cy="16" r="6" fill="white"/>'
+        '</svg>'
+    )
+    folium.Marker(
+        location=zoom_pin,
+        tooltip=f"Zoom target: {zoom_pin[0]:.5f}, {zoom_pin[1]:.5f}",
+        icon=folium.DivIcon(
+            html=pin_svg,
+            icon_size=(32, 48),
+            icon_anchor=(16, 48),
+        ),
+    ).add_to(m)
 
 # Overlay Layer: Past GLOF Events
 GLOF_CSV_URL = "https://raw.githubusercontent.com/fidelsteiner/HMAGLOFDB/main/Database/GLOFs/HMAGLOFDB.csv"
@@ -226,14 +250,38 @@ if fit_bounds:
     m.fit_bounds(fit_bounds)
 
 Draw(export=True, draw_options={"polyline":False, "circle":False, "marker":False}).add_to(m)
+
+# Limit to one drawn polygon: when the user activates a draw tool, remove any
+# existing L.Polygon layers from every FeatureGroup on the map. Rectangles and
+# polygons are both L.Polygon subclasses; GLOF CircleMarkers are not, so they
+# are unaffected.
+class _LimitOneDrawing(MacroElement):
+    _template = Template("""
+        {% macro script(this, kwargs) %}
+        {{ this._parent.get_name() }}.on('draw:drawstart', function() {
+            {{ this._parent.get_name() }}.eachLayer(function(fg) {
+                if (!(fg instanceof L.FeatureGroup)) return;
+                var toRemove = [];
+                fg.eachLayer(function(l) {
+                    if (l instanceof L.Polygon) toRemove.push(l);
+                });
+                toRemove.forEach(function(l) { fg.removeLayer(l); });
+            });
+        });
+        {% endmacro %}
+    """)
+
+_LimitOneDrawing().add_to(m)
+
 draw_data = st_folium(m, width=None, height=550,
+                      returned_objects=["all_drawings"],
                       key=f"map_{st.session_state.get('map_key', 0)}")
 
 aoi_geojson = None
 
 MAX_AOI_AREA_KM2 = 60000
 if draw_data and draw_data.get("all_drawings"):
-    aoi_geojson = draw_data["all_drawings"][0]["geometry"]
+    aoi_geojson = draw_data["all_drawings"][-1]["geometry"]
     aoi_area = calculate_bbox_area_km2(aoi_geojson)
 
     if aoi_area > MAX_AOI_AREA_KM2:
@@ -350,7 +398,7 @@ if run_now_clicked:
     )
     st.session_state.pipeline_running = False
     st.session_state.pipeline_just_launched = True
-    _time.sleep(5)
+    _time.sleep(8)
     st.rerun()
 
 # 9. Execution Task Scheduling

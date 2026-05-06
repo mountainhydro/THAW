@@ -15,6 +15,8 @@ from rasterio.warp import transform_bounds
 import base64
 from streamlit_folium import st_folium
 from folium.plugins import MeasureControl, Draw, Fullscreen
+from folium import MacroElement
+from jinja2 import Template
 from tracking_viewer import render_tracking_viewer
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -405,6 +407,7 @@ if not project_id:
 st.markdown(
     """
     <style>
+    [data-stale='true'] { opacity: 1 !important; transition: none !important; }
     .reportview-container .main .block-container {
         max-width: 1100px;
         padding-top: 2rem;
@@ -497,6 +500,24 @@ draw = Draw(
     export=False,
     draw_options={'polyline': False, 'rectangle': True, 'polygon': False, 'circle': False, 'marker': False, 'circlemarker': False}
 ).add_to(m)
+
+class _LimitOneDrawing(MacroElement):
+    _template = Template("""
+        {% macro script(this, kwargs) %}
+        {{ this._parent.get_name() }}.on('draw:drawstart', function() {
+            {{ this._parent.get_name() }}.eachLayer(function(fg) {
+                if (!(fg instanceof L.FeatureGroup)) return;
+                var toRemove = [];
+                fg.eachLayer(function(l) {
+                    if (l instanceof L.Polygon) toRemove.push(l);
+                });
+                toRemove.forEach(function(l) { fg.removeLayer(l); });
+            });
+        });
+        {% endmacro %}
+    """)
+
+_LimitOneDrawing().add_to(m)
 m.add_child(MeasureControl(position='topleft'))
 
 
@@ -664,11 +685,11 @@ map_output = st_folium(m, width="100%", height=620, returned_objects=["all_drawi
 # Extract drawn AOI from map regardless of whether clusters exist
 drawn_aoi = None
 if map_output and map_output.get("all_drawings"):
-    for drawing in map_output["all_drawings"]:
-        if drawing['geometry']['type'] == 'Polygon':
-            coords = drawing['geometry']['coordinates'][0]
-            lons, lats = [c[0] for c in coords], [c[1] for c in coords]
-            drawn_aoi = [min(lons), min(lats), max(lons), max(lats)]
+    last = map_output["all_drawings"][-1]
+    if last['geometry']['type'] == 'Polygon':
+        coords = last['geometry']['coordinates'][0]
+        lons, lats = [c[0] for c in coords], [c[1] for c in coords]
+        drawn_aoi = [min(lons), min(lats), max(lons), max(lats)]
 
 # --- 7. Data Sync & Table ---
 cluster_csv_files = glob.glob(os.path.join(folder_path, "cluster_summary*.csv"))
@@ -689,15 +710,12 @@ if cluster_csv_files:
                 "Selected": " " 
             })
 
-    if map_output and map_output.get("all_drawings") and drawn_aoi:
-        for drawing in map_output["all_drawings"]:
-            if drawing['geometry']['type'] == 'Polygon':
-                coords = drawing['geometry']['coordinates'][0]
-                lons, lats = [c[0] for c in coords], [c[1] for c in coords]
-                for row in data_rows:
-                    if (min(lons) <= row["Centroid_Lon"] <= max(lons) and
-                        min(lats) <= row["Centroid_Lat"] <= max(lats)):
-                        selected_ids.append(str(row["Cluster_ID"]))
+    if drawn_aoi:
+        min_lon, min_lat, max_lon, max_lat = drawn_aoi
+        for row in data_rows:
+            if (min_lon <= row["Centroid_Lon"] <= max_lon and
+                    min_lat <= row["Centroid_Lat"] <= max_lat):
+                selected_ids.append(str(row["Cluster_ID"]))
     
     selected_ids = list(set(selected_ids))
     for row in data_rows:

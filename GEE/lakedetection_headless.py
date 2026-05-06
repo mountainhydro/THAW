@@ -367,7 +367,7 @@ if __name__ == "__main__":
     try:
         print("Starting pipeline... this can take a few minutes", flush=True)
         msg = run_pipeline(config_path)
-        print(f"PIPELINE_SUCCESS: {msg}", flush=True)
+        print(f"PIPELINE_SUCCESS: {msg} — Please proceed to the Output and Tracking page.", flush=True)
     except Exception as e:
         print(f"PIPELINE_ERROR: {str(e)}", flush=True)
         sys.exit(1)
