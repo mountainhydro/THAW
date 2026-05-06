@@ -154,12 +154,15 @@ def delete_drive_files(token_path, file_ids):
     except Exception as e:
         print(f"Warning: could not build Drive service for cleanup: {e}", flush=True)
         return
+    deleted = 0
     for fid in file_ids:
         try:
             drive.files().delete(fileId=fid).execute()
-            print(f"Deleted Drive file: {fid}", flush=True)
+            deleted += 1
         except Exception as e:
             print(f"Warning: could not delete Drive file {fid} ({type(e).__name__}: {e})", flush=True)
+    if deleted:
+        print(f"Cleaned {deleted} file(s) from Google Drive.", flush=True)
 
 
 def _poll_and_download(task_list, drive_service, token_path):
