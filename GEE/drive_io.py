@@ -46,6 +46,92 @@ def _is_valid_tif(path):
         return False
 
 
+def _merge_tif_tiles(tile_paths, output_path):
+    """
+    Merge one or more GeoTIFF tiles into a single output file.
+    Single tile: fast rename. Multiple tiles: rasterio.merge then delete temps.
+    """
+    import shutil
+    if len(tile_paths) == 1:
+        shutil.move(tile_paths[0], output_path)
+        return
+    from rasterio.merge import merge as rio_merge
+    datasets = [rasterio.open(p) for p in tile_paths]
+    try:
+        mosaic, transform = rio_merge(datasets)
+        profile = datasets[0].profile.copy()
+        profile.update({
+            "height":    mosaic.shape[1],
+            "width":     mosaic.shape[2],
+            "transform": transform,
+        })
+    finally:
+        for ds in datasets:
+            ds.close()
+    with rasterio.open(output_path, "w", **profile) as dst:
+        dst.write(mosaic)
+    for p in tile_paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _download_tiles_and_merge(drive_service, drive_files, local_path, file_prefix):
+    """
+    Download all Drive tiles matching a file_prefix and merge into local_path.
+
+    GEE splits large exports into tiles named like ``prefix-0000000000-0000023296.tif``.
+    This function downloads every tile and merges them in filename order.
+
+    Returns
+    -------
+    (success : bool, file_ids : list[str])
+        success  — True if local_path is a valid TIF after the call.
+        file_ids — IDs of every tile downloaded (for Drive cleanup).
+    """
+    tiles = sorted(drive_files, key=lambda f: f["name"])
+    exact = [f for f in tiles if f["name"] == f"{file_prefix}.tif"]
+
+    if exact:
+        # Non-tiled: single file with the exact expected name
+        file_id = exact[0]["id"].strip().rstrip("-")
+        ok = _download_file_with_retry(drive_service, file_id, local_path,
+                                       file_prefix=file_prefix)
+        return ok, [file_id]
+
+    # Tiled output: download each tile to a temp path alongside local_path
+    tmp_dir    = os.path.dirname(local_path)
+    tile_paths = []
+    tile_ids   = []
+    for tf in tiles:
+        tid = tf["id"].strip().rstrip("-")
+        if not tid:
+            continue
+        tmp_path = os.path.join(tmp_dir, f"_tile_{tf['name']}")
+        ok = _download_file_with_retry(drive_service, tid, tmp_path,
+                                       file_prefix=file_prefix)
+        if ok:
+            tile_paths.append(tmp_path)
+            tile_ids.append(tid)
+
+    if not tile_paths:
+        return False, []
+
+    try:
+        _merge_tif_tiles(tile_paths, local_path)
+    except Exception as merge_e:
+        print(f"Warning: tile merge failed for {os.path.basename(local_path)}: {merge_e}", flush=True)
+        for p in tile_paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        return False, tile_ids
+
+    return True, tile_ids
+
+
 def _download_file_with_retry(drive_service, file_id, local_path, max_attempts=8, base_wait=30, file_prefix=None):
     """Download a single Drive file with exponential-backoff retry.
     On 404, re-queries Drive for a fresh file ID using file_prefix.
@@ -214,16 +300,10 @@ def _poll_and_download(task_list, drive_service, token_path):
 
                 if files:
                     stall_counts[idx] = 0
-                    exact = [f for f in files if f["name"] == f"{item['file_prefix']}.tif"]
-                    chosen = exact[0] if exact else files[0]
-                    file_id = chosen["id"].strip().rstrip("-")
-                    if not file_id:
-                        item["done"] = True
-                        completed += 1
-                        continue
-                    _download_file_with_retry(drive_service, file_id, item["local_path"],
-                                              file_prefix=item["file_prefix"])
-                    if not _is_valid_tif(item["local_path"]):
+                    ok, tile_ids = _download_tiles_and_merge(
+                        drive_service, files, item["local_path"],
+                        file_prefix=item["file_prefix"])
+                    if not ok or not _is_valid_tif(item["local_path"]):
                         print(f"Warning: downloaded file is corrupt or unreadable, skipping: {os.path.basename(item['local_path'])}", flush=True)
                         try:
                             os.remove(item["local_path"])
@@ -234,7 +314,7 @@ def _poll_and_download(task_list, drive_service, token_path):
                         continue
                     downloaded += 1
                     print(f"Downloaded files: ({downloaded}/{len(task_list)})", flush=True)
-                    item["drive_file_ids"] = [file_id]
+                    item["drive_file_ids"] = tile_ids
                     item["done"] = True
                     completed += 1
                     pass_states[idx] = "DOWNLOADED"
@@ -335,7 +415,7 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
         return local_dir
 
     # Check Drive for files already exported (avoids re-submitting GEE tasks on retry)
-    drive_available = []  # (file_prefix, local_path, file_id)
+    drive_available = []  # (file_prefix, local_path, drive_files_list)
     need_gee = {}         # name → (img, file_prefix, local_path)
 
     print(f"Checking Google Drive for {len(missing)} missing file(s)...", flush=True)
@@ -350,16 +430,8 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
             ).execute()
             files = res.get("files", [])
             if files:
-                exact = [f for f in files if f["name"] == f"{file_prefix}.tif"]
-                chosen = exact[0] if exact else files[0]
-                file_id = chosen["id"].strip().rstrip("-")
-                if file_id:
-                    try:
-                        drive_service.files().get(fileId=file_id, fields="id", supportsAllDrives=True).execute()
-                        drive_available.append((file_prefix, local_path, file_id))
-                        continue
-                    except Exception:
-                        pass
+                drive_available.append((file_prefix, local_path, files))
+                continue
         except Exception:
             pass
         need_gee[name] = (img, file_prefix, local_path)
@@ -367,11 +439,11 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
     if drive_available:
         print(f"Found {len(drive_available)} file(s) already in Drive — downloading directly.", flush=True)
         ids_downloaded = []
-        for file_prefix, local_path, file_id in drive_available:
-            ok = _download_file_with_retry(drive_service, file_id, local_path,
-                                           file_prefix=file_prefix)
+        for file_prefix, local_path, drive_files in drive_available:
+            ok, tile_ids = _download_tiles_and_merge(drive_service, drive_files, local_path,
+                                                     file_prefix=file_prefix)
             if ok:
-                ids_downloaded.append(file_id)
+                ids_downloaded.extend(tile_ids)
         if ids_downloaded:
             delete_drive_files(token_path, ids_downloaded)
 
@@ -487,7 +559,7 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
         print(f"{already_local} file(s) already on disk, skipping.", flush=True)
 
     # Check Drive for the locally-missing files
-    drive_available = []   # (local_path, file_prefix, file_id) — found in Drive
+    drive_available = []   # (local_path, file_prefix, drive_files_list) — found in Drive
     need_gee        = []   # (local_path, file_prefix, i, band, img, img_date) — need GEE export
 
     if missing_locally:
@@ -503,16 +575,8 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
                 ).execute()
                 files = res.get("files", [])
                 if files:
-                    exact = [f for f in files if f["name"] == f"{file_prefix}.tif"]
-                    chosen = exact[0] if exact else files[0]
-                    file_id = chosen["id"].strip().rstrip("-")
-                    if file_id:
-                        try:
-                            drive_service.files().get(fileId=file_id, fields="id", supportsAllDrives=True).execute()
-                            drive_available.append((local_path, file_prefix, file_id))
-                            continue
-                        except Exception:
-                            pass
+                    drive_available.append((local_path, file_prefix, files))
+                    continue
             except Exception:
                 pass
             need_gee.append((local_path, file_prefix, i, band, img, img_date))
@@ -521,12 +585,12 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
             print(f"Found {len(drive_available)} file(s) already in Drive — downloading directly.", flush=True)
             dl_count = 0
             ids_downloaded = []
-            for local_path, file_prefix, file_id in drive_available:
-                ok = _download_file_with_retry(drive_service, file_id, local_path,
-                                               file_prefix=file_prefix, max_attempts=8)
+            for local_path, file_prefix, drive_files in drive_available:
+                ok, tile_ids = _download_tiles_and_merge(drive_service, drive_files, local_path,
+                                                         file_prefix=file_prefix)
                 if ok:
                     dl_count += 1
-                    ids_downloaded.append(file_id)
+                    ids_downloaded.extend(tile_ids)
             print(f"Downloaded {dl_count}/{len(drive_available)} file(s) from Drive.", flush=True)
             if ids_downloaded:
                 delete_drive_files(token_path, ids_downloaded)

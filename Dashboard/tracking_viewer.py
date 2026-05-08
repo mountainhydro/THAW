@@ -74,19 +74,20 @@ def _discover_frames(tracking_dir):
 
 # ── viewer section (paste into Output_Preview.py) ──────────────────────────
 
-def render_tracking_viewer(folder_path):
+def render_tracking_viewer(tracking_dir, title="Tracking Results Viewer"):
     """
-    Call this function at the bottom of Output_Preview.py, passing the
-    already-resolved folder_path variable (the dated Outputs_* folder).
+    Render the three-panel image viewer and lake area chart for one tracking run.
 
-    Example (in Output_Preview.py):
-        from tracking_viewer import render_tracking_viewer
-        render_tracking_viewer(folder_path)
+    Parameters
+    ----------
+    tracking_dir : str
+        Absolute path to a specific tracking results directory
+        (e.g. `.../Outputs_2026-05-06_Khumbu/tracking_results_1/`).
+    title : str, optional
+        Section header shown above the viewer.
     """
-    tracking_dir = os.path.join(folder_path, "tracking_results")
-
     st.write("---")
-    st.subheader("Tracking Results Viewer")
+    st.subheader(title)
 
     # Constrain all widgets in this viewer to match TOTAL_WIDTH
     TOTAL_WIDTH = 900
@@ -122,7 +123,7 @@ def render_tracking_viewer(folder_path):
             "Date",
             options=dates,
             value=dates[0],
-            key=f"tracking_slider_{os.path.basename(folder_path)}",
+            key=f"tracking_slider_{os.path.basename(tracking_dir)}",
         )
         idx = dates.index(selected_date)
         st.caption(f"Image {idx + 1} of {len(frames)}")

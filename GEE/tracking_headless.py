@@ -15,6 +15,7 @@ import sys
 import json
 import datetime
 from pathlib import Path
+import re
 
 # Path resolution for local imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -106,7 +107,15 @@ def run_tracking_pipeline(config_path):
     ROOT_DIR = os.getcwd()
     os.chdir(ROOT_DIR)
 
-    final_out_dir = Path(ROOT_DIR) / rel_out_dir / "tracking_results"
+    _parent_out = Path(ROOT_DIR) / rel_out_dir
+    _existing_nums = []
+    if _parent_out.is_dir():
+        for _d in _parent_out.iterdir():
+            _m = re.fullmatch(r"tracking_results_(\d+)", _d.name)
+            if _m:
+                _existing_nums.append(int(_m.group(1)))
+    _run_number = max(_existing_nums, default=0) + 1
+    final_out_dir = _parent_out / f"tracking_results_{_run_number}"
     final_out_dir.mkdir(parents=True, exist_ok=True)
     final_out_dir_str = str(final_out_dir)
 
