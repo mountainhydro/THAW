@@ -142,8 +142,8 @@ if not st.session_state.authenticated:
 
         1. In the Google Cloud Console, click **Create project**  
             - Type a short name for your project, for example: `THAW`.
-            - Just below the name you will see an **ID** that Google generates automatically,
-            for example `thaw-123456`. 
+            - Just below the name you will see an **ID** that Google generates automatically, **which is different from the project name**,
+            for example `thaw-123456`.
             - Copy this ID, and **paste it in the "GEE Project ID" field** above. 
             - If you have an organization attached to your Google Account, select it, otherwise select *no organization* and click **Create**.
         2. Select **See if you are eligible for noncommercial use** and click **Get Started**, and fill the form.

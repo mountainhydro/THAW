@@ -20,6 +20,7 @@ from jinja2 import Template
 from tracking_viewer import render_tracking_viewer
 import matplotlib.pyplot as plt
 from PIL import Image
+import time as _time
 
 # --- 1. Function Definitions ---
 
@@ -107,7 +108,8 @@ def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=Non
     dates = [f["date"] for f in frames]
 
     # Render lake area chart
-    chart_b64 = ""
+    chart_b64  = ""
+    chart_meta = None
     metrics_csv = os.path.join(tracking_dir, "lake_metrics.csv")
     if os.path.isfile(metrics_csv):
         try:
@@ -129,8 +131,22 @@ def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=Non
             fig.autofmt_xdate(rotation=30, ha="right")
             ax.legend(fontsize=8, loc="upper left")
             fig.tight_layout()
+            _fw = fig.get_figwidth() * fig.dpi
+            _fh = fig.get_figheight() * fig.dpi
+            _ap = ax.get_position()
+            _xlim = ax.get_xlim()
+            chart_meta = {
+                "left":     int(_ap.x0 * _fw),
+                "right":    int(_ap.x1 * _fw),
+                "top":      int((1 - _ap.y1) * _fh),
+                "bottom":   int((1 - _ap.y0) * _fh),
+                "native_w": int(_fw),
+                "native_h": int(_fh),
+                "xmin":     _xlim[0],
+                "xmax":     _xlim[1],
+            }
             buf = BytesIO()
-            fig.savefig(buf, format="PNG", dpi=100, bbox_inches="tight")
+            fig.savefig(buf, format="PNG", dpi=100)
             plt.close(fig)
             chart_b64 = base64.b64encode(buf.getvalue()).decode()
         except Exception:
@@ -162,15 +178,29 @@ def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=Non
             except Exception:
                 pass
 
+    # Pre-compute slider dates as matplotlib date floats so JS can map them to x-axis pixels
+    dates_mpl_js = "null"
+    if chart_meta:
+        try:
+            from matplotlib.dates import date2num as _mpl_date2num
+            dates_mpl_js = json.dumps([_mpl_date2num(datetime.strptime(d, "%Y-%m-%d")) for d in dates])
+        except Exception:
+            pass
+
     # Build self-contained HTML
     dates_js  = json.dumps(dates)
     frames_js = json.dumps(frame_b64)
     title     = f"THAW Tracking Report - {task_date} {task_name}".strip()
-    chart_section = (
-        f"<h2>Lake Area Over Time</h2>"
-        f"<img id='chart-img' src='data:image/png;base64,{chart_b64}'>"
-        if chart_b64 else ""
-    )
+    if chart_b64 and chart_meta:
+        chart_section = (
+            f'<h2>Lake Area Over Time</h2>'
+            f'<div style="position:relative;display:inline-block;width:100%;max-width:1200px;margin-top:10px;">'
+            f'<img id="chart-img" src="data:image/png;base64,{chart_b64}" style="display:block;width:100%;">'
+            f'<canvas id="chart-canvas" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;"></canvas>'
+            f'</div>'
+        )
+    else:
+        chart_section = ""
 
     # Build satellite + z_score Folium map
     map_iframe = ""
@@ -238,6 +268,7 @@ def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=Non
                             color="#FF6B00", weight=2, dash_array="8 6",
                             fill=False, tooltip="Tracking AOI",
                         ).add_to(fm)
+                        fm.fit_bounds([[_b[1], _b[0]], [_b[3], _b[2]]])
                     except Exception:
                         pass
                 folium.LayerControl(collapsed=False).add_to(fm)
@@ -269,7 +300,7 @@ def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=Non
   input[type=range] {{ width: 100%; }}
   #date-label {{ font-size: 0.95em; color: #444; margin: 4px 0 10px; }}
   #frame-img  {{ max-width: 1200px; width: 100%; border: 1px solid #ddd; border-radius: 4px; }}
-  #chart-img  {{ max-width: 1200px; width: 100%; border: 1px solid #ddd; border-radius: 4px; margin-top: 10px; }}
+  #chart-img  {{ max-width: 1200px; width: 100%; border: 1px solid #ddd; border-radius: 4px; }}
   table {{ border-collapse: collapse; width: 100%; max-width: 1200px; font-size: 0.85em; margin-top: 6px; }}
   th {{ background: #4a90d9; color: #fff; padding: 7px 10px; text-align: left; }}
   td {{ padding: 6px 10px; border-bottom: 1px solid #e0e0e0; }}
@@ -288,12 +319,42 @@ def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=Non
 <img id="frame-img" src="data:image/png;base64,{first_img}">
 {chart_section}
 <script>
-const dates  = {dates_js};
-const frames = {frames_js};
+const dates     = {dates_js};
+const frames    = {frames_js};
+const chartMeta = {json.dumps(chart_meta) if chart_meta else 'null'};
+const datesMpl  = {dates_mpl_js};
+
+function drawChartIndicator(i) {{
+  if (!chartMeta || !datesMpl) return;
+  const canvas = document.getElementById("chart-canvas");
+  if (!canvas) return;
+  canvas.width  = canvas.offsetWidth;
+  canvas.height = canvas.offsetHeight;
+  const ctx  = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const frac = (datesMpl[i] - chartMeta.xmin) / (chartMeta.xmax - chartMeta.xmin);
+  if (frac < 0 || frac > 1) return;
+  const scaleX = canvas.offsetWidth  / chartMeta.native_w;
+  const scaleY = canvas.offsetHeight / chartMeta.native_h;
+  const x  = (chartMeta.left + frac * (chartMeta.right - chartMeta.left)) * scaleX;
+  const y0 = chartMeta.top    * scaleY;
+  const y1 = chartMeta.bottom * scaleY;
+  ctx.beginPath();
+  ctx.moveTo(x, y0);
+  ctx.lineTo(x, y1);
+  ctx.strokeStyle = "rgba(220, 80, 0, 0.9)";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([5, 3]);
+  ctx.stroke();
+}}
+
 function updateFrame(i) {{
   document.getElementById("frame-img").src = "data:image/png;base64," + frames[i];
   document.getElementById("date-label").textContent = "Date: " + dates[i] + " (" + (parseInt(i)+1) + " of " + frames.length + ")";
+  drawChartIndicator(i);
 }}
+
+window.addEventListener("load", function() {{ drawChartIndicator(0); }});
 </script>
 </body>
 </html>"""
@@ -380,6 +441,40 @@ def write_timetrack_config(folder_path, aoi, start_date, end_date, selected_ids,
         json.dump(config_data, f, indent=4)
     
     return cfg_path
+
+def _discover_tracking_runs(folder_path):
+    """Return [(label, path), …] in display order: legacy first (empty label), then Tracking 1, 2, …"""
+    import re as _re_runs
+    runs = []
+    legacy = os.path.join(folder_path, "tracking_results")
+    if os.path.isdir(legacy):
+        runs.append(("Tracking", legacy))
+    numbered = []
+    try:
+        for entry in os.scandir(folder_path):
+            if not entry.is_dir():
+                continue
+            m = _re_runs.fullmatch(r"tracking_results_(\d+)", entry.name)
+            if m:
+                numbered.append((int(m.group(1)), entry.path))
+    except OSError:
+        pass
+    for n, path in sorted(numbered, key=lambda x: x[0]):
+        runs.append((f"Tracking {n}", path))
+    return runs
+
+def _get_run_status(tracking_dir):
+    """Return 'idle' | 'running' | 'success' | 'failed' for one tracking dir."""
+    log_files = sorted(glob.glob(os.path.join(tracking_dir, "tracking_log_*.txt")))
+    if not log_files:
+        return "idle"
+    with open(log_files[-1], encoding="utf-8", errors="replace") as _f:
+        content = _f.read()
+    if "PIPELINE_SUCCESS" in content:
+        return "success"
+    if "PIPELINE_ERROR" in content:
+        return "failed"
+    return "running"
 
 # --- 2. Directory & Auth Setup ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__)) 
@@ -491,6 +586,9 @@ if tif_files:
             fit_bounds = [[wgs_bounds[1], wgs_bounds[0]], [wgs_bounds[3], wgs_bounds[2]]]
     except:
         pass
+
+# Discover all tracking runs before building the map (needed for bounding boxes)
+_all_runs = _discover_tracking_runs(folder_path)
 
 m = folium.Map(location=center, zoom_start=12)
 folium.TileLayer("https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
@@ -608,21 +706,21 @@ leg = make_combined_legend(layers_present, VIS_BY_LAYER)
 if leg:
     m.get_root().html.add_child(leg)
 
-# Dashed bounding box derived from the first raw backscatter TIF in tracking results
-tracking_raw_tifs = sorted(glob.glob(os.path.join(folder_path, "tracking_results", "*VV_raw*.tif")))
-if tracking_raw_tifs:
+# One dashed bounding box per tracking run, individually named in the LayerControl
+for _bb_label, _bb_dir in _all_runs:
+    _bb_tifs = sorted(glob.glob(os.path.join(_bb_dir, "*VV_raw*.tif")))
+    if not _bb_tifs:
+        continue
     try:
-        with rasterio.open(tracking_raw_tifs[0]) as _src:
+        with rasterio.open(_bb_tifs[0]) as _src:
             _b = transform_bounds(_src.crs, "EPSG:4326", *_src.bounds)
         _xmin, _ymin, _xmax, _ymax = _b
         folium.Rectangle(
             bounds=[[_ymin, _xmin], [_ymax, _xmax]],
-            color="#FF6B00",
-            weight=2,
-            dash_array="8 6",
+            color="#FF6B00", weight=2, dash_array="8 6",
             fill=False,
-            tooltip="Tracking analysis AOI",
-            name="Tracking AOI",
+            tooltip=f"Tracking AOI — {_bb_label}",
+            name=f"Tracking AOI — {_bb_label}",
         ).add_to(m)
     except Exception:
         pass
@@ -682,6 +780,22 @@ Fullscreen(
 folium.LayerControl(collapsed=False).add_to(m)
 map_output = st_folium(m, width="100%", height=620, returned_objects=["all_drawings"], key=f"map_{folder_path}")
 
+if st.session_state.get("tracking_just_launched"):
+    _dirs_at_launch = st.session_state.get("tracking_dirs_at_launch", set())
+    _new_runs = [(l, d) for l, d in _all_runs if d not in _dirs_at_launch]
+    if not _new_runs:
+        st.info("Timetracking started, please wait...")
+    else:
+        _new_status = _get_run_status(_new_runs[-1][1])
+        if _new_status == "running":
+            st.info("Timetracking running, please scroll down.")
+        elif _new_status in ("success", "failed"):
+            st.session_state.pop("tracking_just_launched", None)
+            st.session_state.pop("tracking_launched_for", None)
+            st.session_state.pop("tracking_dirs_at_launch", None)
+        else:
+            st.info("Timetracking started, please wait...")
+
 # Extract drawn AOI from map regardless of whether clusters exist
 drawn_aoi = None
 if map_output and map_output.get("all_drawings"):
@@ -735,27 +849,22 @@ st.dataframe(data_rows, width=1100, height=400, hide_index=True)
 
 
 # --- 8. Progress Tracking & Execution ---
-import time as _time
 
 # Clear "just launched" flag when the user switches to a different folder
 if st.session_state.get("tracking_launched_for") != folder_path:
     st.session_state.pop("tracking_just_launched", None)
     st.session_state.pop("tracking_launched_for", None)
+    st.session_state.pop("tracking_dirs_at_launch", None)
 
-tracking_dir = os.path.join(folder_path, "tracking_results")
-tracking_log_files = sorted(glob.glob(os.path.join(tracking_dir, "tracking_log_*.txt")))
-
-# Determine tracking run status from log file
+# Derive overall tracking status from all runs
 tracking_status = "idle"
-if tracking_log_files:
-    with open(tracking_log_files[-1], encoding="utf-8", errors="replace") as _f:
-        _log_content = _f.read()
-    if "PIPELINE_SUCCESS" in _log_content:
-        tracking_status = "success"
-    elif "PIPELINE_ERROR" in _log_content:
-        tracking_status = "failed"
-    else:
+for _lbl, _tdir in _all_runs:
+    _s = _get_run_status(_tdir)
+    if _s == "running":
         tracking_status = "running"
+        break
+    if _s in ("success", "failed") and tracking_status == "idle":
+        tracking_status = _s
 
 st.sidebar.header("Cluster tracking over time")
 base_date_dt = datetime.strptime(selected_folder_date, "%Y-%m-%d")
@@ -774,7 +883,7 @@ if drawn_aoi:
                                            calc_end, selected_ids,
                                            project_id, DRIVE_TOKEN_FILE)
             script_rel_path = os.path.join("GEE", "tracking_headless.py")
-            process = subprocess.Popen(
+            subprocess.Popen(
                 [sys.executable, "-u", script_rel_path, cfg_p],
                 cwd=ROOT_DIR,
                 stdout=subprocess.DEVNULL,
@@ -783,78 +892,108 @@ if drawn_aoi:
             tracking_status = "running"
             st.session_state["tracking_just_launched"] = True
             st.session_state["tracking_launched_for"] = folder_path
+            st.session_state["tracking_dirs_at_launch"] = {d for _, d in _all_runs}
             st.rerun()
         except Exception as e:
             st.sidebar.error(f"Error: {e}")
 else:
     st.sidebar.info("Draw an area of interest on the map to select clusters for tracking.")
 
-# Pipeline log expander
+# --- 9. Multi-Run Display ---
 st.write("### Analysis Progress")
-if tracking_status == "idle":
-    if st.session_state.get("tracking_just_launched"):
-        st.info("Tracking analysis starting, please wait...")
-        _time.sleep(2)
-        st.rerun()
-    else:
-        st.info("No tracking analysis run yet for this folder.")
-elif tracking_status != "idle":
-    log_label = (
-        "[Running] Tracking Analysis" if tracking_status == "running" else
-        "[Done] Tracking Analysis"    if tracking_status == "success" else
-        "[Failed] Tracking Analysis"
+
+if tracking_status == "idle" and st.session_state.get("tracking_just_launched"):
+    st.info("Tracking analysis starting, please wait...")
+    _time.sleep(2)
+    st.rerun()
+
+if not _all_runs:
+    st.info("No tracking analysis run yet for this folder.")
+
+_, _location = dated_folders[selected_idx][1], dated_folders[selected_idx][2]
+
+for _run_label, _run_dir in _all_runs:
+    _run_status = _get_run_status(_run_dir)
+    _log_files  = sorted(glob.glob(os.path.join(_run_dir, "tracking_log_*.txt")))
+    _key        = _run_label or os.path.basename(_run_dir)  # stable non-empty widget key
+
+    if _run_label:
+        st.write(f"#### {_run_label}")
+
+    if _run_status == "idle":
+        if st.session_state.get("tracking_just_launched") and _run_dir == _all_runs[-1][1]:
+            st.info("Tracking analysis starting, please wait...")
+            _time.sleep(2)
+            st.rerun()
+        else:
+            st.info("Run directory exists but no log found yet.")
+        continue
+
+    _status_prefix = (
+        "[Running]" if _run_status == "running" else
+        "[Done]"    if _run_status == "success"  else
+        "[Failed]"
     )
-    if tracking_status == "success":
-        st.success(f"Tracking analysis complete! Files saved in: {tracking_dir}")
-    with st.expander(log_label, expanded=(tracking_status == "running")):
-        if tracking_log_files:
-            with open(tracking_log_files[-1], encoding="utf-8", errors="replace") as _f:
-                st.code(_f.read())
+    _expander_label = f"{_status_prefix} {_run_label}".strip()
+
+    if _run_status == "success":
+        st.success(f"Tracking analysis complete! Files saved in: {_run_dir}")
+
+    with st.expander(_expander_label, expanded=(_run_status == "running")):
+        if _log_files:
+            with open(_log_files[-1], encoding="utf-8", errors="replace") as _lf:
+                st.code(_lf.read())
         else:
             st.info("Starting tracking analysis, please wait...")
-        if tracking_status == "running":
-            _pid_file = os.path.join(tracking_dir, "pipeline.pid")
+        if _run_status == "running":
+            _pid_file = os.path.join(_run_dir, "pipeline.pid")
             if os.path.exists(_pid_file):
                 try:
                     _pid = int(open(_pid_file).read().strip())
-                    if st.button("Cancel", key="cancel_tracking"):
+                    if st.button("Cancel", key=f"cancel_tracking_{_key}"):
                         if _is_pid_running(_pid):
                             subprocess.call(["taskkill", "/F", "/PID", str(_pid)])
                         try:
                             os.remove(_pid_file)
                         except Exception:
                             pass
-                        if tracking_log_files:
-                            with open(tracking_log_files[-1], "a", encoding="utf-8") as _lf:
-                                _lf.write("\nPIPELINE_ERROR: Cancelled by user.\n")
+                        if _log_files:
+                            with open(_log_files[-1], "a", encoding="utf-8") as _lf2:
+                                _lf2.write("\nPIPELINE_ERROR: Cancelled by user.\n")
                         st.rerun()
                 except Exception:
                     pass
 
-    if tracking_status == "running":
+    if _run_status == "running":
         _time.sleep(3)
         st.rerun()
 
-if tracking_status != "running":
-    render_tracking_viewer(folder_path)
+    if _run_status != "running":
+        _viewer_title = _run_label.replace("Tracking", "Tracking Results", 1)
+        render_tracking_viewer(_run_dir, title=_viewer_title)
 
-    if os.path.isdir(tracking_dir):
-        st.write("---")
-        _, location = dated_folders[selected_idx][1], dated_folders[selected_idx][2]
-        if st.button("Export Tracking Report (.html)"):
-            with st.spinner("Generating report..."):
-                html_bytes, filename = generate_tracking_report(
-                    tracking_dir,
-                    task_date=selected_folder_date,
-                    task_name=location,
-                    folder_path=folder_path,
-                )
-            if html_bytes:
-                st.download_button(
-                    label="Download Report",
-                    data=html_bytes,
-                    file_name=filename,
-                    mime="text/html",
-                )
-            else:
-                st.warning("No tracking results found to export.")
+        if os.path.isdir(_run_dir):
+            st.write("---")
+            if st.button("Export Tracking Report (.html)", key=f"export_{_key}"):
+                with st.spinner("Generating report..."):
+                    _task_name = f"{_location}_{_run_label.replace(' ', '_')}" if _run_label else _location
+                    _html_bytes, _filename = generate_tracking_report(
+                        _run_dir,
+                        task_date=selected_folder_date,
+                        task_name=_task_name,
+                        folder_path=folder_path,
+                    )
+                if _html_bytes:
+                    st.download_button(
+                        label="Download Report",
+                        data=_html_bytes,
+                        file_name=_filename,
+                        mime="text/html",
+                        key=f"dl_{_key}",
+                    )
+                else:
+                    st.warning("No tracking results found to export.")
+
+if st.session_state.get("tracking_just_launched"):
+    _time.sleep(3)
+    st.rerun()

@@ -397,7 +397,6 @@ if run_now_clicked:
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     st.session_state.pipeline_running = False
-    st.session_state.pipeline_just_launched = True
     _time.sleep(8)
     st.rerun()
 
@@ -458,38 +457,32 @@ def _is_pid_running(pid):
 
 recent_folders = sorted(
     [f for f, _ in dated_folders],
-    key=os.path.getmtime,
-    reverse=True
+    key=lambda f: (
+        0 if os.path.exists(os.path.join(f, "pipeline.pid")) else 1,
+        -os.path.getmtime(f),
+    ),
 )[:4]
 any_running = False
 for folder in recent_folders:
     folder_name = os.path.basename(folder)
     log_files = sorted(glob.glob(os.path.join(folder, "pipeline_log_*.txt")))
     if not log_files:
-        if st.session_state.get("pipeline_just_launched"):
-            with st.expander(f"[Starting] {folder_name}", expanded=True):
-                st.info("Pipeline starting, please wait...")
+        folder_age = _time.time() - os.path.getmtime(folder)
+        if folder_age < 300:
+            st.markdown(f"**[Starting] {folder_name}**")
+            st.info("Pipeline starting, please wait...")
             _time.sleep(2)
             st.rerun()
         continue
-    st.session_state.pop("pipeline_just_launched", None)
     status, content = _get_log_status(log_files[-1])
 
     pid_file = os.path.join(folder, "pipeline.pid")
 
     if status == "running":
         any_running = True
-
-    label = (
-        f"[Done] {folder_name}"    if status == "success" else
-        f"[Failed] {folder_name}"  if status == "failed"  else
-        f"[Running] {folder_name}"
-    )
-    with st.expander(label, expanded=(status == "running")):
-        if status == "success":
-            st.success(f"Pipeline complete! Files saved in: {folder}")
+        st.markdown(f"**[Running] {folder_name}**")
         st.code(content)
-        if status == "running" and os.path.exists(pid_file):
+        if os.path.exists(pid_file):
             try:
                 _pid = int(open(pid_file).read().strip())
                 if st.button("Cancel", key=f"cancel_{folder_name}"):
@@ -504,6 +497,15 @@ for folder in recent_folders:
                     st.rerun()
             except Exception:
                 pass
+    else:
+        label = (
+            f"[Done] {folder_name}"   if status == "success" else
+            f"[Failed] {folder_name}"
+        )
+        with st.expander(label, expanded=False):
+            if status == "success":
+                st.success(f"Pipeline complete! Files saved in: {folder}")
+            st.code(content)
 
 if any_running:
     _time.sleep(3)
