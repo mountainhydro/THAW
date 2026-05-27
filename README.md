@@ -76,8 +76,8 @@ In short, the following things are needed for running THAW:
   **Scheduled task**: Additionally,
   - Select the recurrence frequency and timing (One daily, one weekly and one monthly task can currently exist in parallel)
   - Click **Schedule job**
-
-
+    
+    *Important note:* Your scheduled tasks will only work while your credentials persist, so while you stay "logged in". If you have tasks scheduled, **do not click *Logout*** after your THAW session. Just close the browser and bash window.
 
 ## Project Structure
 
