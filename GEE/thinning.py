@@ -121,6 +121,57 @@ def load_glacier_mask(aoi, buffer_m=200, output_dir="outputs"):
     return geom
 
 
+def get_elevation_threshold_from_nearest_glacier(
+    aoi, elev_image, search_radius_m=100_000, margin_m=500, fallback_m=1000
+):
+    """
+    Derive an elevation threshold from the lowest DEM pixel of the nearest
+    GLIMS glacier within search_radius_m of the AOI.
+
+    Returns float: (min_glacier_elevation - margin_m).
+    Falls back to fallback_m if no glacier is found within the search radius.
+    """
+    search_area = aoi.buffer(search_radius_m)
+    glims = ee.FeatureCollection("GLIMS/20230607").filterBounds(search_area)
+
+    count = glims.size().getInfo()
+    if count == 0:
+        print(f"Terrain elevation threshold: {fallback_m} m (fallback, no glaciers within {search_radius_m/1000:.0f} km).", flush=True)
+        return float(fallback_m)
+
+    centroid = aoi.centroid(maxError=100)
+    nearest = (
+        glims
+        .map(lambda f: f.set("_dist", f.geometry().distance(centroid, maxError=100)))
+        .sort("_dist")
+        .first()
+    )
+    nearest_geom = nearest.geometry()
+
+    result = elev_image.reduceRegion(
+        reducer=ee.Reducer.toList(),
+        geometry=nearest_geom,
+        scale=100,
+        maxPixels=1e9,
+        bestEffort=True,
+    ).getInfo()
+
+    values = sorted(
+        v for v in (next(iter(result.values()), []) if result else [])
+        if v is not None
+    )
+    lowest_5 = values[:5]
+    min_elev = float(np.median(lowest_5)) if lowest_5 else None
+
+    if min_elev is None:
+        print(f"Terrain elevation threshold: {fallback_m} m (fallback, glacier elevation unreadable).", flush=True)
+        return float(fallback_m)
+
+    threshold = float(min_elev) - margin_m
+    print(f"Terrain elevation threshold: {threshold:.0f} m (nearest glacier min {min_elev:.0f} m − {margin_m} m).", flush=True)
+    return threshold
+
+
 # ============================================================
 # GEOMETRY UTILITIES
 # ============================================================

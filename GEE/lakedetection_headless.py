@@ -27,6 +27,7 @@ from gee_auth import initialize_ee
 from drive_io import Logger, export_and_download, convert_to_cog, CancelledError
 from gee_core import apply_radar_mask_to_collection, get_historical_collection
 from reporting import cluster_processing
+from thinning import get_elevation_threshold_from_nearest_glacier
 
 
 # ============================================================
@@ -175,7 +176,8 @@ def run_pipeline(config_path):
     srtm = ee.Image("USGS/SRTMGL1_003")
     elev = srtm.select('elevation')
     slope = ee.Terrain.slope(elev.focal_median(4))
-    terrain_mask = elev.gt(3000).And(slope.focal_min(8).lt(6)).clip(aoi)
+    elev_threshold = get_elevation_threshold_from_nearest_glacier(aoi, elev)
+    terrain_mask = elev.gt(elev_threshold).And(slope.focal_min(8).lt(6)).clip(aoi)
 
     daysBack = 90
     start = ref_date-datetime.timedelta(days=daysBack)
