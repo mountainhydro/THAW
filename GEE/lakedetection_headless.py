@@ -101,8 +101,7 @@ def run_pipeline(config_path):
         ref_date = datetime.datetime.now()
     else:
         ref_date = datetime.datetime.strptime(cfg["run_date"], "%Y-%m-%d")
-    doy = ref_date.timetuple().tm_yday
-    
+
     date_str = ref_date.strftime("%Y-%m-%d")
     task_name = cfg.get("task_name", "")
     name_suffix = f"_{task_name}" if task_name else ""
@@ -196,19 +195,19 @@ def run_pipeline(config_path):
         .filterDate(start, ref_date) \
         .filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING')) \
         .sort('system:time_start', False)
-    s1_asc = apply_radar_mask_to_collection(s1_asc, elev)
+    s1_asc = apply_radar_mask_to_collection(s1_asc, elev).select('VV_masked')
 
     s1_desc = s1 \
         .filterDate(start, ref_date) \
         .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING')) \
         .sort('system:time_start', False)
-    s1_desc =  apply_radar_mask_to_collection(s1_desc, elev)
+    s1_desc = apply_radar_mask_to_collection(s1_desc, elev).select('VV_masked')
 
     # Reduce to the recent days, and the earlier days
     recent_asc = s1_asc.filterDate(ref_date-datetime.timedelta(days=13),ref_date)
     recent_desc = s1_desc.filterDate(ref_date-datetime.timedelta(days=13),ref_date)
-    earlier_asc = s1_asc.filterDate(ref_date-datetime.timedelta(days=25), ref_date-datetime.timedelta(days=13))
-    earlier_desc = s1_desc.filterDate(ref_date-datetime.timedelta(days=25), ref_date-datetime.timedelta(days=13))
+    # earlier_asc = s1_asc.filterDate(ref_date-datetime.timedelta(days=25), ref_date-datetime.timedelta(days=13))
+    # earlier_desc = s1_desc.filterDate(ref_date-datetime.timedelta(days=25), ref_date-datetime.timedelta(days=13))
 
     # Mosaic per orbit direction — fall back to most recent available image
     # if the fixed date window returns nothing (sparse coverage AOIs)
@@ -221,12 +220,15 @@ def run_pipeline(config_path):
 
     latest_asc  = safe_mosaic(recent_asc,  s1_asc,  "ASC recent")
     latest_desc = safe_mosaic(recent_desc, s1_desc, "DESC recent")
-    prev_asc    = safe_mosaic(earlier_asc,  s1_asc.sort('system:time_start', False).limit(4).sort('system:time_start', True).limit(1),  "ASC earlier")
-    prev_desc   = safe_mosaic(earlier_desc, s1_desc.sort('system:time_start', False).limit(4).sort('system:time_start', True).limit(1), "DESC earlier")
+    # prev_asc  = safe_mosaic(earlier_asc,  s1_asc.sort('system:time_start', False).limit(4).sort('system:time_start', True).limit(1),  "ASC earlier")
+    # prev_desc = safe_mosaic(earlier_desc, s1_desc.sort('system:time_start', False).limit(4).sort('system:time_start', True).limit(1), "DESC earlier")
 
     # Get images from the years before within a timewindow around the doy
     hist_asc = get_historical_collection(s1, 'ASCENDING', doy, windowSize, 10, ref_date)
     hist_desc = get_historical_collection(s1, 'DESCENDING', doy, windowSize, 10, ref_date)
+
+    hist_asc = apply_radar_mask_to_collection(hist_asc, elev).select('VV_masked')
+    hist_desc = apply_radar_mask_to_collection(hist_desc, elev).select('VV_masked')
 
     # get mean and stdv from historical ASC and DESC images
     hist_asc_stats = hist_asc.reduce(
@@ -238,39 +240,34 @@ def run_pipeline(config_path):
             reducer2 = ee.Reducer.stdDev(), \
         sharedInputs = True))
 
-    #hist_mean = hist_asc_stats.select('VV_mean').add(hist_desc_stats.select('VV_mean')).divide(2)
-
-    # Compute differences, mean, z-score
+    # Compute mean and z-score
     mean_img = latest_asc.add(latest_desc).divide(2)
-    #mean_prev = prev_asc.add(prev_desc).divide(2)
-    diff_asc = latest_asc.subtract(prev_asc)
-    diff_desc = latest_desc.subtract(prev_desc)
-    mean_diff = diff_asc.add(diff_desc).divide(2).focal_mean(5)
+    # diff_asc = latest_asc.subtract(prev_asc)
+    # diff_desc = latest_desc.subtract(prev_desc)
+    # mean_diff = diff_asc.add(diff_desc).divide(2).focal_mean(5)
 
     # apply terrain and mask
     masked_mean = mean_img.updateMask(terrain_mask).focal_mean(5)
-    #masked_mean_prev = mean_prev.updateMask(terrain_mask)
 
-    
     # flagging
     # water/land transition between -14(very likely land -> likelyhood water = 0) and -18(very likely water -> likelyhood water = 1)
-    potential_water = masked_mean.select('VV').subtract(-14).divide(-4)
+    potential_water = masked_mean.subtract(-14).divide(-4)
     focal_mean = potential_water.focal_mean(3) # spatial clustering: focal mean of potential water
-    mean_diff.updateMask(focal_mean)  # masked diff (computed but not exported)
+    # mean_diff = mean_diff.updateMask(focal_mean)
 
-    latest_asc_anomaly = latest_asc.select('VV') \
-        .subtract(hist_asc_stats.select('VV_mean')) \
+    latest_asc_anomaly = latest_asc \
+        .subtract(hist_asc_stats.select('VV_masked_mean')) \
         .rename('asc_anomaly')
-    latest_desc_anomaly = latest_desc.select('VV') \
-        .subtract(hist_desc_stats.select('VV_mean')) \
-        .rename('asc_anomaly')
+    latest_desc_anomaly = latest_desc \
+        .subtract(hist_desc_stats.select('VV_masked_mean')) \
+        .rename('desc_anomaly')
 
     zscore_asc = latest_asc_anomaly \
-        .divide(hist_asc_stats.select('VV_stdDev')) \
+        .divide(hist_asc_stats.select('VV_masked_stdDev')) \
         .rename('asc_zscore')
     zscore_desc = latest_desc_anomaly \
-        .divide(hist_desc_stats.select('VV_stdDev')) \
-        .rename('asc_zscore')
+        .divide(hist_desc_stats.select('VV_masked_stdDev')) \
+        .rename('desc_zscore')
     zscore_mean = zscore_asc.add(zscore_desc).divide(2).focal_mean(3).updateMask(focal_mean)
 
     

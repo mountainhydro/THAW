@@ -16,8 +16,6 @@ import sys
 import time as _time
 import requests
 import pandas as pd  # Added for GLOF CSV processing
-import rasterio
-from rasterio.warp import transform_bounds
 from datetime import datetime, date as dt_date
 import streamlit as st
 import folium

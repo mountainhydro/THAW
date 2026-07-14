@@ -200,14 +200,16 @@ def apply_radar_mask_to_collection(collection, dem, thinning_correction=0.0):
     Returns
     -------
     ee.ImageCollection
-        Collection with 'VV_masked' and 'valid_mask' bands added.
+        Collection with the raw 'VV' band replaced by 'VV_masked' (radar-geometry
+        masked), plus a 'valid_mask' band.
     """
     thinning_correction = float(thinning_correction)
 
     def wrap(image):
         mask = get_radar_mask(image, dem)
         maskedVV = image.select('VV').updateMask(mask).rename('VV_masked')
-        image = image.addBands(maskedVV).addBands(mask).copyProperties(image, image.propertyNames())
+        image = image.select(image.bandNames().remove('VV')) \
+            .addBands(maskedVV).addBands(mask).copyProperties(image, image.propertyNames())
         if thinning_correction != 0.0:
             pi = ee.Number(math.pi)
             theta_i = ee.Number(image.get('mean_angle')).multiply(pi.divide(180))
