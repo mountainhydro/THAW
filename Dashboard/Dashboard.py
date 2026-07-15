@@ -9,6 +9,8 @@ import base64
 import streamlit as st
 import ee
 
+from logo_header import render_logo_header
+
 # 1. Paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__)) 
 ROOT_DIR = os.path.dirname(CURRENT_DIR)  
@@ -25,6 +27,7 @@ SCOPES = [
 
 # 2. Page Config
 st.set_page_config(page_title="Welcome to THAW!", layout="centered")
+render_logo_header()
 
 
 # 3. Helper Functions

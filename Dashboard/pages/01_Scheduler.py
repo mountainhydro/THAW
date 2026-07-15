@@ -24,6 +24,8 @@ from folium import MacroElement
 from jinja2 import Template
 from streamlit_folium import st_folium
 
+from logo_header import render_logo_header
+
 # 1. Function Definitions
 def load_gee_creds():
     if os.path.exists(CRED_FILE):
@@ -122,6 +124,7 @@ os.makedirs(CONFIG_DIR, exist_ok=True)
 project_id, service_account_path = load_gee_creds()
 
 st.set_page_config(layout="wide", page_title="Job Scheduler")
+render_logo_header()
 st.markdown("<style>[data-stale='true']{opacity:1!important;transition:none!important;}</style>", unsafe_allow_html=True)
 
 if not project_id:

@@ -22,6 +22,8 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import time as _time
 
+from logo_header import render_logo_header
+
 # --- 1. Function Definitions ---
 
 def _is_pid_running(pid):
@@ -495,6 +497,7 @@ project_id, _ = load_gee_creds()
 
 # --- 3. Page Configuration ---
 st.set_page_config(layout="wide", page_title="Output Preview")
+render_logo_header()
 
 # Auth Check
 if not project_id:
