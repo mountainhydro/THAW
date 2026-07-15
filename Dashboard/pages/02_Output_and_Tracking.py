@@ -156,6 +156,7 @@ def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=Non
     cluster_table = ""
     if folder_path:
         csv_files = glob.glob(os.path.join(folder_path, "cluster_summary*.csv"))
+        csv_files = [f for f in csv_files if "_snowfilter" not in os.path.basename(f)]
         if csv_files:
             csv_files.sort(key=os.path.getmtime, reverse=True)
             try:
@@ -367,6 +368,7 @@ def make_combined_legend(layers_present, vis_by_layer):
     """Single semi-transparent box with one gradient bar per visible layer."""
     LAYER_META = {
         "z_score":         dict(title="Z-Score",        unit=""),
+        "zscore_snowfilter": dict(title="Z-Score (Snow-filtered)", unit=""),
         "potential_water": dict(title="Potential Water", unit=""),
         "mean_diff":       dict(title="Mean Diff",       unit=" dB"),
     }
@@ -518,6 +520,7 @@ st.markdown(
 # --- 4. Visualization & Data Discovery ---
 VIS_BY_LAYER = {
     "z_score": {"min": -2, "max": 2, "palette": "RdYlGn"},
+    "zscore_snowfilter": {"min": -2, "max": 2, "palette": "RdYlGn"},
     "potential_water": {"min": 0, "max": 1, "palette": "Blues"},
     "mean_diff": {"min": -5, "max": 5, "palette": "RdBu"},
 }
@@ -715,8 +718,10 @@ for _bb_label, _bb_dir in _all_runs:
         pass
 
 # Handle Clusters GeoJson
-geojson_files = glob.glob(os.path.join(folder_path, "detected_clusters*.geojson"))
-if geojson_files:
+def _add_cluster_layer(m, geojson_files, layer_name, color):
+    """Load the most recent geojson from a list, inject centroids, add to map."""
+    if not geojson_files:
+        return
     geojson_files.sort(key=os.path.getmtime, reverse=True)
     with open(geojson_files[0], "r", encoding="utf-8") as fh:
         gj = json.load(fh)
@@ -755,10 +760,16 @@ if geojson_files:
     _tooltip_fields  = [f for f in _field_map if f in _sample_props]
     _tooltip_aliases = [_field_map[f] for f in _tooltip_fields]
     _tooltip = folium.GeoJsonTooltip(fields=_tooltip_fields, aliases=_tooltip_aliases) if _tooltip_fields else None
-    folium.GeoJson(gj, name="All Clusters",
-        style_function=lambda feat: {"color": "red", "weight": 2, "fillColor": "red", "fillOpacity": 0.1},
+    folium.GeoJson(gj, name=layer_name,
+        style_function=lambda feat, _color=color: {"color": _color, "weight": 2, "fillColor": _color, "fillOpacity": 0.1},
         tooltip=_tooltip
     ).add_to(m)
+
+_all_geojson_files = glob.glob(os.path.join(folder_path, "detected_clusters*.geojson"))
+_standard_geojson_files = [f for f in _all_geojson_files if "_snowfilter" not in os.path.basename(f)]
+_snowfilter_geojson_files = [f for f in _all_geojson_files if "_snowfilter" in os.path.basename(f)]
+_add_cluster_layer(m, _standard_geojson_files, "All Clusters", "red")
+_add_cluster_layer(m, _snowfilter_geojson_files, "All Clusters (Snow-filtered)", "red")
 
 Fullscreen(
     position="topright",
@@ -795,7 +806,17 @@ if map_output and map_output.get("all_drawings"):
         drawn_aoi = [min(lons), min(lats), max(lons), max(lats)]
 
 # --- 7. Data Sync & Table ---
-cluster_csv_files = glob.glob(os.path.join(folder_path, "cluster_summary*.csv"))
+_all_cluster_csv_files = glob.glob(os.path.join(folder_path, "cluster_summary*.csv"))
+_standard_csv_files = [f for f in _all_cluster_csv_files if "_snowfilter" not in os.path.basename(f)]
+_snowfilter_csv_files = [f for f in _all_cluster_csv_files if "_snowfilter" in os.path.basename(f)]
+
+cluster_set = "Standard"
+if _standard_csv_files and _snowfilter_csv_files:
+    cluster_set = st.radio("Cluster set", ["Standard", "Snow-filtered"], horizontal=True, key=f"cluster_set_{folder_path}")
+elif _snowfilter_csv_files:
+    cluster_set = "Snow-filtered"
+
+cluster_csv_files = _snowfilter_csv_files if cluster_set == "Snow-filtered" else _standard_csv_files
 data_rows = []
 selected_ids = []
 

@@ -18,6 +18,7 @@ Sections
 4. S1 preprocessing       (tracking pipeline)
 5. Temporal smoothing     (tracking pipeline)
 6. Water likelihood       (tracking pipeline + shared)
+7. Snow masking (optical) (lakedetection pipeline)
 """
 
 import ee
@@ -522,3 +523,94 @@ def simple_threshold(image, threshold=-14):
     """
     water = image.select('VV_dB').lt(threshold).rename('water_mask')
     return image.addBands(water)
+
+
+# ============================================================
+# 7. SNOW MASKING (OPTICAL) — LAKEDETECTION PIPELINE
+# ============================================================
+
+def get_snow_mask(aoi, ref_date, lookback_days=14, extension_days=7,
+                   coverage_thres=0.8, cloud_prob_max=40,
+                   ndsi_thres=0.4, nir_thres=0.15, scale=20):
+    """
+    Build a Sentinel-2 optical snow mask over the AOI using a cloud-filtered
+    median mosaic, NDSI and NIR thresholds.
+
+    A 14-day lookback window is used by default; if cloud-free coverage over
+    the AOI is below coverage_thres, the window is extended once (14 -> 21
+    days by default) and reused regardless of the resulting coverage. Pixels
+    with no valid Sentinel-2 data are treated as "not snow" so missing optical
+    coverage never blocks SAR-based lake detection.
+
+    Parameters
+    ----------
+    aoi : ee.Geometry
+        Area of interest.
+    ref_date : datetime.datetime
+        Reference date; the lookback window ends here.
+    lookback_days : int, optional
+        Initial lookback window size in days (default 14).
+    extension_days : int, optional
+        Additional days added to the window if coverage is insufficient
+        (default 7, giving a 21-day window on extension).
+    coverage_thres : float, optional
+        Minimum fraction (0-1) of the AOI that must have valid cloud-free
+        data before the window is extended (default 0.8).
+    cloud_prob_max : float, optional
+        Sentinel-2 cloud probability threshold; pixels below this are kept
+        (default 40).
+    ndsi_thres : float, optional
+        NDSI threshold above which a pixel is considered snow (default 0.4).
+    nir_thres : float, optional
+        NIR reflectance threshold above which a pixel is considered snow
+        (default 0.15).
+    scale : int, optional
+        Scale in metres used for the coverage-fraction check (default 20).
+
+    Returns
+    -------
+    ee.Image
+        Single-band binary mask named 'snow_mask' (1 = snow-covered).
+    """
+    def build_mosaic(period_start):
+        s2_sr = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
+            .filterBounds(aoi).filterDate(period_start, ref_date)
+        s2_clouds = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY') \
+            .filterBounds(aoi).filterDate(period_start, ref_date)
+        joined = ee.ImageCollection(ee.Join.saveFirst('cloud_prob_img').apply(
+            primary=s2_sr,
+            secondary=s2_clouds,
+            condition=ee.Filter.equals(leftField='system:index', rightField='system:index')
+        ))
+
+        def mask_clouds(img):
+            cloud_prob = ee.Image(img.get('cloud_prob_img')).select('probability')
+            is_clear = cloud_prob.lt(cloud_prob_max)
+            is_real_data = img.select('B8A').mask().And(img.select('B9').mask())
+            return img.updateMask(is_clear.And(is_real_data))
+
+        return joined.map(mask_clouds).median().clip(aoi)
+
+    period_start = ref_date - datetime.timedelta(days=lookback_days)
+    mosaic = build_mosaic(period_start)
+
+    coverage = mosaic.select('B3').mask().reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=aoi,
+        scale=scale,
+        maxPixels=1e9,
+        bestEffort=True,
+    ).get('B3')
+    coverage = ee.Number(ee.Algorithms.If(coverage, coverage, 0)).getInfo()
+
+    if coverage < coverage_thres:
+        extended_days = lookback_days + extension_days
+        print(f"Snow mask: only {coverage:.0%} AOI coverage in {lookback_days}-day window, "
+              f"extending to {extended_days} days.", flush=True)
+        period_start = ref_date - datetime.timedelta(days=extended_days)
+        mosaic = build_mosaic(period_start)
+
+    ndsi = mosaic.normalizedDifference(['B3', 'B11']).rename('NDSI')
+    nir = mosaic.select('B8').divide(10000).rename('NIR')
+    snow_mask = ndsi.gt(ndsi_thres).And(nir.gt(nir_thres))
+    return snow_mask.unmask(0).rename('snow_mask')

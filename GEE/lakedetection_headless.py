@@ -25,7 +25,7 @@ if SCRIPT_DIR not in sys.path:
 # Local imports
 from gee_auth import initialize_ee
 from drive_io import Logger, export_and_download, convert_to_cog, CancelledError
-from gee_core import apply_radar_mask_to_collection, get_historical_collection
+from gee_core import apply_radar_mask_to_collection, get_historical_collection, get_snow_mask
 from reporting import cluster_processing
 from thinning import get_elevation_threshold_from_nearest_glacier
 
@@ -160,6 +160,10 @@ def run_pipeline(config_path):
             z_score_files = [f for f in z_score_files if not f.endswith("_cog.tif")]
             if z_score_files:
                 retry(lambda: cluster_processing(z_score_files[0], run_label), label="Clustering", max_attempts=3, base_wait=10)
+            snowfilter_files = glob.glob(os.path.join(local_path, "zscore_snowfilter_*.tif"))
+            snowfilter_files = [f for f in snowfilter_files if not f.endswith("_cog.tif")]
+            if snowfilter_files:
+                retry(lambda: cluster_processing(snowfilter_files[0], f"{run_label}_snowfilter"), label="Clustering (snowfilter)", max_attempts=3, base_wait=10)
             done.append("cluster")
             write_checkpoint(local_dir, steps_complete=done)
 
@@ -172,8 +176,10 @@ def run_pipeline(config_path):
         aoi_data = json.load(f)
     aoi = ee.Geometry.Polygon(aoi_data["features"][0]["geometry"]["coordinates"])
 
-    srtm = ee.Image("USGS/SRTMGL1_003")
-    elev = srtm.select('elevation')
+    # DEM: mosaicked COPDEM GLO-30, reprojected to its native projection
+    glo30 = ee.ImageCollection('COPERNICUS/DEM/GLO30_2024_1')
+    glo30_proj = glo30.first().projection()
+    elev = glo30.select('DEM').mosaic().setDefaultProjection(glo30_proj)
     slope = ee.Terrain.slope(elev.focal_median(4))
     elev_threshold = get_elevation_threshold_from_nearest_glacier(aoi, elev)
     terrain_mask = elev.gt(elev_threshold).And(slope.focal_min(8).lt(6)).clip(aoi)
@@ -270,15 +276,21 @@ def run_pipeline(config_path):
         .rename('desc_zscore')
     zscore_mean = zscore_asc.add(zscore_desc).divide(2).focal_mean(3).updateMask(focal_mean)
 
+    # Optical snow mask (Sentinel-2 NDSI/NIR) — additional filtered product,
+    # does not affect potential_water or zscore_mean.
+    snow_mask = get_snow_mask(aoi, ref_date)
+    zscore_snowfilter = zscore_mean.updateMask(snow_mask.Not())
+
     
 # ============================================================
 # EXPORT AND DOWNLOAD
 # ============================================================
     token_path   = cfg["drive_token_path"]
-    export_names = ["potential_water", "z_score"]
+    export_names = ["potential_water", "z_score", "zscore_snowfilter"]
     exports = {
         "potential_water": potential_water,
         "z_score": zscore_mean,
+        "zscore_snowfilter": zscore_snowfilter,
     }
 
     # Write initial checkpoint so dashboard can detect this run
@@ -338,6 +350,16 @@ def run_pipeline(config_path):
             retry(
                 lambda: cluster_processing(z_score_tif, run_label),
                 label="Clustering",
+                max_attempts=3,
+                base_wait=10,
+            )
+        snowfilter_files = glob.glob(os.path.join(local_path, "zscore_snowfilter_*.tif"))
+        snowfilter_files = [f for f in snowfilter_files if not f.endswith("_cog.tif")]
+        if snowfilter_files:
+            snowfilter_tif = snowfilter_files[0]
+            retry(
+                lambda: cluster_processing(snowfilter_tif, f"{run_label}_snowfilter"),
+                label="Clustering (snowfilter)",
                 max_attempts=3,
                 base_wait=10,
             )
