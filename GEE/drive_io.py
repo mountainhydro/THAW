@@ -296,6 +296,12 @@ def _poll_and_download(task_list, drive_service, token_path):
                     files = res.get("files", [])
                 except Exception as e:
                     print(f"Warning: Drive query failed for {item['label']}: {e}", flush=True)
+                    stall_counts[idx] += 1
+                    if stall_counts[idx] >= 10:
+                        print(f"Warning: Drive query kept failing for {item['label']}, giving up.", flush=True)
+                        item["done"]   = True
+                        item["failed"] = True
+                        completed += 1
                     continue
 
                 if files:
