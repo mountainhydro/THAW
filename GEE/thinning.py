@@ -74,8 +74,14 @@ def load_aoi(aoi_input):
             "Unsupported AOI format. Must be a file path, GeoJSON string, or bounding box list."
         )
 
-def load_dem(aoi, dem_source='JAXA/ALOS/AW3D30/V2_2'):
-    dem = ee.Image(dem_source).select('AVE_DSM').clip(aoi)
+def load_dem(aoi, dem_source='COPERNICUS/DEM/GLO30_2024_1'):
+    # COPDEM GLO-30 is tiled as an ImageCollection (unlike the deprecated,
+    # single-image JAXA/ALOS/AW3D30/V2_2 this replaces) — mosaic and
+    # reproject to its native projection, matching the main lakedetection
+    # pipeline's DEM handling.
+    glo30 = ee.ImageCollection(dem_source)
+    glo30_proj = glo30.first().projection()
+    dem = glo30.select('DEM').mosaic().setDefaultProjection(glo30_proj).clip(aoi)
     slope = ee.Terrain.slope(dem.focal_median(4))
     aspect = ee.Terrain.aspect(dem)
     terrain_mask = slope.focal_min(8).lt(6)

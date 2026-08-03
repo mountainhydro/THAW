@@ -9,7 +9,9 @@ import json
 import csv
 import subprocess
 import sys
+import pandas as pd
 from datetime import datetime, timedelta
+from io import BytesIO
 import rasterio
 from rasterio.warp import transform_bounds
 import base64
@@ -23,6 +25,7 @@ from PIL import Image
 import time as _time
 
 from logo_header import render_logo_header
+from tile_server import start_tile_server, single_band_tile_url, rgb_tile_url
 
 # --- 1. Function Definitions ---
 
@@ -492,6 +495,10 @@ OUTPUT_DIR = os.path.join(ROOT_DIR, "Outputs")
 CONFIG_DIR = os.path.join(ROOT_DIR, "config")
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
+# Local tile server for lazily serving raster layers (only tiles visible in
+# the viewport are rendered/transferred, avoiding Streamlit's message-size cap)
+TILE_PORT = start_tile_server(OUTPUT_DIR)
+
 # Load GEE Credentials (Same as Scheduler)
 project_id, _ = load_gee_creds()
 
@@ -570,7 +577,19 @@ def make_display_label(folder_date, location):
 
 date_options = [make_display_label(fd, loc) for _, fd, loc in dated_folders]
 
-selected_display = st.sidebar.selectbox("Date", date_options)
+selected_display = st.sidebar.selectbox("Date", date_options, key="output_date_select")
+# Reset the HMA-overview toggle, cluster highlight and persisted map view
+# whenever the user picks a different folder
+if st.session_state.get("_prev_output_date_select") != selected_display:
+    st.session_state["_show_hma_overview"] = False
+    st.session_state["_selected_cluster_id"] = None
+    st.session_state["_map_view"] = None
+    st.session_state["_pending_cluster_zoom"] = None
+st.session_state["_prev_output_date_select"] = selected_display
+if st.sidebar.button("Show full HMA overview"):
+    st.session_state["_show_hma_overview"] = True
+    st.session_state["_map_view"] = None
+
 # Recover folder_path from selected index
 selected_idx = date_options.index(selected_display)
 folder_path, selected_folder_dt, _ = dated_folders[selected_idx]
@@ -581,22 +600,52 @@ st.title(f"Preview: {selected_folder_date}")
 st.caption(f"Connected to GEE Project: `{project_id}`")
 
 # --- 6. Map Generation Logic ---
-center = [28.3, 85.6]
+# View priority: (1) a one-shot zoom-to-cluster from a just-clicked cluster,
+# (2) the view we last decided on for this folder (so unrelated reruns —
+# e.g. tracking-status polling — reuse it instead of recomputing and
+# resetting the zoom), (3) fit the folder's data, or (4) the HMA overview.
+# NOTE: we deliberately do NOT track live zoom/center from st_folium — doing
+# so makes every pan/zoom trigger a full Streamlit rerun (which rebuilds the
+# whole map and resets any layers the user unticked). Without that, ordinary
+# panning/zooming causes no rerun at all, so the browser-side map simply
+# stays wherever the user left it.
+show_overview = st.session_state.get("_show_hma_overview", False)
+_pending_zoom = st.session_state.pop("_pending_cluster_zoom", None)
+_persisted_view = (
+    st.session_state.get("_map_view")
+    if st.session_state.get("_map_view_folder") == folder_path else None
+)
+
+center = [36.0, 86]
+zoom_start = 5
 fit_bounds = None
 
-if tif_files:
+if _pending_zoom:
+    center = _pending_zoom["center"]
+    zoom_start = _pending_zoom["zoom"]
+elif _persisted_view:
+    center = _persisted_view["center"]
+    zoom_start = _persisted_view["zoom"]
+elif tif_files and not show_overview:
     try:
         with rasterio.open(tif_files[0]) as src:
             wgs_bounds = transform_bounds(src.crs, 'EPSG:4326', *src.bounds)
             center = [(wgs_bounds[1] + wgs_bounds[3]) / 2, (wgs_bounds[0] + wgs_bounds[2]) / 2]
             fit_bounds = [[wgs_bounds[1], wgs_bounds[0]], [wgs_bounds[3], wgs_bounds[2]]]
+            zoom_start = 12
     except:
         pass
+
+# Remember whichever view we just decided on, so later unrelated reruns
+# (tracking-status polling, etc.) reuse it instead of recomputing from
+# scratch and resetting the user's zoom.
+st.session_state["_map_view"] = {"center": center, "zoom": zoom_start}
+st.session_state["_map_view_folder"] = folder_path
 
 # Discover all tracking runs before building the map (needed for bounding boxes)
 _all_runs = _discover_tracking_runs(folder_path)
 
-m = folium.Map(location=center, zoom_start=12)
+m = folium.Map(location=center, zoom_start=zoom_start)
 folium.TileLayer("https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
                   attr="Google", name="Satellite").add_to(m)
 
@@ -624,74 +673,75 @@ class _LimitOneDrawing(MacroElement):
 _LimitOneDrawing().add_to(m)
 m.add_child(MeasureControl(position='topleft'))
 
+class _PersistLayerVisibility(MacroElement):
+    """Remember each overlay's checked/unchecked state (by name) in the
+    browser's localStorage. Streamlit/streamlit_folium can't report back
+    which non-WMS layers are toggled, and every rerun rebuilds the map from
+    scratch — so this restores/tracks visibility purely client-side, fully
+    independent of Python reruns."""
+    _template = Template("""
+        {% macro script(this, kwargs) %}
+        (function() {
+            var STORAGE_KEY = 'thaw_layer_visibility';
+            function getStored() {
+                try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch (e) { return {}; }
+            }
+            function setStored(obj) {
+                try { localStorage.setItem(STORAGE_KEY, JSON.stringify(obj)); } catch (e) {}
+            }
+            function applyAndBind(attemptsLeft) {
+                var container = document.querySelector('.leaflet-control-layers-overlays');
+                if (!container) {
+                    if (attemptsLeft > 0) setTimeout(function () { applyAndBind(attemptsLeft - 1); }, 200);
+                    return;
+                }
+                var stored = getStored();
+                container.querySelectorAll('label').forEach(function (label) {
+                    var input = label.querySelector('input[type=checkbox]');
+                    var span = label.querySelector('span');
+                    if (!input || !span || input.dataset.thawBound) return;
+                    var layerName = span.textContent.trim();
+                    if (stored[layerName] === false && input.checked) {
+                        input.click();
+                    }
+                    input.dataset.thawBound = '1';
+                    input.addEventListener('change', function () {
+                        var s = getStored();
+                        s[layerName] = input.checked;
+                        setStored(s);
+                    });
+                });
+            }
+            applyAndBind(15);
+        })();
+        {% endmacro %}
+    """)
 
+_PersistLayerVisibility().add_to(m)
 
-from io import BytesIO
-from rasterio.warp import calculate_default_transform, reproject, Resampling as _Resampling
-from rasterio.crs import CRS as _RioCRS
-
-_MERCATOR = _RioCRS.from_epsg(3857)
-
-@st.cache_data(show_spinner=False)
-def _render_tif(tif_path, vis_min, vis_max, palette, mask_below_zero, mtime):
-    """Reproject to Web Mercator, colourise, encode PNG. Cached by (path, mtime)."""
-    try:
-        with rasterio.open(tif_path) as src:
-            raw = src.read(1).astype(np.float32)
-            scaled_transform = src.transform
-            read_w, read_h = src.width, src.height
-
-            if src.nodata is not None:
-                raw[raw == src.nodata] = np.nan
-            if mask_below_zero:
-                raw[raw < 0] = np.nan
-
-            dst_transform, dst_w, dst_h = calculate_default_transform(
-                src.crs, _MERCATOR, read_w, read_h, *src.bounds)
-            dst = np.full((dst_h, dst_w), np.nan, dtype=np.float32)
-            reproject(
-                source=raw, destination=dst,
-                src_transform=scaled_transform, src_crs=src.crs,
-                dst_transform=dst_transform, dst_crs=_MERCATOR,
-                resampling=_Resampling.bilinear,
-                src_nodata=np.nan, dst_nodata=np.nan,
-            )
-
-        merc_w = dst_transform.c
-        merc_n = dst_transform.f
-        merc_e = merc_w + dst_transform.a * dst_w
-        merc_s = merc_n + dst_transform.e * dst_h
-        tb = transform_bounds(_MERCATOR, 'EPSG:4326', merc_w, merc_s, merc_e, merc_n)
-        nodata_mask = np.isnan(dst)
-        norm = np.clip((dst - vis_min) / (vis_max - vis_min), 0, 1)
-        norm[nodata_mask] = 0.0
-        cmap = plt.get_cmap(palette)
-        rgba = (cmap(norm) * 255).astype(np.uint8)
-        rgba[nodata_mask, 3] = 0
-        img_io = BytesIO()
-        Image.fromarray(rgba, mode='RGBA').save(img_io, format='PNG')
-        img_io.seek(0)
-        return base64.b64encode(img_io.read()).decode(), tb[1], tb[0], tb[3], tb[2]
-    except Exception:
-        return None
-
-# Add TIF Layers
+# Add TIF Layers — served lazily as raster tiles from the local tile server
+# (Dashboard/tile_server.py), so only tiles visible in the viewport are ever
+# rendered/transferred instead of embedding one full-resolution PNG.
 if tif_files:
-    with st.spinner("Loading map layers..."):
-        for tif in tif_files:
-            basename = os.path.basename(tif)
+    for tif in tif_files:
+        basename = os.path.basename(tif)
+        if "true_color" in basename:
+            layer_label = "True Color (Sentinel-2)"
+            tile_url = rgb_tile_url(TILE_PORT, tif)
+            opacity = 1.0
+        else:
             vis = get_vis_params(basename)
             # Use readable label from VIS_BY_LAYER instead of raw filename
             layer_label = next((k.replace("_", " ").title() for k in VIS_BY_LAYER if k in basename), basename)
-            result = _render_tif(tif, vis['min'], vis['max'], vis['palette'],
-                                 'potential_water' in basename, os.path.getmtime(tif))
-            if result:
-                img_b64, south, west, north, east = result
-                folium.raster_layers.ImageOverlay(
-                    image=f"data:image/png;base64,{img_b64}",
-                    bounds=[[south, west], [north, east]],
-                    name=layer_label, opacity=0.7, interactive=False
-                ).add_to(m)
+            tile_url = single_band_tile_url(
+                TILE_PORT, tif, vis['min'], vis['max'], vis['palette'],
+                mask_below_zero='potential_water' in basename,
+            )
+            opacity = 0.7
+        folium.TileLayer(
+            tiles=tile_url, name=layer_label, attr="THAW", overlay=True,
+            control=True, opacity=opacity,
+        ).add_to(m)
     if fit_bounds:
         m.fit_bounds(fit_bounds)
 
@@ -721,8 +771,12 @@ for _bb_label, _bb_dir in _all_runs:
         pass
 
 # Handle Clusters GeoJson
-def _add_cluster_layer(m, geojson_files, layer_name, color):
-    """Load the most recent geojson from a list, inject centroids, add to map."""
+def _add_cluster_layer(m, geojson_files, layer_name, color, selected_cluster_id=None):
+    """Load the most recent geojson from a list, inject centroids, add to map.
+
+    Features matching selected_cluster_id are drawn highlighted (gold). Purely
+    display — selection is driven by the table, not by clicking the map.
+    """
     if not geojson_files:
         return
     geojson_files.sort(key=os.path.getmtime, reverse=True)
@@ -762,17 +816,23 @@ def _add_cluster_layer(m, geojson_files, layer_name, color):
     }
     _tooltip_fields  = [f for f in _field_map if f in _sample_props]
     _tooltip_aliases = [_field_map[f] for f in _tooltip_fields]
+    # Hover-only tooltip, no popup/click binding (see docstring: map is read-only).
     _tooltip = folium.GeoJsonTooltip(fields=_tooltip_fields, aliases=_tooltip_aliases) if _tooltip_fields else None
-    folium.GeoJson(gj, name=layer_name,
-        style_function=lambda feat, _color=color: {"color": _color, "weight": 2, "fillColor": _color, "fillOpacity": 0.1},
-        tooltip=_tooltip
-    ).add_to(m)
 
+    def _style(feat, _color=color):
+        fid = str(feat.get("properties", {}).get("cluster_id"))
+        if selected_cluster_id is not None and fid == str(selected_cluster_id):
+            return {"color": "#FFD700", "weight": 4, "fillColor": "#FFD700", "fillOpacity": 0.6}
+        return {"color": _color, "weight": 2, "fillColor": _color, "fillOpacity": 0.1}
+
+    folium.GeoJson(gj, name=layer_name, style_function=_style, tooltip=_tooltip).add_to(m)
+
+_selected_cluster_id = st.session_state.get("_selected_cluster_id")
 _all_geojson_files = glob.glob(os.path.join(folder_path, "detected_clusters*.geojson"))
 _standard_geojson_files = [f for f in _all_geojson_files if "_snowfilter" not in os.path.basename(f)]
 _snowfilter_geojson_files = [f for f in _all_geojson_files if "_snowfilter" in os.path.basename(f)]
-_add_cluster_layer(m, _standard_geojson_files, "All Clusters", "red")
-_add_cluster_layer(m, _snowfilter_geojson_files, "All Clusters (Snow-filtered)", "red")
+_add_cluster_layer(m, _standard_geojson_files, "All Clusters", "red", _selected_cluster_id)
+_add_cluster_layer(m, _snowfilter_geojson_files, "All Clusters (Snow-filtered)", "red", _selected_cluster_id)
 
 Fullscreen(
     position="topright",
@@ -781,7 +841,14 @@ Fullscreen(
     force_separate_button=True,
 ).add_to(m)
 folium.LayerControl(collapsed=False).add_to(m)
-map_output = st_folium(m, width="100%", height=620, returned_objects=["all_drawings"], key=f"map_{folder_path}")
+# Cluster selection is table -> map only (see _add_cluster_layer), so no
+# click-related returned_objects are needed here; the map's view and each
+# layer's checked/unchecked state stay exactly as the user left them.
+map_output = st_folium(
+    m, width="100%", height=620,
+    returned_objects=["all_drawings"],
+    key=f"map_{folder_path}",
+)
 
 if st.session_state.get("tracking_just_launched"):
     _dirs_at_launch = st.session_state.get("tracking_dirs_at_launch", set())
@@ -858,7 +925,39 @@ m_col1.metric("Total Detected", len(data_rows))
 if data_rows:
     m_col2.metric("Clusters in Selection", len(selected_ids))
 
-st.dataframe(data_rows, width=1100, height=400, hide_index=True)
+if data_rows:
+    st.caption("Click a row to highlight the matching cluster on the map.")
+    df_clusters = pd.DataFrame(data_rows)
+
+    # Streamlit reports the current selected row index on every rerun, so
+    # selection state always matches the table's current (possibly re-sorted)
+    # row order.
+    table_key = f"cluster_table_select_{folder_path}_{cluster_set}"
+    _event = st.dataframe(
+        df_clusters,
+        width=1100, height=400, hide_index=True,
+        key=table_key,
+        on_select="rerun",
+        selection_mode="single-row",
+    )
+    _selected_rows = _event.selection.rows if _event and _event.selection else []
+    if _selected_rows:
+        _clicked_row = df_clusters.iloc[_selected_rows[0]]
+        _clicked_id = str(_clicked_row["Cluster_ID"])
+        if _clicked_id != str(_selected_cluster_id):
+            st.session_state["_selected_cluster_id"] = _clicked_id
+            st.session_state["_pending_cluster_zoom"] = {
+                "center": [_clicked_row["Centroid_Lat"], _clicked_row["Centroid_Lon"]],
+                "zoom": 15,
+            }
+            st.session_state["_map_view_folder"] = folder_path
+            st.rerun()
+    elif _selected_cluster_id is not None:
+        # Row was deselected (clicked again) -> clear the map highlight too.
+        st.session_state["_selected_cluster_id"] = None
+        st.rerun()
+else:
+    st.dataframe(data_rows, width=1100, height=400, hide_index=True)
 
 
 # --- 8. Progress Tracking & Execution ---

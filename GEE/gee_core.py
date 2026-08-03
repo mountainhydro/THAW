@@ -18,7 +18,7 @@ Sections
 4. S1 preprocessing       (tracking pipeline)
 5. Temporal smoothing     (tracking pipeline)
 6. Water likelihood       (tracking pipeline + shared)
-7. Snow masking (optical) (lakedetection pipeline)
+7. Sentinel-2 snow masking & true color (lakedetection pipeline)
 """
 
 import ee
@@ -526,21 +526,17 @@ def simple_threshold(image, threshold=-14):
 
 
 # ============================================================
-# 7. SNOW MASKING (OPTICAL) — LAKEDETECTION PIPELINE
+# 7. SENTINEL-2 SNOW MASKING & TRUE COLOR — LAKEDETECTION PIPELINE
 # ============================================================
 
-def get_snow_mask(aoi, ref_date, lookback_days=14, extension_days=7,
-                   coverage_thres=0.8, cloud_prob_max=40,
-                   ndsi_thres=0.4, nir_thres=0.15, scale=20):
+def get_sentinel2_mosaic(aoi, ref_date, lookback_days=14, extension_days=7,
+                          coverage_thres=0.8, cloud_prob_max=40, scale=20):
     """
-    Build a Sentinel-2 optical snow mask over the AOI using a cloud-filtered
-    median mosaic, NDSI and NIR thresholds.
+    Build a cloud-filtered Sentinel-2 median mosaic over the AOI.
 
     A 14-day lookback window is used by default; if cloud-free coverage over
     the AOI is below coverage_thres, the window is extended once (14 -> 21
-    days by default) and reused regardless of the resulting coverage. Pixels
-    with no valid Sentinel-2 data are treated as "not snow" so missing optical
-    coverage never blocks SAR-based lake detection.
+    days by default) and reused regardless of the resulting coverage.
 
     Parameters
     ----------
@@ -559,18 +555,13 @@ def get_snow_mask(aoi, ref_date, lookback_days=14, extension_days=7,
     cloud_prob_max : float, optional
         Sentinel-2 cloud probability threshold; pixels below this are kept
         (default 40).
-    ndsi_thres : float, optional
-        NDSI threshold above which a pixel is considered snow (default 0.4).
-    nir_thres : float, optional
-        NIR reflectance threshold above which a pixel is considered snow
-        (default 0.15).
     scale : int, optional
         Scale in metres used for the coverage-fraction check (default 20).
 
     Returns
     -------
     ee.Image
-        Single-band binary mask named 'snow_mask' (1 = snow-covered).
+        Cloud-masked Sentinel-2 median mosaic (all bands), clipped to aoi.
     """
     def build_mosaic(period_start):
         s2_sr = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
@@ -605,12 +596,73 @@ def get_snow_mask(aoi, ref_date, lookback_days=14, extension_days=7,
 
     if coverage < coverage_thres:
         extended_days = lookback_days + extension_days
-        print(f"Snow mask: only {coverage:.0%} AOI coverage in {lookback_days}-day window, "
+        print(f"Sentinel-2 mosaic: only {coverage:.0%} AOI coverage in {lookback_days}-day window, "
               f"extending to {extended_days} days.", flush=True)
         period_start = ref_date - datetime.timedelta(days=extended_days)
         mosaic = build_mosaic(period_start)
+
+    return mosaic
+
+
+def get_snow_mask(aoi, ref_date, mosaic=None, ndsi_thres=0.4, nir_thres=0.15, **mosaic_kwargs):
+    """
+    Build a Sentinel-2 optical snow mask from NDSI and NIR thresholds.
+
+    Pixels with no valid Sentinel-2 data are treated as "not snow" so missing
+    optical coverage never blocks SAR-based lake detection.
+
+    Parameters
+    ----------
+    aoi : ee.Geometry
+        Area of interest.
+    ref_date : datetime.datetime
+        Reference date; the lookback window ends here.
+    mosaic : ee.Image, optional
+        A pre-built Sentinel-2 mosaic (e.g. from get_sentinel2_mosaic()) to
+        reuse instead of building a new one. If None, one is built internally.
+    ndsi_thres : float, optional
+        NDSI threshold above which a pixel is considered snow (default 0.4).
+    nir_thres : float, optional
+        NIR reflectance threshold above which a pixel is considered snow
+        (default 0.15).
+    **mosaic_kwargs
+        Passed through to get_sentinel2_mosaic() when mosaic is None
+        (lookback_days, extension_days, coverage_thres, cloud_prob_max, scale).
+
+    Returns
+    -------
+    ee.Image
+        Single-band binary mask named 'snow_mask' (1 = snow-covered).
+    """
+    if mosaic is None:
+        mosaic = get_sentinel2_mosaic(aoi, ref_date, **mosaic_kwargs)
 
     ndsi = mosaic.normalizedDifference(['B3', 'B11']).rename('NDSI')
     nir = mosaic.select('B8').divide(10000).rename('NIR')
     snow_mask = ndsi.gt(ndsi_thres).And(nir.gt(nir_thres))
     return snow_mask.unmask(0).rename('snow_mask')
+
+
+def get_true_color_image(mosaic, min_refl=0, max_refl=3000, gamma=1.4):
+    """
+    Build an 8-bit true-color (RGB) visualization image from a Sentinel-2 mosaic.
+
+    Parameters
+    ----------
+    mosaic : ee.Image
+        A Sentinel-2 mosaic (e.g. from get_sentinel2_mosaic()) with B4/B3/B2 bands.
+    min_refl : float, optional
+        Reflectance value mapped to 0 (default 0).
+    max_refl : float, optional
+        Reflectance value mapped to 255 (default 3000).
+    gamma : float, optional
+        Gamma correction applied to the stretch (default 1.4).
+
+    Returns
+    -------
+    ee.Image
+        3-band 8-bit RGB image ready for export/display.
+    """
+    return mosaic.select(['B4', 'B3', 'B2']).visualize(
+        min=min_refl, max=max_refl, gamma=gamma
+    )

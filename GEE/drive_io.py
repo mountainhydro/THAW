@@ -251,10 +251,55 @@ def delete_drive_files(token_path, file_ids):
         print(f"Cleaned {deleted} file(s) from Google Drive.", flush=True)
 
 
+def cleanup_stale_drive_exports(token_path, drive_folder="GEE_Exports", max_age_hours=12 * 24):
+    """
+    Delete any file older than max_age_hours still sitting in the Drive export
+    folder. Safety net for files a run never got to clean up itself — e.g. a
+    crashed/killed process, or a quota/permission error inside
+    delete_drive_files — since such files no longer match any prefix a later
+    run looks for (once already valid on disk, a prefix is never re-queried),
+    and would otherwise sit in Drive forever.
+
+    Silent by design (no print output) — this runs on every pipeline start and
+    would otherwise clutter the run logs with unrelated cleanup noise.
+    """
+    try:
+        drive = build_drive_service(token_path)
+        folders = drive.files().list(
+            q=f"name='{drive_folder}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+            fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute().get("files", [])
+        cutoff = (datetime.datetime.now(datetime.timezone.utc)
+                  - datetime.timedelta(hours=max_age_hours)).strftime("%Y-%m-%dT%H:%M:%S")
+        stale_ids = []
+        for folder in folders:
+            page_token = None
+            while True:
+                res = drive.files().list(
+                    q=f"'{folder['id']}' in parents and trashed=false and createdTime < '{cutoff}'",
+                    fields="nextPageToken, files(id)", pageSize=1000, pageToken=page_token,
+                    supportsAllDrives=True, includeItemsFromAllDrives=True,
+                ).execute()
+                stale_ids.extend(f["id"] for f in res.get("files", []))
+                page_token = res.get("nextPageToken")
+                if not page_token:
+                    break
+        for fid in stale_ids:
+            try:
+                drive.files().delete(fileId=fid).execute()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _poll_and_download(task_list, drive_service, token_path):
     """
-    Poll a list of GEE export tasks, download each file as it completes,
-    then permanently delete all downloaded files from Drive.
+    Poll a list of GEE export tasks, downloading and immediately deleting
+    each file's Drive copy as soon as it completes (rather than batching
+    deletion until every task is done), so a crash partway through a large
+    batch leaves at most the file in flight orphaned in Drive, not every
+    file already finished.
     """
     print(f"Waiting for {len(task_list)} GEE task(s)...", flush=True)
     completed  = 0
@@ -320,7 +365,7 @@ def _poll_and_download(task_list, drive_service, token_path):
                         continue
                     downloaded += 1
                     print(f"Downloaded files: ({downloaded}/{len(task_list)})", flush=True)
-                    item["drive_file_ids"] = tile_ids
+                    delete_drive_files(token_path, tile_ids)
                     item["done"] = True
                     completed += 1
                     pass_states[idx] = "DOWNLOADED"
@@ -363,9 +408,6 @@ def _poll_and_download(task_list, drive_service, token_path):
     if failed:
         raise RuntimeError(f"GEE task(s) failed: {', '.join(failed)}")
 
-    # Return IDs for caller to delete — deletion is best-effort outside retry scope
-    return [fid for item in task_list for fid in item.get("drive_file_ids", [])]
-
 
 def export_and_download(images_to_export, reference_date, aoi, token_path,
                         output_root, run_label, task_name=""):
@@ -401,6 +443,7 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
     os.makedirs(local_dir, exist_ok=True)
 
     drive_service = build_drive_service(token_path)
+    cleanup_stale_drive_exports(token_path)
 
     # Separate files already valid on disk from those needing download
     missing = {}
@@ -474,21 +517,13 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
             "file_prefix":    file_prefix,
             "local_path":     local_path,
             "label":          name,
-            "drive_file_ids": [],
             "done":           False,
         })
         print(f"Started GEE task: {name}", flush=True)
 
-    ids_to_delete = []
-    try:
-        ids_to_delete = _poll_and_download(task_list, drive_service, token_path)
-    finally:
-        if ids_to_delete:
-            print(f"Cleaning up {len(ids_to_delete)} file(s) from Google Drive...", flush=True)
-            try:
-                delete_drive_files(token_path, ids_to_delete)
-            except Exception as e:
-                print(f"Warning: Drive cleanup failed (files may remain): {e}", flush=True)
+    print("To monitor your task on the GEE server, visit code.earthengine.google.com/tasks", flush=True)
+
+    _poll_and_download(task_list, drive_service, token_path)
 
     return local_dir
 
@@ -529,6 +564,7 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
 
     os.makedirs(output_dir, exist_ok=True)
     drive_service = build_drive_service(token_path)
+    cleanup_stale_drive_exports(token_path, drive_folder=drive_folder)
 
     count = s1_collection.size().getInfo()
     s1_list = s1_collection.toList(count)
@@ -629,7 +665,6 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
                 "file_prefix":    file_prefix,
                 "local_path":     local_path,
                 "label":          os.path.basename(local_path),
-                "drive_file_ids": [],
                 "done":           False,
             })
         except Exception as e:
@@ -639,24 +674,14 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
         print("No tasks to run (all files already exist or none launched).", flush=True)
         return
 
-    os_error_occurred = False
-    ids_to_delete = []
     try:
-        ids_to_delete = _poll_and_download(task_list, drive_service, token_path)
+        _poll_and_download(task_list, drive_service, token_path)
     except (OSError, IOError) as e:
         all_downloaded = all(_is_valid_tif(item["local_path"]) for item in task_list)
         if all_downloaded:
             print(f"Warning: Drive cleanup error ignored (all files downloaded): {e}", flush=True)
-            os_error_occurred = True
         else:
             raise
-    finally:
-        if ids_to_delete and not os_error_occurred:
-            print(f"Cleaning up {len(ids_to_delete)} file(s) from Google Drive...", flush=True)
-            try:
-                delete_drive_files(token_path, ids_to_delete)
-            except Exception as e:
-                print(f"Warning: Drive cleanup failed (files may remain): {e}", flush=True)
 
 
 # ============================================================

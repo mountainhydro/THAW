@@ -25,7 +25,7 @@ if SCRIPT_DIR not in sys.path:
 # Local imports
 from gee_auth import initialize_ee
 from drive_io import Logger, export_and_download, convert_to_cog, CancelledError
-from gee_core import apply_radar_mask_to_collection, get_historical_collection, get_snow_mask
+from gee_core import apply_radar_mask_to_collection, get_historical_collection, get_sentinel2_mosaic, get_snow_mask, get_true_color_image
 from reporting import cluster_processing
 from thinning import get_elevation_threshold_from_nearest_glacier
 
@@ -127,6 +127,13 @@ def run_pipeline(config_path):
     pid_file = os.path.join(local_dir, "pipeline.pid")
     with open(pid_file, "w") as _pf:
         _pf.write(str(os.getpid()))
+
+    # Snapshot the resolved config (run_date pinned to date_str) so the dashboard
+    # can auto-relaunch this exact run if the process dies before completion.
+    _snapshot = dict(cfg)
+    _snapshot["run_date"] = date_str
+    with open(os.path.join(local_dir, "launch_config.json"), "w") as _cf:
+        json.dump(_snapshot, _cf, indent=2)
 
     # Read checkpoint early — used for both resume detection and run_label restore
     ckpt = read_checkpoint(local_dir)
@@ -277,20 +284,24 @@ def run_pipeline(config_path):
     zscore_mean = zscore_asc.add(zscore_desc).divide(2).focal_mean(3).updateMask(focal_mean)
 
     # Optical snow mask (Sentinel-2 NDSI/NIR) — additional filtered product,
-    # does not affect potential_water or zscore_mean.
-    snow_mask = get_snow_mask(aoi, ref_date)
+    # does not affect potential_water or zscore_mean. Also export the same
+    # cloud-filtered mosaic as a true-color image for visual reference.
+    s2_mosaic = get_sentinel2_mosaic(aoi, ref_date)
+    snow_mask = get_snow_mask(aoi, ref_date, mosaic=s2_mosaic)
     zscore_snowfilter = zscore_mean.updateMask(snow_mask.Not())
+    true_color = get_true_color_image(s2_mosaic)
 
     
 # ============================================================
 # EXPORT AND DOWNLOAD
 # ============================================================
     token_path   = cfg["drive_token_path"]
-    export_names = ["potential_water", "z_score", "zscore_snowfilter"]
+    export_names = ["potential_water", "z_score", "zscore_snowfilter", "true_color"]
     exports = {
         "potential_water": potential_water,
         "z_score": zscore_mean,
         "zscore_snowfilter": zscore_snowfilter,
+        "true_color": true_color,
     }
 
     # Write initial checkpoint so dashboard can detect this run

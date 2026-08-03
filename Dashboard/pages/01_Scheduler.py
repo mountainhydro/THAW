@@ -456,6 +456,34 @@ def _is_pid_running(pid):
     except Exception:
         return False
 
+def _relaunch_stale_pipeline(folder, log_path):
+    """Log is flagged 'running' but its PID is dead (crash/reboot). Mark the
+    stale log as failed so it isn't picked up again, then relaunch from the
+    saved config snapshot (drive_io will skip re-submitting already-finished
+    GEE exports and just download them)."""
+    with open(log_path, "a", encoding="utf-8") as _lf:
+        _lf.write("\nPIPELINE_ERROR: Process terminated unexpectedly (crash or machine restart).\n")
+    pid_file = os.path.join(folder, "pipeline.pid")
+    try:
+        os.remove(pid_file)
+    except Exception:
+        pass
+
+    cfg_snapshot = os.path.join(folder, "launch_config.json")
+    if not os.path.exists(cfg_snapshot):
+        st.warning(
+            f"'{os.path.basename(folder)}' stopped running and has no saved config to "
+            "auto-relaunch. Use 'Run job now' with the same date/AOI/name to resume it."
+        )
+        return
+
+    script_p = os.path.join(GEE_DIR, "lakedetection_headless.py")
+    subprocess.Popen(
+        [sys.executable, "-u", script_p, cfg_snapshot],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    st.info(f"'{os.path.basename(folder)}' had stopped (crash/restart) — automatically relaunched.")
+
 recent_folders = sorted(
     [f for f, _ in dated_folders],
     key=lambda f: (
@@ -478,6 +506,17 @@ for folder in recent_folders:
     status, content = _get_log_status(log_files[-1])
 
     pid_file = os.path.join(folder, "pipeline.pid")
+
+    # Flagged "running" but the process behind it is gone (crash / machine
+    # restart) — auto-relaunch it from its saved config and re-render.
+    if status == "running" and os.path.exists(pid_file):
+        try:
+            _pid = int(open(pid_file).read().strip())
+        except Exception:
+            _pid = None
+        if _pid is not None and not _is_pid_running(_pid):
+            _relaunch_stale_pipeline(folder, log_files[-1])
+            st.rerun()
 
     if status == "running":
         any_running = True

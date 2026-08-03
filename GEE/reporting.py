@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 import rasterio
 from rasterio.features import shapes
 from rasterio.warp import transform_geom
+from rasterio.warp import transform as warp_transform_points
 from sklearn.cluster import DBSCAN
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from datetime import datetime
@@ -74,20 +75,28 @@ def cluster_processing(tif_path, timestamp, z_thres=-2, min_size_cluster=20, pix
     labels_raster = np.full(candidate.shape, -1, dtype=int)
     labels_raster[ys, xs] = labels.astype(int)
 
+    # rasterio.features.shapes() groups pixels by 4-connectivity, but DBSCAN
+    # clusters are formed by Euclidean distance (eps), not strict adjacency —
+    # a single cluster label can therefore rasterize into several disconnected
+    # polygon fragments. Group fragments by label so each cluster yields
+    # exactly one feature/row instead of one per fragment.
+    fragments_by_label = {}
+    for geom, val in shapes(labels_raster, mask=(labels_raster != -1), transform=transform):
+        lbl = int(val)
+        geom_wgs84 = transform_geom(src_crs, "EPSG:4326", geom)
+        fragments_by_label.setdefault(lbl, []).append(geom_wgs84)
+
     features = []
     summary_data = "Cluster_ID,Pixel_Count,Area_m2,Centroid_Lon,Centroid_Lat\n"
 
-    for geom, val in shapes(labels_raster, mask=(labels_raster != -1), transform=transform):
-        lbl = int(val)
-
-        # Reproject from raster native CRS (e.g. UTM) to WGS84 so Folium renders correctly
-        geom_wgs84 = transform_geom(src_crs, "EPSG:4326", geom)
-
-        coords_list = geom_wgs84['coordinates'][0]
-        lons = [p[0] for p in coords_list]
-        lats = [p[1] for p in coords_list]
-        center_lon = sum(lons) / len(lons)
-        center_lat = sum(lats) / len(lats)
+    for lbl, fragments in sorted(fragments_by_label.items()):
+        # Centroid from the full pixel mask (all fragments combined), not
+        # from a single fragment's own vertices.
+        mask_ys, mask_xs = np.nonzero(labels_raster == lbl)
+        row_c, col_c = mask_ys.mean(), mask_xs.mean()
+        x_native, y_native = transform * (col_c + 0.5, row_c + 0.5)
+        lon_arr, lat_arr = warp_transform_points(src_crs, "EPSG:4326", [x_native], [y_native])
+        center_lon, center_lat = lon_arr[0], lat_arr[0]
 
         pix_count = int((labels_raster == lbl).sum())
 
@@ -100,14 +109,26 @@ def cluster_processing(tif_path, timestamp, z_thres=-2, min_size_cluster=20, pix
             pixel_area_m2 = abs(res_x * m_per_deg_lon) * abs(res_y * m_per_deg_lat)
         total_area_m2 = pix_count * pixel_area_m2
 
+        # One Polygon if the cluster is a single contiguous shape, otherwise
+        # a MultiPolygon combining every fragment — but always one feature.
+        if len(fragments) == 1:
+            geometry = fragments[0]
+        else:
+            geometry = {
+                "type": "MultiPolygon",
+                "coordinates": [f["coordinates"] for f in fragments],
+            }
+
         feature = {
             "type": "Feature",
             "properties": {
                 "cluster_id": lbl,
                 "pixel_count": pix_count,
-                "area_m2": round(total_area_m2, 0)
+                "area_m2": round(total_area_m2, 0),
+                "centroid_lon": round(float(center_lon), 6),
+                "centroid_lat": round(float(center_lat), 6),
             },
-            "geometry": geom_wgs84
+            "geometry": geometry
         }
         features.append(feature)
         summary_data += f"{lbl},{pix_count},{round(total_area_m2, 0)},{center_lon:.6f},{center_lat:.6f}\n"
