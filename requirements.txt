@@ -10,11 +10,20 @@ folium==0.20.0
 streamlit-folium==0.26.1
 rasterio
 scikit-learn
+geopandas
+shapely
+pyproj
+geojson
 
 # Visualization & Internal Streamlit Checks
 matplotlib
 pandas
 pyarrow
+Pillow
+Jinja2
+
+# HTTP
+requests
 
 # Google Auth
 google-api-python-client==2.188.0
