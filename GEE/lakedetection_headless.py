@@ -24,7 +24,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 # Local imports
 from gee_auth import initialize_ee
-from drive_io import Logger, export_and_download, convert_to_cog, CancelledError
+from drive_io import Logger, export_and_download, convert_to_cog, compute_snow_filtered_zscore, CancelledError
 from gee_core import apply_radar_mask_to_collection, get_historical_collection, get_sentinel2_mosaic, get_snow_mask, get_true_color_image
 from reporting import cluster_processing
 from thinning import get_elevation_threshold_from_nearest_glacier
@@ -155,14 +155,20 @@ def run_pipeline(config_path):
         done = ckpt.get("steps_complete", [])
         local_path = local_dir
 
+        if "snowfilter" not in done:
+            print("Step 2/4: Computing local snow-filtered z-score...", flush=True)
+            retry(lambda: compute_snow_filtered_zscore(local_path, run_label), label="Local snow-filter", max_attempts=3, base_wait=10)
+            done.append("snowfilter")
+            write_checkpoint(local_dir, steps_complete=done)
+
         if "cog" not in done:
-            print("Step 2/3: Converting to COG...", flush=True)
+            print("Step 3/4: Converting to COG...", flush=True)
             retry(lambda: convert_to_cog(local_path), label="COG conversion", max_attempts=3, base_wait=10)
             done.append("cog")
             write_checkpoint(local_dir, steps_complete=done)
 
         if "cluster" not in done:
-            print("Step 3/3: Running cluster analysis...", flush=True)
+            print("Step 4/4: Running cluster analysis...", flush=True)
             z_score_files = glob.glob(os.path.join(local_path, "z_score_*.tif"))
             z_score_files = [f for f in z_score_files if not f.endswith("_cog.tif")]
             if z_score_files:
@@ -284,24 +290,25 @@ def run_pipeline(config_path):
     zscore_mean = zscore_asc.add(zscore_desc).divide(2).focal_mean(3).updateMask(focal_mean)
 
     # Optical snow mask (Sentinel-2 NDSI/NIR) — additional filtered product,
-    # does not affect potential_water or zscore_mean. Also export the same
-    # cloud-filtered mosaic as a true-color image for visual reference.
+    # does not affect potential_water or zscore_mean. Snow-filtering itself is
+    # applied locally (see compute_snow_filtered_zscore) from this lightweight
+    # mask instead of exporting a whole second z-score raster from GEE.
     s2_mosaic = get_sentinel2_mosaic(aoi, ref_date)
     snow_mask = get_snow_mask(aoi, ref_date, mosaic=s2_mosaic)
-    zscore_snowfilter = zscore_mean.updateMask(snow_mask.Not())
-    true_color = get_true_color_image(s2_mosaic)
+    # zscore_snowfilter = zscore_mean.updateMask(snow_mask.Not())  # now computed locally instead
+    # true_color = get_true_color_image(s2_mosaic)  # dropped for now to cut export/processing time; re-enable if needed
 
     
 # ============================================================
 # EXPORT AND DOWNLOAD
 # ============================================================
     token_path   = cfg["drive_token_path"]
-    export_names = ["potential_water", "z_score", "zscore_snowfilter", "true_color"]
+    export_names = ["potential_water", "z_score", "snow_mask"]
     exports = {
         "potential_water": potential_water,
         "z_score": zscore_mean,
-        "zscore_snowfilter": zscore_snowfilter,
-        "true_color": true_color,
+        "snow_mask": snow_mask.toByte(),
+        # "true_color": true_color,  # dropped for now, see above
     }
 
     # Write initial checkpoint so dashboard can detect this run
@@ -317,7 +324,7 @@ def run_pipeline(config_path):
     done = []
 
     if "download" not in done:
-        print("Step 1/3: Launching tasks on Google Earth Engine...", flush=True)
+        print("Step 1/4: Launching tasks on Google Earth Engine...", flush=True)
         local_path = retry(
             lambda: export_and_download(
                 exports, ref_date, aoi, token_path,
@@ -328,15 +335,32 @@ def run_pipeline(config_path):
         write_checkpoint(local_dir, steps_complete=["download"])
         done.append("download")
     else:
-        print("Step 1/3: Download already complete, skipping.", flush=True)
+        print("Step 1/4: Download already complete, skipping.", flush=True)
         local_path = local_dir
+
+
+# ============================================================
+# LOCAL SNOW-FILTER COMBINATION
+# ============================================================
+    if "snowfilter" not in done:
+        print("Step 2/4: Computing local snow-filtered z-score...", flush=True)
+        retry(
+            lambda: compute_snow_filtered_zscore(local_path, run_label),
+            label="Local snow-filter",
+            max_attempts=3,
+            base_wait=10,
+        )
+        done.append("snowfilter")
+        write_checkpoint(local_dir, steps_complete=done)
+    else:
+        print("Step 2/4: Local snow-filter already complete, skipping.", flush=True)
 
 
 # ============================================================
 # COG CONVERSION
 # ============================================================
     if "cog" not in done:
-        print("Step 2/3: Converting to COG...", flush=True)
+        print("Step 3/4: Converting to COG...", flush=True)
         retry(
             lambda: convert_to_cog(local_path),
             label="COG conversion",
@@ -346,14 +370,14 @@ def run_pipeline(config_path):
         done.append("cog")
         write_checkpoint(local_dir, steps_complete=done)
     else:
-        print("Step 2/3: COG conversion already complete, skipping.", flush=True)
+        print("Step 3/4: COG conversion already complete, skipping.", flush=True)
 
 
 # ============================================================
 # CLUSTERING
 # ============================================================
     if "cluster" not in done:
-        print("Step 3/3: Running cluster analysis...", flush=True)
+        print("Step 4/4: Running cluster analysis...", flush=True)
         z_score_files = glob.glob(os.path.join(local_path, "z_score_*.tif"))
         z_score_files = [f for f in z_score_files if not f.endswith("_cog.tif")]
         if z_score_files:
@@ -377,7 +401,7 @@ def run_pipeline(config_path):
         done.append("cluster")
         write_checkpoint(local_dir, steps_complete=done)
     else:
-        print("Step 3/3: Clustering already complete, skipping.", flush=True)
+        print("Step 4/4: Clustering already complete, skipping.", flush=True)
 
     clear_checkpoint(local_dir)
     try:

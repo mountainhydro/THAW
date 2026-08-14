@@ -28,6 +28,7 @@ SCOPES = [
 # 2. Page Config
 st.set_page_config(page_title="Welcome to THAW!", layout="centered")
 render_logo_header()
+st.markdown("<style>[data-stale='true']{opacity:1!important;transition:none!important;}</style>", unsafe_allow_html=True)
 
 
 # 3. Helper Functions

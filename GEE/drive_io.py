@@ -19,7 +19,9 @@ import time
 import socket
 import datetime
 import ee
+import numpy as np
 import rasterio
+from rasterio.warp import reproject, Resampling
 from googleapiclient.http import MediaIoBaseDownload
 from rio_cogeo.cogeo import cog_translate
 from rio_cogeo.profiles import cog_profiles
@@ -687,6 +689,70 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
 # ============================================================
 # COG CONVERSION
 # ============================================================
+
+def compute_snow_filtered_zscore(local_dir, run_label):
+    """
+    Build the snow-filtered z-score raster locally instead of on GEE.
+
+    Combines the already-downloaded 'z_score' and 'snow_mask' GeoTIFFs
+    (exporting a binary mask from GEE is far cheaper than exporting a whole
+    second z-score raster). The mask is resampled onto the z_score grid
+    (nearest-neighbour) if the two exports don't already share one, since
+    each is reprojected independently by GEE. Snow-flagged pixels are set to
+    NaN, matching how cluster_processing() already treats invalid pixels.
+
+    Parameters
+    ----------
+    local_dir : str — output folder containing the downloaded GeoTIFFs
+    run_label : str — run label used in filenames, e.g. '2026-05-01_39084_71499_001'
+
+    Returns
+    -------
+    str or None — path to the written 'zscore_snowfilter_<run_label>.tif', or
+    None if either input file is missing (already logged as a warning).
+    """
+    z_path    = os.path.join(local_dir, f"z_score_{run_label}.tif")
+    mask_path = os.path.join(local_dir, f"snow_mask_{run_label}.tif")
+    out_path  = os.path.join(local_dir, f"zscore_snowfilter_{run_label}.tif")
+
+    if _is_valid_tif(out_path):
+        return out_path
+    if not (_is_valid_tif(z_path) and _is_valid_tif(mask_path)):
+        print("Skipping local snow-filter: z_score or snow_mask file missing.", flush=True)
+        return None
+
+    with rasterio.open(z_path) as z_src:
+        z_data    = z_src.read(1).astype("float32")
+        z_profile = z_src.profile.copy()
+
+    with rasterio.open(mask_path) as m_src:
+        same_grid = (
+            m_src.transform == z_profile["transform"] and
+            m_src.width == z_profile["width"] and
+            m_src.height == z_profile["height"] and
+            m_src.crs == z_profile["crs"]
+        )
+        if same_grid:
+            mask_data = m_src.read(1)
+        else:
+            mask_data = np.zeros((z_profile["height"], z_profile["width"]), dtype=m_src.dtypes[0])
+            reproject(
+                source=rasterio.band(m_src, 1),
+                destination=mask_data,
+                dst_transform=z_profile["transform"],
+                dst_crs=z_profile["crs"],
+                resampling=Resampling.nearest,
+            )
+
+    out_data = np.where(mask_data.astype(bool), np.nan, z_data)
+    z_profile.update(dtype="float32", nodata=np.nan)
+
+    with rasterio.open(out_path, "w", **z_profile) as dst:
+        dst.write(out_data, 1)
+
+    print(f"Computed local snow-filtered z-score: {os.path.basename(out_path)}", flush=True)
+    return out_path
+
 
 def convert_to_cog(folder):
     """

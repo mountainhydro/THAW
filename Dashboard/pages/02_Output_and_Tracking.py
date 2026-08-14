@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 import rasterio
 from rasterio.warp import transform_bounds
+from shapely.geometry import shape as shapely_shape
 import base64
 from streamlit_folium import st_folium
 from folium.plugins import MeasureControl, Draw, Fullscreen
@@ -483,6 +484,22 @@ def _get_run_status(tracking_dir):
         return "failed"
     return "running"
 
+def _load_cluster_geoms(geojson_files):
+    """Return {cluster_id: shapely geometry} from the most recent geojson in the list."""
+    if not geojson_files:
+        return {}
+    latest = sorted(geojson_files, key=os.path.getmtime, reverse=True)[0]
+    with open(latest, "r", encoding="utf-8") as fh:
+        gj = json.load(fh)
+    geoms = {}
+    for feat in gj.get("features", []):
+        cid = str(feat.get("properties", {}).get("cluster_id"))
+        try:
+            geoms[cid] = shapely_shape(feat["geometry"])
+        except Exception:
+            continue
+    return geoms
+
 # --- 2. Directory & Auth Setup ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__)) 
 DASH_DIR = os.path.dirname(CURRENT_DIR)                 
@@ -578,38 +595,34 @@ def make_display_label(folder_date, location):
 date_options = [make_display_label(fd, loc) for _, fd, loc in dated_folders]
 
 selected_display = st.sidebar.selectbox("Date", date_options, key="output_date_select")
-# Reset the HMA-overview toggle, cluster highlight and persisted map view
-# whenever the user picks a different folder
+# Reset cluster highlight and persisted map view whenever the user picks a different folder
 if st.session_state.get("_prev_output_date_select") != selected_display:
-    st.session_state["_show_hma_overview"] = False
     st.session_state["_selected_cluster_id"] = None
     st.session_state["_map_view"] = None
     st.session_state["_pending_cluster_zoom"] = None
 st.session_state["_prev_output_date_select"] = selected_display
-if st.sidebar.button("Show full HMA overview"):
-    st.session_state["_show_hma_overview"] = True
-    st.session_state["_map_view"] = None
 
 # Recover folder_path from selected index
 selected_idx = date_options.index(selected_display)
 folder_path, selected_folder_dt, _ = dated_folders[selected_idx]
 selected_folder_date = selected_folder_dt.strftime("%Y-%m-%d")
-tif_files = glob.glob(os.path.join(folder_path, "*_cog.tif"))
+# snow_mask is an intermediate input (used locally to build zscore_snowfilter),
+# not a product meant for map display
+tif_files = [f for f in glob.glob(os.path.join(folder_path, "*_cog.tif"))
+             if "snow_mask" not in os.path.basename(f)]
 
 st.title(f"Preview: {selected_folder_date}")
 st.caption(f"Connected to GEE Project: `{project_id}`")
-
 # --- 6. Map Generation Logic ---
 # View priority: (1) a one-shot zoom-to-cluster from a just-clicked cluster,
 # (2) the view we last decided on for this folder (so unrelated reruns —
 # e.g. tracking-status polling — reuse it instead of recomputing and
-# resetting the zoom), (3) fit the folder's data, or (4) the HMA overview.
+# resetting the zoom), or (3) fit the folder's data.
 # NOTE: we deliberately do NOT track live zoom/center from st_folium — doing
 # so makes every pan/zoom trigger a full Streamlit rerun (which rebuilds the
 # whole map and resets any layers the user unticked). Without that, ordinary
 # panning/zooming causes no rerun at all, so the browser-side map simply
 # stays wherever the user left it.
-show_overview = st.session_state.get("_show_hma_overview", False)
 _pending_zoom = st.session_state.pop("_pending_cluster_zoom", None)
 _persisted_view = (
     st.session_state.get("_map_view")
@@ -626,7 +639,7 @@ if _pending_zoom:
 elif _persisted_view:
     center = _persisted_view["center"]
     zoom_start = _persisted_view["zoom"]
-elif tif_files and not show_overview:
+elif tif_files:
     try:
         with rasterio.open(tif_files[0]) as src:
             wgs_bounds = transform_bounds(src.crs, 'EPSG:4326', *src.bounds)
@@ -662,7 +675,10 @@ class _LimitOneDrawing(MacroElement):
                 if (!(fg instanceof L.FeatureGroup)) return;
                 var toRemove = [];
                 fg.eachLayer(function(l) {
-                    if (l instanceof L.Polygon) toRemove.push(l);
+                    // L.Rectangle only — the draw toolbar only offers rectangles,
+                    // while cluster GeoJson polygons are plain L.Polygon (never
+                    // L.Rectangle), so this leaves cluster layers untouched.
+                    if (l instanceof L.Rectangle) toRemove.push(l);
                 });
                 toRemove.forEach(function(l) { fg.removeLayer(l); });
             });
@@ -682,7 +698,10 @@ class _PersistLayerVisibility(MacroElement):
     _template = Template("""
         {% macro script(this, kwargs) %}
         (function() {
-            var STORAGE_KEY = 'thaw_layer_visibility';
+            // Bump the trailing version suffix whenever Python-side default
+            // visibility changes, so stale stored toggles from before that
+            // change don't silently keep overriding the new defaults.
+            var STORAGE_KEY = 'thaw_layer_visibility_v2';
             function getStored() {
                 try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch (e) { return {}; }
             }
@@ -722,7 +741,11 @@ _PersistLayerVisibility().add_to(m)
 # Add TIF Layers — served lazily as raster tiles from the local tile server
 # (Dashboard/tile_server.py), so only tiles visible in the viewport are ever
 # rendered/transferred instead of embedding one full-resolution PNG.
+_z_score_layer = None
 if tif_files:
+    # Z Score is deferred and added at the very bottom of the layer list,
+    # unchecked by default (Potential Water / snow-filtered results are the
+    # primary view now).
     for tif in tif_files:
         basename = os.path.basename(tif)
         if "true_color" in basename:
@@ -738,6 +761,12 @@ if tif_files:
                 mask_below_zero='potential_water' in basename,
             )
             opacity = 0.7
+        if layer_label == "Z Score":
+            _z_score_layer = folium.TileLayer(
+                tiles=tile_url, name=layer_label, attr="THAW", overlay=True,
+                control=True, opacity=opacity, show=False,
+            )
+            continue
         folium.TileLayer(
             tiles=tile_url, name=layer_label, attr="THAW", overlay=True,
             control=True, opacity=opacity,
@@ -771,7 +800,7 @@ for _bb_label, _bb_dir in _all_runs:
         pass
 
 # Handle Clusters GeoJson
-def _add_cluster_layer(m, geojson_files, layer_name, color, selected_cluster_id=None):
+def _add_cluster_layer(m, geojson_files, layer_name, color, selected_cluster_id=None, show=True):
     """Load the most recent geojson from a list, inject centroids, add to map.
 
     Features matching selected_cluster_id are drawn highlighted (gold). Purely
@@ -825,14 +854,34 @@ def _add_cluster_layer(m, geojson_files, layer_name, color, selected_cluster_id=
             return {"color": "#FFD700", "weight": 4, "fillColor": "#FFD700", "fillOpacity": 0.6}
         return {"color": _color, "weight": 2, "fillColor": _color, "fillOpacity": 0.1}
 
-    folium.GeoJson(gj, name=layer_name, style_function=_style, tooltip=_tooltip).add_to(m)
+    folium.GeoJson(gj, name=layer_name, style_function=_style, tooltip=_tooltip, show=show).add_to(m)
+
+    # Dedicated always-visible highlight, independent of this layer's own
+    # checkbox/persisted visibility (_PersistLayerVisibility re-applies a
+    # stored hidden preference shortly after mount, which would otherwise
+    # hide the gold highlight again a split-second after it appears).
+    if selected_cluster_id is not None:
+        _sel_feats = [f for f in gj.get("features", [])
+                      if str(f.get("properties", {}).get("cluster_id")) == str(selected_cluster_id)]
+        if _sel_feats:
+            folium.GeoJson(
+                {"type": "FeatureCollection", "features": _sel_feats},
+                style_function=lambda feat: {"color": "#FFD700", "weight": 4, "fillColor": "#FFD700", "fillOpacity": 0.6},
+                control=False,
+            ).add_to(m)
 
 _selected_cluster_id = st.session_state.get("_selected_cluster_id")
 _all_geojson_files = glob.glob(os.path.join(folder_path, "detected_clusters*.geojson"))
 _standard_geojson_files = [f for f in _all_geojson_files if "_snowfilter" not in os.path.basename(f)]
 _snowfilter_geojson_files = [f for f in _all_geojson_files if "_snowfilter" in os.path.basename(f)]
-_add_cluster_layer(m, _standard_geojson_files, "All Clusters", "red", _selected_cluster_id)
 _add_cluster_layer(m, _snowfilter_geojson_files, "All Clusters (Snow-filtered)", "red", _selected_cluster_id)
+
+# Z Score and All Clusters (standard) moved to the bottom of the layer list,
+# unchecked by default — the selected-cluster highlight is drawn as its own
+# always-visible overlay (see _add_cluster_layer), independent of this.
+if _z_score_layer is not None:
+    _z_score_layer.add_to(m)
+_add_cluster_layer(m, _standard_geojson_files, "All Clusters", "red", _selected_cluster_id, show=False)
 
 Fullscreen(
     position="topright",
@@ -880,27 +929,45 @@ _all_cluster_csv_files = glob.glob(os.path.join(folder_path, "cluster_summary*.c
 _standard_csv_files = [f for f in _all_cluster_csv_files if "_snowfilter" not in os.path.basename(f)]
 _snowfilter_csv_files = [f for f in _all_cluster_csv_files if "_snowfilter" in os.path.basename(f)]
 
-cluster_set = "Standard"
-if _standard_csv_files and _snowfilter_csv_files:
-    cluster_set = st.radio("Cluster set", ["Standard", "Snow-filtered"], horizontal=True, key=f"cluster_set_{folder_path}")
-elif _snowfilter_csv_files:
-    cluster_set = "Snow-filtered"
-
-cluster_csv_files = _snowfilter_csv_files if cluster_set == "Snow-filtered" else _standard_csv_files
+# Base list is the standard (unfiltered) clusters; falls back to the
+# snow-filtered CSV alone if that's all that exists (Snow can't be
+# determined without the standard set to compare against).
+cluster_csv_files = _standard_csv_files or _snowfilter_csv_files
 data_rows = []
 selected_ids = []
 
 if cluster_csv_files:
     cluster_csv_files.sort(key=os.path.getmtime, reverse=True)
+    # Reuses the geojson lists already loaded for the map (_standard_geojson_files /
+    # _snowfilter_geojson_files) to spatially match clusters between the two runs —
+    # DBSCAN assigns Cluster_IDs independently per run, so IDs can't be compared directly.
+    # Note: an empty snowfilter geojson (0 features) is a valid result — it means every
+    # standard cluster was removed by snow filtering — so it's treated differently from
+    # the file simply not existing (no snowfilter run at all -> can't compare -> N/A).
+    _snowfilter_available = bool(_snowfilter_geojson_files)
+    _snowfilter_geoms = _load_cluster_geoms(_snowfilter_geojson_files)
+    _standard_geoms = _load_cluster_geoms(_standard_geojson_files) if _standard_csv_files else {}
     with open(cluster_csv_files[0], mode='r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
+            cid = row["Cluster_ID"]
+            if not _snowfilter_available:
+                snow_flag = "N/A"
+            else:
+                geom = _standard_geoms.get(str(cid))
+                if geom is None:
+                    snow_flag = "N/A"
+                elif any(geom.intersects(g) for g in _snowfilter_geoms.values()):
+                    snow_flag = "No"
+                else:
+                    snow_flag = "Yes"
             data_rows.append({
-                "Cluster_ID": row["Cluster_ID"],
+                "Cluster_ID": cid,
                 "Pixel_Count": int(row["Pixel_Count"]),
                 "Area_m2": float(row["Area_m2"]),
                 "Centroid_Lon": float(row["Centroid_Lon"]),
                 "Centroid_Lat": float(row["Centroid_Lat"]),
+                "Snow": snow_flag,
                 "Selected": " " 
             })
 
@@ -920,19 +987,26 @@ if cluster_csv_files:
 # Display Table
 st.write("---")
 st.subheader("Detected Clusters Summary")
-m_col1, m_col2, m_col3 = st.columns(3)
-m_col1.metric("Total Detected", len(data_rows))
-if data_rows:
-    m_col2.metric("Clusters in Selection", len(selected_ids))
+show_snow_clusters = st.checkbox(
+    "Show also non-snow-filtered clusters", value=False,
+    key=f"show_snow_clusters_{folder_path}",
+    help="Also list clusters that were removed by snow filtering (Snow = Yes).",
+)
+visible_rows = data_rows if show_snow_clusters else [r for r in data_rows if r["Snow"] != "Yes"]
 
-if data_rows:
+m_col1, m_col2, m_col3 = st.columns(3)
+m_col1.metric("Total Detected", len(visible_rows))
+if visible_rows:
+    m_col2.metric("Clusters in Selection", sum(1 for r in visible_rows if r["Selected"] == "In Box"))
+
+if visible_rows:
     st.caption("Click a row to highlight the matching cluster on the map.")
-    df_clusters = pd.DataFrame(data_rows)
+    df_clusters = pd.DataFrame(visible_rows)
 
     # Streamlit reports the current selected row index on every rerun, so
     # selection state always matches the table's current (possibly re-sorted)
     # row order.
-    table_key = f"cluster_table_select_{folder_path}_{cluster_set}"
+    table_key = f"cluster_table_select_{folder_path}"
     _event = st.dataframe(
         df_clusters,
         width=1100, height=400, hide_index=True,
@@ -957,7 +1031,7 @@ if data_rows:
         st.session_state["_selected_cluster_id"] = None
         st.rerun()
 else:
-    st.dataframe(data_rows, width=1100, height=400, hide_index=True)
+    st.dataframe(visible_rows, width=1100, height=400, hide_index=True)
 
 
 # --- 8. Progress Tracking & Execution ---
@@ -987,29 +1061,29 @@ st.sidebar.write(f"**Period:** {calc_start} to {calc_end}")
 
 if drawn_aoi:
     st.sidebar.success(f"AOI Defined: {len(selected_ids)} clusters selected.")
-    if tracking_status == "running":
-        st.sidebar.caption("A tracking analysis is already running.")
-    if st.sidebar.button("Run Tracking Analysis", disabled=(tracking_status == "running")):
-        try:
-            cfg_p = write_timetrack_config(folder_path, drawn_aoi, calc_start,
-                                           calc_end, selected_ids,
-                                           project_id, DRIVE_TOKEN_FILE)
-            script_rel_path = os.path.join("GEE", "tracking_headless.py")
-            subprocess.Popen(
-                [sys.executable, "-u", script_rel_path, cfg_p],
-                cwd=ROOT_DIR,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            tracking_status = "running"
-            st.session_state["tracking_just_launched"] = True
-            st.session_state["tracking_launched_for"] = folder_path
-            st.session_state["tracking_dirs_at_launch"] = {d for _, d in _all_runs}
-            st.rerun()
-        except Exception as e:
-            st.sidebar.error(f"Error: {e}")
 else:
     st.sidebar.info("Draw an area of interest on the map to select clusters for tracking.")
+if tracking_status == "running":
+    st.sidebar.caption("A tracking analysis is already running.")
+if st.sidebar.button("Run Tracking Analysis", disabled=(tracking_status == "running" or not drawn_aoi)):
+    try:
+        cfg_p = write_timetrack_config(folder_path, drawn_aoi, calc_start,
+                                       calc_end, selected_ids,
+                                       project_id, DRIVE_TOKEN_FILE)
+        script_rel_path = os.path.join("GEE", "tracking_headless.py")
+        subprocess.Popen(
+            [sys.executable, "-u", script_rel_path, cfg_p],
+            cwd=ROOT_DIR,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        tracking_status = "running"
+        st.session_state["tracking_just_launched"] = True
+        st.session_state["tracking_launched_for"] = folder_path
+        st.session_state["tracking_dirs_at_launch"] = {d for _, d in _all_runs}
+        st.rerun()
+    except Exception as e:
+        st.sidebar.error(f"Error: {e}")
 
 # --- 9. Multi-Run Display ---
 st.write("### Analysis Progress")
