@@ -194,7 +194,8 @@ def run_pipeline(config_path):
     glo30_proj = glo30.first().projection()
     elev = glo30.select('DEM').mosaic().setDefaultProjection(glo30_proj)
     slope = ee.Terrain.slope(elev.focal_median(4))
-    elev_threshold = get_elevation_threshold_from_nearest_glacier(aoi, elev)
+    # elev_threshold = get_elevation_threshold_from_nearest_glacier(aoi, elev)  # unreliable in some AOIs, see below
+    elev_threshold = 2500  # hardcoded pending fix to nearest-glacier method
     terrain_mask = elev.gt(elev_threshold).And(slope.focal_min(8).lt(6)).clip(aoi)
 
     daysBack = 90

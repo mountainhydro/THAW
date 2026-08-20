@@ -390,15 +390,16 @@ if run_now_clicked:
     st.session_state.pipeline_running = True
     cfg_p = write_job_config(is_manual=True, task_name=task_name_safe)
     script_p = os.path.join(GEE_DIR, "lakedetection_headless.py")
-    status_container = st.empty()
-    status_container.info("Starting pipeline, please wait...")
 
-    process = subprocess.Popen(
+    subprocess.Popen(
         [sys.executable, "-u", script_p, cfg_p],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     st.session_state.pipeline_running = False
-    _time.sleep(8)
+    # Output folder is created by the pipeline itself (after GEE auth), which can take
+    # longer than a fixed sleep — track the expected path and poll for it below instead.
+    name_suffix = f"_{task_name_safe}" if task_name_safe else ""
+    st.session_state.pending_folder = os.path.join(OUTPUT_DIR, f"Outputs_{run_date.isoformat()}{name_suffix}")
     st.rerun()
 
 # 9. Execution Task Scheduling
@@ -483,6 +484,18 @@ def _relaunch_stale_pipeline(folder, log_path):
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     st.info(f"'{os.path.basename(folder)}' had stopped (crash/restart) — automatically relaunched.")
+
+# Newly launched run: its folder doesn't exist until the pipeline finishes GEE auth,
+# so poll for it here instead of relying on a fixed delay before the first rerun.
+pending_folder = st.session_state.get("pending_folder")
+if pending_folder:
+    if os.path.exists(pending_folder):
+        st.session_state.pop("pending_folder", None)
+        st.rerun()
+    else:
+        st.info(f"Starting pipeline for {os.path.basename(pending_folder)}, please wait...")
+        _time.sleep(2)
+        st.rerun()
 
 recent_folders = sorted(
     [f for f, _ in dated_folders],
