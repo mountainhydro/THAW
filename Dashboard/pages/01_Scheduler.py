@@ -280,7 +280,7 @@ draw_data = st_folium(m, width=None, height=550,
 
 aoi_geojson = None
 
-MAX_AOI_AREA_KM2 = 6000
+MAX_AOI_AREA_KM2 = 10000
 if draw_data and draw_data.get("all_drawings"):
     aoi_geojson = draw_data["all_drawings"][-1]["geometry"]
     aoi_area = calculate_bbox_area_km2(aoi_geojson)
