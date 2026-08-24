@@ -20,7 +20,7 @@
 ## Features Overview
 - **Surface Water Detection** from Synthetic Aperture Radar (Sentinel1-SAR) data given a user-define area of interest (AOI). Determination of the anomaly of the latest backscatter data to historic backscatter phenology in each pixel, expressed as a composite z-score for the ascending and descending orbits. Unlike optical satellites, Sentinel-1 radar penetrates clouds and delivers observations also during nighttimes, making it ideal for monitoring flooded areas or seasonal lake changes in mountainous regions.
 
-- **Scope**: Can be used over any mountain area globally, for areas up to 60,000 km<sup>2</sup>, for any date within the timeframe of Sentinel1-SAR (2014 - present). *Event-level tracking is a work-in-progress feature*. 
+- **Scope**: Can be used over any mountain area globally, for areas up to 10,000 km<sup>2</sup> (currently), for any date within the timeframe of Sentinel1-SAR (2014 - present). *Event-level tracking is a work-in-progress feature*. 
 
 - **Lake detection and tracking**: Water bodies appearing anomalous compared to the historical collection of images (10 years back), are automatically flagged and a summary is presented in the *Output and Tracking* window. A ruler can be used to measure lake sizes. In a secondary *tracking* step, the user can select a focus-area and track lakes back in time. The user can pan through the timetagged images and observe the lake evolution. A graph presenting lake area evolution over time is additionally presented.
 
