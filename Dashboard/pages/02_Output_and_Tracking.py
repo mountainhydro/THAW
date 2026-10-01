@@ -763,7 +763,7 @@ if tif_files:
     for tif in tif_files:
         basename = os.path.basename(tif)
         if "true_color" in basename:
-            layer_label = "True Color (Sentinel-2)"
+            layer_label = "True Color (cloud masked)"
             tile_url = rgb_tile_url(TILE_PORT, tif)
             opacity = 1.0
         else:

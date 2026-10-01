@@ -17,7 +17,7 @@ import streamlit as st
 # ── helpers ────────────────────────────────────────────────────────────────
 
 PANEL_CFG = {
-    "true_color":      dict(label="True Color (Sentinel-2)", rgb=True),
+    "true_color":      dict(label="True Color (cloud masked)", rgb=True),
     "VV_corrected":    dict(label="Corrected VV (dB)", cmap=plt.cm.gray,   vmin=-25, vmax=0,  nan_fill=0.5),
     "lake_likelihood": dict(label="Lake Likelihood",   cmap=plt.cm.viridis, vmin=0,  vmax=1,  nan_fill=0.0),
 }
