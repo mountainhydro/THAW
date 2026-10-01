@@ -163,6 +163,11 @@ def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
       mean_area_km2  — likelihood-weighted area within clusters (sum × pixel area)
       upper_area_km2 — pixels within clusters where likelihood >= upper threshold
 
+    Prefers the snow-filtered raster ('<prefix>_<date>_likelihood_snowfilter.tif',
+    see compute_snow_filtered_likelihood in drive_io.py) per date when present,
+    falling back to the raw '<prefix>_<date>_lake_likelihood.tif' otherwise
+    (e.g. no usable Sentinel-2 coverage for that date).
+
     Parameters
     ----------
     out_dir          : str   — directory containing *lake_likelihood*.tif files
@@ -176,7 +181,20 @@ def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
     """
     lower_thresh, mid_thresh, upper_thresh = thresholds
 
-    tif_files = sorted(glob.glob(os.path.join(out_dir, "*lake_likelihood*.tif")))
+    def _date_key(path):
+        basename = os.path.basename(path)
+        match = re.search(r'(\d{4}-\d{2}-\d{2})', basename)
+        if match:
+            return match.group(1)
+        match2 = re.search(r'(\d{4})(\d{2})(\d{2})T\d{6}', basename)
+        return f"{match2.group(1)}-{match2.group(2)}-{match2.group(3)}" if match2 else basename
+
+    raw_files = glob.glob(os.path.join(out_dir, "*_lake_likelihood.tif"))
+    snowfilter_files = glob.glob(os.path.join(out_dir, "*_likelihood_snowfilter.tif"))
+    by_date = {_date_key(p): p for p in raw_files}
+    by_date.update({_date_key(p): p for p in snowfilter_files})
+    tif_files = [by_date[d] for d in sorted(by_date)]
+
     if not tif_files:
         raise ValueError(f"No lake_likelihood TIF files found in {out_dir}")
 
@@ -365,7 +383,7 @@ def generate_lake_metrics_report(
 # ============================================================
 
 PANEL_LABELS = {
-    'VV_raw':          'Raw VV (dB)',
+    'true_color':      'True Color (cloud masked)',
     'VV_corrected':    'Corrected VV (dB)',
     'lake_likelihood': 'Lake Likelihood',
 }
@@ -380,6 +398,13 @@ def _read_masked(path):
         data[data == nodata] = np.nan
     data[data <= -9999] = np.nan
     return data
+
+
+def _read_rgb(path):
+    """Read a 3-band 8-bit true-color GeoTIFF as an (H, W, 3) uint8 array."""
+    with rasterio.open(path) as src:
+        data = src.read([1, 2, 3])
+    return np.transpose(data, (1, 2, 0)).astype(np.uint8)
 
 
 def _render_band(data, cmap, vmin, vmax, nan_fill):
@@ -397,14 +422,14 @@ def _fit_height(im, target_h):
 
 
 def build_lake_monitoring_gif(out_dir, dates, areas_km2,
-                               bands=['VV_raw', 'VV_corrected', 'lake_likelihood'],
+                               bands=['true_color', 'VV_corrected', 'lake_likelihood'],
                                target_size=(1800, 600),
                                gif_filename=None,
                                duration=600,
                                font_path=None):
     """
     Build a lake monitoring GIF from exported TIF files.
-    Panels: Raw VV | Corrected VV | Lake Likelihood, with date and area overlay.
+    Panels: True Color | Corrected VV | Lake Likelihood, with date and area overlay.
     """
     if gif_filename is None:
         gif_filename = os.path.join(out_dir, "lake_monitoring.gif")
@@ -437,27 +462,26 @@ def build_lake_monitoring_gif(out_dir, dates, areas_km2,
             continue
 
         try:
-            vv_raw  = _read_masked(band_paths['VV_raw'])
+            im_true = Image.fromarray(_read_rgb(band_paths['true_color']))
             vv_corr = _read_masked(band_paths['VV_corrected'])
             lkl     = _read_masked(band_paths['lake_likelihood'])
         except Exception as e:
             print(f"Warning: skipping frame {date} — cannot read file: {e}", flush=True)
             continue
 
-        im_raw  = _render_band(vv_raw,  plt.cm.gray,   vmin=-25, vmax=0, nan_fill=0.5)
         im_corr = _render_band(vv_corr, plt.cm.gray,   vmin=-25, vmax=0, nan_fill=0.5)
         im_lkl  = _render_band(lkl,    plt.cm.viridis, vmin=0,   vmax=1, nan_fill=0.0)
 
-        target_h = max(im_raw.height, im_corr.height, im_lkl.height)
-        im_raw   = _fit_height(im_raw,  target_h)
+        target_h = max(im_true.height, im_corr.height, im_lkl.height)
+        im_true  = _fit_height(im_true, target_h)
         im_corr  = _fit_height(im_corr, target_h)
         im_lkl   = _fit_height(im_lkl,  target_h)
 
-        total_w  = im_raw.width + im_corr.width + im_lkl.width
+        total_w  = im_true.width + im_corr.width + im_lkl.width
         combined = Image.new("RGB", (total_w, target_h))
-        combined.paste(im_raw,  (0, 0))
-        combined.paste(im_corr, (im_raw.width, 0))
-        combined.paste(im_lkl,  (im_raw.width + im_corr.width, 0))
+        combined.paste(im_true, (0, 0))
+        combined.paste(im_corr, (im_true.width, 0))
+        combined.paste(im_lkl,  (im_true.width + im_corr.width, 0))
 
         combined = ImageOps.contain(combined, target_size)
 

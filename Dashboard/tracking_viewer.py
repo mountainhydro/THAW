@@ -17,10 +17,20 @@ import streamlit as st
 # ── helpers ────────────────────────────────────────────────────────────────
 
 PANEL_CFG = {
+    "true_color":      dict(label="True Color (Sentinel-2)", rgb=True),
+    "VV_corrected":    dict(label="Corrected VV (dB)", cmap=plt.cm.gray,   vmin=-25, vmax=0,  nan_fill=0.5),
+    "lake_likelihood": dict(label="Lake Likelihood",   cmap=plt.cm.viridis, vmin=0,  vmax=1,  nan_fill=0.0),
+}
+
+# ---- LEGACY: tracking runs from before the true_color/snow_mask export change ----
+# These lack true_color_*.tif and used VV_raw instead. Delete this dict plus
+# _panel_cfg_for_dir()'s VV_raw branch once no such folders need viewing.
+LEGACY_PANEL_CFG = {
     "VV_raw":          dict(label="Raw VV (dB)",       cmap=plt.cm.gray,   vmin=-25, vmax=0,  nan_fill=0.5),
     "VV_corrected":    dict(label="Corrected VV (dB)", cmap=plt.cm.gray,   vmin=-25, vmax=0,  nan_fill=0.5),
     "lake_likelihood": dict(label="Lake Likelihood",   cmap=plt.cm.viridis, vmin=0,  vmax=1,  nan_fill=0.0),
 }
+# ---- END LEGACY ----
 
 def _read_masked(path):
     with rasterio.open(path) as src:
@@ -30,11 +40,24 @@ def _read_masked(path):
     data[data <= -9999] = np.nan
     return data
 
+def _read_rgb(path):
+    """Read a 3-band 8-bit true-color GeoTIFF as an (H, W, 3) uint8 array."""
+    with rasterio.open(path) as src:
+        data = src.read([1, 2, 3])
+    return np.transpose(data, (1, 2, 0)).astype(np.uint8)
+
 def _render_to_pil(data, cmap, vmin, vmax, nan_fill):
     norm = np.clip((data - vmin) / (vmax - vmin), 0, 1)
     norm = np.where(np.isnan(norm), nan_fill, norm)
     rgb  = (cmap(norm)[:, :, :3] * 255).astype(np.uint8)
     return Image.fromarray(rgb)
+
+def _render_panel(path, cfg):
+    """Render one panel: true-color reads RGB directly, others via colormap."""
+    if cfg.get("rgb"):
+        return Image.fromarray(_read_rgb(path))
+    data = _read_masked(path)
+    return _render_to_pil(data, cfg["cmap"], cfg["vmin"], cfg["vmax"], cfg["nan_fill"])
 
 def _pil_to_bytes(im):
     buf = BytesIO()
@@ -51,14 +74,30 @@ def _extract_date(filename):
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
     return os.path.basename(filename)
 
+def _panel_cfg_for_dir(tracking_dir):
+    """
+    Pick the panel set matching what's actually on disk: new true_color runs
+    vs legacy VV_raw runs (see LEGACY_PANEL_CFG above — remove the VV_raw
+    branch once no legacy folders need viewing). Defaults to the new
+    PANEL_CFG if neither is found (e.g. empty/in-progress folder).
+    """
+    if glob.glob(os.path.join(tracking_dir, "*true_color*.tif")):
+        return PANEL_CFG
+    if glob.glob(os.path.join(tracking_dir, "*VV_raw*.tif")):
+        return LEGACY_PANEL_CFG
+    return PANEL_CFG
+
 def _discover_frames(tracking_dir):
     """
-    Returns a list of dicts, one per timestep, sorted by date:
-        [{"date": "2025-06-09", "VV_raw": path, "VV_corrected": path, "lake_likelihood": path}, ...]
-    Only includes timesteps where ALL three bands are present.
+    Returns (frames, panel_cfg):
+        frames     — list of dicts, one per timestep, sorted by date:
+                     [{"date": "2025-06-09", <band>: path, ...}, ...]
+        panel_cfg  — the PANEL_CFG/LEGACY_PANEL_CFG matching this folder's files
+    Only includes timesteps where ALL bands in panel_cfg are present.
     """
+    panel_cfg = _panel_cfg_for_dir(tracking_dir)
     frames = {}
-    for band in PANEL_CFG:
+    for band in panel_cfg:
         for path in sorted(glob.glob(os.path.join(tracking_dir, f"*{band}*.tif"))):
             date = _extract_date(os.path.basename(path))
             frames.setdefault(date, {})[band] = path
@@ -67,9 +106,9 @@ def _discover_frames(tracking_dir):
     complete = {
         date: bands
         for date, bands in frames.items()
-        if all(b in bands for b in PANEL_CFG)
+        if all(b in bands for b in panel_cfg)
     }
-    return [{"date": d, **complete[d]} for d in sorted(complete)]
+    return [{"date": d, **complete[d]} for d in sorted(complete)], panel_cfg
 
 
 # ── viewer section (paste into Output_Preview.py) ──────────────────────────
@@ -105,7 +144,7 @@ def render_tracking_viewer(tracking_dir, title="Tracking Results Viewer"):
         st.info("No tracking results found for this date. Run a tracking analysis first.")
         return
 
-    frames = _discover_frames(tracking_dir)
+    frames, panel_cfg = _discover_frames(tracking_dir)
 
     if not frames:
         st.warning("No time tracking results available. Please draw AOI and launch a tracking analysis.")
@@ -135,11 +174,10 @@ def render_tracking_viewer(tracking_dir, title="Tracking Results Viewer"):
 
     # ── render three panels + baked captions as one image ──
     panels, captions = [], []
-    for band in PANEL_CFG:
-        cfg = PANEL_CFG[band]
+    for band in panel_cfg:
+        cfg = panel_cfg[band]
         try:
-            data = _read_masked(frame[band])
-            im   = _render_to_pil(data, cfg["cmap"], cfg["vmin"], cfg["vmax"], cfg["nan_fill"])
+            im = _render_panel(frame[band], cfg)
             ratio = panel_w / im.width
             im = im.resize((panel_w, max(1, int(im.height * ratio))), Image.LANCZOS)
             panels.append(im)

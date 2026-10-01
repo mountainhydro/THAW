@@ -28,6 +28,11 @@ from gee_core import (
     compute_temporal_spatial_mean,
     apply_temporal_spatial_smoothing_by_orbit,
     likelihood_score,
+    build_monthly_composites,
+    build_yearly_snapshot_composites,
+    get_sentinel2_mosaic,
+    get_snow_mask,
+    get_true_color_image,
 )
 from thinning import (
     load_aoi,
@@ -36,7 +41,7 @@ from thinning import (
     get_glacier_thinning_correction,
 )
 from reporting import generate_lake_metrics_report
-from drive_io import Logger, export_images_via_drive, CancelledError
+from drive_io import Logger, export_images_via_drive, compute_snow_filtered_likelihood, CancelledError
 from gee_auth import initialize_ee, build_drive_service
 
 
@@ -45,6 +50,10 @@ from gee_auth import initialize_ee, build_drive_service
 # ============================================================
 
 CHECKPOINT_FILE = "tracking_checkpoint.json"
+
+# Server-side safety net against runaway export/download counts — keep in sync
+# with MAX_FRAMES_HARD_CAP in Dashboard/pages/02_Output_and_Tracking.py.
+MAX_FRAMES_HARD_CAP = 60
 
 def retry(fn, label, max_attempts=5, base_wait=30):
     import time as _time
@@ -101,6 +110,12 @@ def run_tracking_pipeline(config_path):
     rel_out_dir = cfg.get("rel_output_dir")
     task_name   = cfg.get("task_name", "tracking")
 
+    # Multi-scale tracking: "days" (default) exports every raw scene, unchanged;
+    # "months"/"years" composite scenes per period to bound the export count.
+    interval_unit  = cfg.get("interval_unit", "days")
+    interval_value = cfg.get("interval_value")
+    season_window  = cfg.get("season_window") or {}
+
     # ROOT_DIR is the cwd when launched by the dashboard.
     # Explicitly chdir to it so relative paths inside inputs.py
     # (e.g. thinning_cache) resolve against ROOT_DIR.
@@ -145,8 +160,16 @@ def run_tracking_pipeline(config_path):
     if ckpt and "download" in ckpt.get("steps_complete", []):
         print(f"Resuming incomplete tracking pipeline from checkpoint.", flush=True)
         done = ckpt.get("steps_complete", [])
+        if "snowfilter" not in done:
+            print("Step 2/3: Computing local snow-filtered likelihood...", flush=True)
+            retry(
+                lambda: compute_snow_filtered_likelihood(final_out_dir_str),
+                label="Local snow-filter", max_attempts=3, base_wait=10,
+            )
+            done.append("snowfilter")
+            write_checkpoint(final_out_dir_str, steps_complete=done)
         if "reporting" not in done:
-            print("Step 2/2: Generating lake metrics report...", flush=True)
+            print("Step 3/3: Generating lake metrics report...", flush=True)
             retry(
                 lambda: generate_lake_metrics_report(output_dir=final_out_dir_str),
                 label="Reporting", max_attempts=3, base_wait=10,
@@ -222,9 +245,73 @@ def run_tracking_pipeline(config_path):
 
 
 # ============================================================
+# TEMPORAL COMPOSITING (multi-scale tracking)
+# ============================================================
+    sar_bands = ["VV_corrected", "lake_likelihood"]
+
+    if interval_unit == "months":
+        print(f"Compositing into monthly composites ({interval_value} months)...", flush=True)
+        export_collection = build_monthly_composites(s1_scored, start_date, end_date, bands=sar_bands)
+    elif interval_unit == "years":
+        print(f"Compositing into yearly season-window snapshots ({interval_value} years)...", flush=True)
+        export_collection = build_yearly_snapshot_composites(
+            s1_scored, start_date, end_date,
+            season_window.get("start_month", 6), season_window.get("start_day", 1),
+            season_window.get("end_month", 9), season_window.get("end_day", 30),
+            bands=sar_bands,
+        )
+    else:
+        export_collection = s1_scored.select(sar_bands)
+
+    frame_count = export_collection.size().getInfo()
+    print(f"Export frame count: {frame_count} (interval_unit={interval_unit})", flush=True)
+
+    if frame_count == 0:
+        print("WARNING: No imagery found for the specified period/season window. Terminating.", flush=True)
+        return "No imagery found."
+
+    if frame_count > MAX_FRAMES_HARD_CAP:
+        print(f"CRITICAL: {frame_count} frames exceeds the hard cap of {MAX_FRAMES_HARD_CAP} "
+              f"— aborting before submitting any export tasks.", flush=True)
+        return f"Aborted: {frame_count} frames exceeds hard cap of {MAX_FRAMES_HARD_CAP}."
+
+
+# ============================================================
+# SENTINEL-2 SNOW MASK + TRUE COLOR (per frame)
+# ============================================================
+    print("Building Sentinel-2 snow mask / true-color image per frame...", flush=True)
+    frame_list = export_collection.toList(frame_count)
+    augmented_images = []
+    for i in range(frame_count):
+        img = ee.Image(frame_list.get(i))
+        img_time = img.get('system:time_start').getInfo()
+        frame_date = datetime.datetime.fromtimestamp(img_time / 1000, tz=datetime.timezone.utc).replace(tzinfo=None)
+        s2_mosaic = get_sentinel2_mosaic(aoi, frame_date)
+        if s2_mosaic.bandNames().size().getInfo() == 0:
+            # No Sentinel-2 coverage (e.g. pre-2015 frames, before S2A launch) —
+            # placeholder snow_mask/true_color instead of crashing on .select().
+            print(f"  No Sentinel-2 coverage for {frame_date.date()} — using placeholders.", flush=True)
+            snow_mask = ee.Image.constant(0).rename('snow_mask')
+            true_color = ee.Image.constant([128, 128, 128]).toByte().rename(
+                ['true_color_R', 'true_color_G', 'true_color_B']
+            )
+        else:
+            snow_mask = get_snow_mask(aoi, frame_date, mosaic=s2_mosaic)
+            true_color = get_true_color_image(s2_mosaic).rename(
+                ['true_color_R', 'true_color_G', 'true_color_B']
+            )
+        augmented_images.append(
+            img.addBands(snow_mask).addBands(true_color).set('system:time_start', img_time)
+        )
+    export_collection = ee.ImageCollection(augmented_images)
+
+    bands = ["true_color", "VV_corrected", "lake_likelihood", "snow_mask"]
+    band_groups = {"true_color": ["true_color_R", "true_color_G", "true_color_B"]}
+
+
+# ============================================================
 # EXPORT AND DOWNLOAD
 # ============================================================
-    bands = ["VV_raw", "VV_corrected", "lake_likelihood"]
 
     # Write initial checkpoint
     write_checkpoint(final_out_dir_str, steps_complete=[])
@@ -232,7 +319,7 @@ def run_tracking_pipeline(config_path):
     done = ckpt.get("steps_complete", [])
 
     if "download" not in done:
-        print("Step 1/2: Launching GEE Drive export tasks...", flush=True)
+        print("Step 1/3: Launching GEE Drive export tasks...", flush=True)
         submission_date = datetime.datetime.now().strftime("%Y%m%d")
         _center_lon = (aoi_input[0] + aoi_input[2]) / 2
         _center_lat = (aoi_input[1] + aoi_input[3]) / 2
@@ -240,10 +327,11 @@ def run_tracking_pipeline(config_path):
         prefix = f"{task_name}_{submission_date}_{coord_tag}"
         retry(
             lambda: export_images_via_drive(
-                s1_scored,
+                export_collection,
                 aoi,
                 token_path=cfg.get("drive_token_path"),
                 bands_to_export=bands,
+                band_groups=band_groups,
                 output_dir=final_out_dir_str,
                 prefix=prefix,
             ),
@@ -252,14 +340,31 @@ def run_tracking_pipeline(config_path):
         done.append("download")
         write_checkpoint(final_out_dir_str, steps_complete=done)
     else:
-        print("Step 1/2: Download already complete, skipping.", flush=True)
+        print("Step 1/3: Download already complete, skipping.", flush=True)
+
+
+# ============================================================
+# LOCAL SNOW-FILTER COMBINATION
+# ============================================================
+    if "snowfilter" not in done:
+        print("Step 2/3: Computing local snow-filtered likelihood...", flush=True)
+        retry(
+            lambda: compute_snow_filtered_likelihood(final_out_dir_str),
+            label="Local snow-filter",
+            max_attempts=3,
+            base_wait=10,
+        )
+        done.append("snowfilter")
+        write_checkpoint(final_out_dir_str, steps_complete=done)
+    else:
+        print("Step 2/3: Local snow-filter already complete, skipping.", flush=True)
 
 
 # ============================================================
 # REPORTING
 # ============================================================
     if "reporting" not in done:
-        print("Step 2/2: Generating lake metrics report...", flush=True)
+        print("Step 3/3: Generating lake metrics report...", flush=True)
         retry(
             lambda: generate_lake_metrics_report(output_dir=final_out_dir_str),
             label="Reporting",
@@ -269,7 +374,7 @@ def run_tracking_pipeline(config_path):
         done.append("reporting")
         write_checkpoint(final_out_dir_str, steps_complete=done)
     else:
-        print("Step 2/2: Reporting already complete, skipping.", flush=True)
+        print("Step 3/3: Reporting already complete, skipping.", flush=True)
 
     clear_checkpoint(final_out_dir_str)
     try:

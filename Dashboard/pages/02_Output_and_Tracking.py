@@ -3,6 +3,8 @@ import re as _re
 import streamlit as st
 import os
 import glob
+import calendar
+import math
 import numpy as np
 import folium
 import json
@@ -63,12 +65,10 @@ def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=Non
     Returns (html_bytes, filename) or (None, None) if no data found.
     """
     import pandas as pd
-    from tracking_viewer import (
-        PANEL_CFG, _read_masked, _render_to_pil, _discover_frames
-    )
+    from tracking_viewer import _render_panel, _discover_frames
     from PIL import ImageDraw, ImageFont
 
-    frames = _discover_frames(tracking_dir)
+    frames, panel_cfg = _discover_frames(tracking_dir)
     if not frames:
         return None, None
 
@@ -80,10 +80,9 @@ def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=Non
     frame_b64 = []
     for frame in frames:
         panels, captions = [], []
-        for band, cfg in PANEL_CFG.items():
+        for band, cfg in panel_cfg.items():
             try:
-                data = _read_masked(frame[band])
-                im   = _render_to_pil(data, cfg["cmap"], cfg["vmin"], cfg["vmax"], cfg["nan_fill"])
+                im = _render_panel(frame[band], cfg)
                 ratio = PANEL_W / im.width
                 im = im.resize((PANEL_W, max(1, int(im.height * ratio))), Image.LANCZOS)
                 panels.append(im)
@@ -264,8 +263,8 @@ def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=Non
                     bounds=[[south, west], [north, east]],
                     name="Z-Score", opacity=0.7, interactive=False
                 ).add_to(fm)
-                # Tracking AOI bounding box from first VV_raw TIF
-                trk_tifs = sorted(glob.glob(os.path.join(tracking_dir, "*VV_raw*.tif")))
+                # Tracking AOI bounding box from first VV_corrected TIF
+                trk_tifs = sorted(glob.glob(os.path.join(tracking_dir, "*VV_corrected*.tif")))
                 if trk_tifs:
                     try:
                         with rasterio.open(trk_tifs[0]) as _ts:
@@ -419,7 +418,9 @@ def make_combined_legend(layers_present, vis_by_layer):
     return folium.Element(html)
 
 
-def write_timetrack_config(folder_path, aoi, start_date, end_date, selected_ids, proj_id, drive_token_path):
+def write_timetrack_config(folder_path, aoi, start_date, end_date, selected_ids, proj_id,
+                           drive_token_path, interval_unit="days", interval_value=None,
+                           season_window=None):
     """
     Saves config using relative paths and GEE auth info to ensure transferability.
     """
@@ -442,6 +443,9 @@ def write_timetrack_config(folder_path, aoi, start_date, end_date, selected_ids,
         "task_name": task_name,
         "project_id": proj_id,
         "drive_token_path": drive_token_path,
+        "interval_unit": interval_unit,
+        "interval_value": interval_value,
+        "season_window": season_window,
         "processed_at": datetime.now().isoformat()
     }
     
@@ -511,6 +515,10 @@ GEE_DIR = os.path.join(ROOT_DIR, "GEE")
 OUTPUT_DIR = os.path.join(ROOT_DIR, "Outputs")
 CONFIG_DIR = os.path.join(ROOT_DIR, "config")
 os.makedirs(CONFIG_DIR, exist_ok=True)
+
+# Hard cap on tracking export frames — keep in sync with MAX_FRAMES_HARD_CAP
+# in GEE/tracking_headless.py (which enforces it server-side too).
+MAX_FRAMES_HARD_CAP = 60
 
 # Local tile server for lazily serving raster layers (only tiles visible in
 # the viewport are rendered/transferred, avoiding Streamlit's message-size cap)
@@ -639,6 +647,12 @@ if _pending_zoom:
 elif _persisted_view:
     center = _persisted_view["center"]
     zoom_start = _persisted_view["zoom"]
+    # Reapply the same fit_bounds() call every rerun (not just the first) so
+    # the generated map script stays byte-identical across reruns for this
+    # folder — st_folium remounts the iframe (wiping in-progress AOI
+    # drawings) whenever the script changes, and a fit_bounds() present on
+    # one render but missing on the next was exactly such a mismatch.
+    fit_bounds = _persisted_view.get("fit_bounds")
 elif tif_files:
     try:
         with rasterio.open(tif_files[0]) as src:
@@ -652,7 +666,7 @@ elif tif_files:
 # Remember whichever view we just decided on, so later unrelated reruns
 # (tracking-status polling, etc.) reuse it instead of recomputing from
 # scratch and resetting the user's zoom.
-st.session_state["_map_view"] = {"center": center, "zoom": zoom_start}
+st.session_state["_map_view"] = {"center": center, "zoom": zoom_start, "fit_bounds": fit_bounds}
 st.session_state["_map_view_folder"] = folder_path
 
 # Discover all tracking runs before building the map (needed for bounding boxes)
@@ -782,7 +796,7 @@ if leg:
 
 # One dashed bounding box per tracking run, individually named in the LayerControl
 for _bb_label, _bb_dir in _all_runs:
-    _bb_tifs = sorted(glob.glob(os.path.join(_bb_dir, "*VV_raw*.tif")))
+    _bb_tifs = sorted(glob.glob(os.path.join(_bb_dir, "*VV_corrected*.tif")))
     if not _bb_tifs:
         continue
     try:
@@ -1054,10 +1068,65 @@ for _lbl, _tdir in _all_runs:
 
 st.sidebar.header("Cluster tracking over time")
 base_date_dt = datetime.strptime(selected_folder_date, "%Y-%m-%d")
-days_back = st.sidebar.slider("Look-back period (days)", 1, 180, 90)
-calc_start = (base_date_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
+
+def _subtract_interval(base_dt, unit, value):
+    """Subtract days/months/years from base_dt (calendar-aware, no dateutil dependency)."""
+    if unit == "Days":
+        return base_dt - timedelta(days=value)
+    months = value if unit == "Months" else value * 12
+    total_months_idx = base_dt.month - 1 - months
+    year = base_dt.year + total_months_idx // 12
+    month = total_months_idx % 12 + 1
+    day = min(base_dt.day, calendar.monthrange(year, month)[1])
+    return base_dt.replace(year=year, month=month, day=day)
+
+# "Days" composites nothing (unchanged per-scene export); "Months"/"Years"
+# composite scenes per period on the GEE side to bound the export count —
+# see build_monthly_composites/build_yearly_snapshot_composites in gee_core.py.
+interval_unit_label = st.sidebar.selectbox("Interval unit", ["Days", "Months", "Years"])
+_UNIT_BOUNDS = {"Days": (1, 180, 90), "Months": (1, 36, 12), "Years": (1, 12, 5)}
+_lo, _hi, _default = _UNIT_BOUNDS[interval_unit_label]
+interval_value = st.sidebar.slider(
+    f"Look-back period ({interval_unit_label.lower()})",
+    _lo, _hi, _default,
+)
+
+season_window = None
+if interval_unit_label == "Years":
+    st.sidebar.caption(
+        "Each year is snapshotted from the same seasonal window. Please define below."
+    )
+    _MONTH_NAMES = list(calendar.month_name)[1:]  # index 0 is "" — skip it
+    _sw_col1, _sw_col2 = st.sidebar.columns(2)
+    _season_start_month = _sw_col1.selectbox("Season start", _MONTH_NAMES, index=5)  # June
+    _season_end_month = _sw_col2.selectbox("Season end", _MONTH_NAMES, index=8)      # September
+    _start_month_num = _MONTH_NAMES.index(_season_start_month) + 1
+    _end_month_num = _MONTH_NAMES.index(_season_end_month) + 1
+    season_window = {
+        "start_month": _start_month_num, "start_day": 1,
+        "end_month": _end_month_num,
+        "end_day": calendar.monthrange(2001, _end_month_num)[1],  # last day of that month
+    }
+
+calc_start = _subtract_interval(base_date_dt, interval_unit_label, interval_value).strftime("%Y-%m-%d")
 calc_end   = (base_date_dt + timedelta(days=12)).strftime("%Y-%m-%d")
 st.sidebar.write(f"**Period:** {calc_start} to {calc_end}")
+
+# Approximate — actual frame count depends on real S1 image availability;
+# the pipeline enforces the same cap server-side regardless of this estimate.
+estimated_frames = math.ceil(interval_value / 8) if interval_unit_label == "Days" else interval_value
+over_frame_cap = estimated_frames > MAX_FRAMES_HARD_CAP
+if over_frame_cap:
+    st.sidebar.error(
+        f"Estimated ~{estimated_frames} frames exceeds the hard cap of "
+        f"{MAX_FRAMES_HARD_CAP}. Reduce the look-back period to proceed."
+    )
+else:
+    # 4 bands (true_color, VV_corrected, lake_likelihood, snow_mask) exported per frame
+    st.sidebar.caption(
+        f"Estimated frames to export: ~{estimated_frames} "
+        f"(~{estimated_frames * 4} download tasks at 4 bands/frame)"
+    )
 
 if drawn_aoi:
     st.sidebar.success(f"AOI Defined: {len(selected_ids)} clusters selected.")
@@ -1065,11 +1134,15 @@ else:
     st.sidebar.info("Draw an area of interest on the map to select clusters for tracking.")
 if tracking_status == "running":
     st.sidebar.caption("A tracking analysis is already running.")
-if st.sidebar.button("Run Tracking Analysis", disabled=(tracking_status == "running" or not drawn_aoi)):
+if st.sidebar.button("Run Tracking Analysis",
+                     disabled=(tracking_status == "running" or not drawn_aoi or over_frame_cap)):
     try:
         cfg_p = write_timetrack_config(folder_path, drawn_aoi, calc_start,
                                        calc_end, selected_ids,
-                                       project_id, DRIVE_TOKEN_FILE)
+                                       project_id, DRIVE_TOKEN_FILE,
+                                       interval_unit=interval_unit_label.lower(),
+                                       interval_value=interval_value,
+                                       season_window=season_window)
         script_rel_path = os.path.join("GEE", "tracking_headless.py")
         subprocess.Popen(
             [sys.executable, "-u", script_rel_path, cfg_p],

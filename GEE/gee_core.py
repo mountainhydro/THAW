@@ -17,8 +17,9 @@ Sections
 3. Historical collection  (lakedetection pipeline)
 4. S1 preprocessing       (tracking pipeline)
 5. Temporal smoothing     (tracking pipeline)
-6. Water likelihood       (tracking pipeline + shared)
-7. Sentinel-2 snow masking & true color (lakedetection pipeline)
+6. Temporal compositing   (tracking pipeline, multi-scale)
+7. Water likelihood       (tracking pipeline + shared)
+8. Sentinel-2 snow masking & true color (lakedetection pipeline)
 """
 
 import ee
@@ -475,7 +476,107 @@ def apply_temporal_spatial_smoothing_by_orbit(collection, smoothing_fn, smoothed
 
 
 # ============================================================
-# 6. WATER LIKELIHOOD
+# 6. TEMPORAL COMPOSITING — TRACKING PIPELINE (multi-scale)
+# ============================================================
+
+def build_monthly_composites(s1_scored, start_date, end_date,
+                              bands=('VV_corrected', 'lake_likelihood')):
+    """
+    Reduce a scored Sentinel-1 collection to one median composite per calendar month.
+
+    Used for "annual"-scale tracking (months-based lookback) so the number of
+    exported frames stays bounded regardless of the underlying scene revisit
+    rate. Months with no imagery are skipped. `s1_scored` is assumed already
+    filtered to [start_date, end_date] (e.g. via preprocess_s1_collection).
+
+    Parameters
+    ----------
+    s1_scored : ee.ImageCollection
+        Collection after preprocessing, smoothing and likelihood scoring.
+    start_date, end_date : str
+        ISO date strings bounding the overall range.
+    bands : tuple[str], optional
+        SAR bands to carry into each composite (default the 2 bands the
+        tracking pipeline composites; Sentinel-2 snow_mask/true_color bands
+        are layered on per-frame afterward, not composited here).
+
+    Returns
+    -------
+    ee.ImageCollection
+        One image per non-empty calendar month, tagged with 'system:time_start'
+        set to the 1st of that month.
+    """
+    start = ee.Date(start_date)
+    end = ee.Date(end_date)
+    n_months = end.difference(start, 'month').ceil()
+    month_starts = ee.List.sequence(0, n_months.subtract(1)).map(
+        lambda i: start.advance(i, 'month')
+    )
+
+    def _composite(month_start):
+        month_start = ee.Date(month_start)
+        month_end = month_start.advance(1, 'month')
+        monthly = s1_scored.filterDate(month_start, month_end).select(list(bands))
+        return monthly.median() \
+            .set('system:time_start', month_start.millis()) \
+            .set('_frame_count', monthly.size())
+
+    composites = ee.ImageCollection(month_starts.map(_composite))
+    return composites.filter(ee.Filter.gt('_frame_count', 0))
+
+
+def build_yearly_snapshot_composites(s1_scored, start_date, end_date,
+                                      season_start_month, season_start_day,
+                                      season_end_month, season_end_day,
+                                      bands=('VV_corrected', 'lake_likelihood')):
+    """
+    Reduce a scored Sentinel-1 collection to one median snapshot per year, each
+    built from the same seasonal window (e.g. Jun 1 - Sep 30) so multi-year
+    comparisons aren't confounded by within-year seasonal backscatter variation.
+
+    Used for "decadal"-scale tracking (years-based lookback). Years whose season
+    window has no imagery are skipped. `s1_scored` is assumed already filtered
+    to [start_date, end_date] (e.g. via preprocess_s1_collection).
+
+    Parameters
+    ----------
+    s1_scored : ee.ImageCollection
+        Collection after preprocessing, smoothing and likelihood scoring.
+    start_date, end_date : str
+        ISO date strings bounding the overall range.
+    season_start_month, season_start_day, season_end_month, season_end_day : int
+        Season window applied within every year (end must fall after start
+        within the same year; the window does not wrap across New Year's Eve).
+    bands : tuple[str], optional
+        SAR bands to carry into each composite (default the 2 bands the
+        tracking pipeline composites; Sentinel-2 snow_mask/true_color bands
+        are layered on per-frame afterward, not composited here).
+
+    Returns
+    -------
+    ee.ImageCollection
+        One image per year with imagery in its season window, tagged with
+        'system:time_start' set to that year's season-start date.
+    """
+    start_year = ee.Date(start_date).get('year')
+    end_year = ee.Date(end_date).get('year')
+    years = ee.List.sequence(start_year, end_year)
+
+    def _composite(year):
+        year = ee.Number(year)
+        season_start = ee.Date.fromYMD(year, season_start_month, season_start_day)
+        season_end = ee.Date.fromYMD(year, season_end_month, season_end_day).advance(1, 'day')
+        yearly = s1_scored.filterDate(season_start, season_end).select(list(bands))
+        return yearly.median() \
+            .set('system:time_start', season_start.millis()) \
+            .set('_frame_count', yearly.size())
+
+    composites = ee.ImageCollection(years.map(_composite))
+    return composites.filter(ee.Filter.gt('_frame_count', 0))
+
+
+# ============================================================
+# 7. WATER LIKELIHOOD
 # ============================================================
 
 def likelihood_score(img):
@@ -526,7 +627,7 @@ def simple_threshold(image, threshold=-14):
 
 
 # ============================================================
-# 7. SENTINEL-2 SNOW MASKING & TRUE COLOR — LAKEDETECTION PIPELINE
+# 8. SENTINEL-2 SNOW MASKING & TRUE COLOR — LAKEDETECTION PIPELINE
 # ============================================================
 
 def get_sentinel2_mosaic(aoi, ref_date, lookback_days=14, extension_days=7,
@@ -582,21 +683,28 @@ def get_sentinel2_mosaic(aoi, ref_date, lookback_days=14, extension_days=7,
 
         return joined.map(mask_clouds).median().clip(aoi)
 
+    def _coverage(mosaic):
+        # median() of an empty S2 collection (e.g. pre-2015, before S2A launch)
+        # yields a bandless image — .select('B3') would crash, so treat that
+        # as zero coverage instead.
+        if mosaic.bandNames().size().getInfo() == 0:
+            return 0.0
+        coverage = mosaic.select('B3').mask().reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=aoi,
+            scale=scale,
+            maxPixels=1e9,
+            bestEffort=True,
+        ).get('B3')
+        return ee.Number(ee.Algorithms.If(coverage, coverage, 0)).getInfo()
+
     period_start = ref_date - datetime.timedelta(days=lookback_days)
     mosaic = build_mosaic(period_start)
-
-    coverage = mosaic.select('B3').mask().reduceRegion(
-        reducer=ee.Reducer.mean(),
-        geometry=aoi,
-        scale=scale,
-        maxPixels=1e9,
-        bestEffort=True,
-    ).get('B3')
-    coverage = ee.Number(ee.Algorithms.If(coverage, coverage, 0)).getInfo()
+    coverage = _coverage(mosaic)
 
     if coverage < coverage_thres:
         extended_days = lookback_days + extension_days
-        print(f"Sentinel-2 mosaic: only {coverage:.0%} AOI coverage in {lookback_days}-day window, "
+        print(f"Snow filter, Sentinel-2 mosaic: only {coverage:.0%} AOI coverage in {lookback_days}-day window, "
               f"extending to {extended_days} days.", flush=True)
         period_start = ref_date - datetime.timedelta(days=extended_days)
         mosaic = build_mosaic(period_start)

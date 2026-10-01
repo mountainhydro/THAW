@@ -536,7 +536,8 @@ def export_and_download(images_to_export, reference_date, aoi, token_path,
 
 def export_images_via_drive(s1_collection, aoi_ee, token_path,
                             bands_to_export=None, output_dir="outputs",
-                            prefix="tracking", scale=10, drive_folder="GEE_Exports"):
+                            prefix="tracking", scale=10, drive_folder="GEE_Exports",
+                            band_groups=None):
     """
     Export each image × band from a Sentinel-1 collection to Drive, download
     locally, then delete from Drive. Used by the tracking pipeline.
@@ -560,9 +561,15 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
         Export resolution in metres (default 10).
     drive_folder : str, optional
         GEE Drive export folder name (default 'GEE_Exports').
+    band_groups : dict[str, list[str]], optional
+        Maps a logical band name in bands_to_export to multiple underlying
+        ee.Image band names selected and exported together as one multi-band
+        GeoTIFF (e.g. {'true_color': ['true_color_R', 'true_color_G', 'true_color_B']}).
+        Band names not present default to selecting themselves (single-band export).
     """
     if bands_to_export is None:
         bands_to_export = ["VV_raw", "VV_corrected", "VV_smoothed"]
+    band_groups = band_groups or {}
 
     os.makedirs(output_dir, exist_ok=True)
     drive_service = build_drive_service(token_path)
@@ -650,7 +657,8 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
         [(lp, fp, i, b, im, id_) for lp, fp, i, b, im, id_ in expected if not _is_valid_tif(lp)]
     for local_path, file_prefix, i, band, img, img_date in items_to_submit:
         try:
-            band_image = img.select(band).clip(aoi_ee)
+            select_bands = band_groups.get(band, [band])
+            band_image = img.select(select_bands).clip(aoi_ee)
             safe_desc  = _re.sub(r'[^A-Za-z0-9_\-]', '_', file_prefix)[:100]
             task = ee.batch.Export.image.toDrive(
                 image=band_image,
@@ -752,6 +760,73 @@ def compute_snow_filtered_zscore(local_dir, run_label):
 
     print(f"Computed local snow-filtered z-score: {os.path.basename(out_path)}", flush=True)
     return out_path
+
+
+def compute_snow_filtered_likelihood(output_dir):
+    """
+    Build snow-filtered lake-likelihood rasters for every downloaded tracking
+    frame. Directory-wide equivalent of compute_snow_filtered_zscore() — the
+    tracking pipeline has one frame per date/period instead of a single
+    run_label, so each '<prefix>_<date>_snow_mask.tif' is paired with its
+    matching '<prefix>_<date>_lake_likelihood.tif' by filename.
+
+    Writes '<prefix>_<date>_likelihood_snowfilter.tif' (snow-flagged pixels
+    set to NaN) next to the inputs. Frames missing either input are skipped
+    (already logged as a warning) — extract_cluster_area_timeseries() falls
+    back to the raw likelihood raster for those.
+
+    Parameters
+    ----------
+    output_dir : str — tracking results folder containing the downloaded GeoTIFFs
+
+    Returns
+    -------
+    int — number of snow-filtered rasters written (including ones already present)
+    """
+    written = 0
+    for mask_path in sorted(glob.glob(os.path.join(output_dir, "*_snow_mask.tif"))):
+        likelihood_path = mask_path.replace("_snow_mask.tif", "_lake_likelihood.tif")
+        out_path = mask_path.replace("_snow_mask.tif", "_likelihood_snowfilter.tif")
+
+        if _is_valid_tif(out_path):
+            written += 1
+            continue
+        if not (_is_valid_tif(likelihood_path) and _is_valid_tif(mask_path)):
+            print(f"Skipping local snow-filter: missing input for {os.path.basename(mask_path)}", flush=True)
+            continue
+
+        with rasterio.open(likelihood_path) as l_src:
+            l_data    = l_src.read(1).astype("float32")
+            l_profile = l_src.profile.copy()
+
+        with rasterio.open(mask_path) as m_src:
+            same_grid = (
+                m_src.transform == l_profile["transform"] and
+                m_src.width == l_profile["width"] and
+                m_src.height == l_profile["height"] and
+                m_src.crs == l_profile["crs"]
+            )
+            if same_grid:
+                mask_data = m_src.read(1)
+            else:
+                mask_data = np.zeros((l_profile["height"], l_profile["width"]), dtype=m_src.dtypes[0])
+                reproject(
+                    source=rasterio.band(m_src, 1),
+                    destination=mask_data,
+                    dst_transform=l_profile["transform"],
+                    dst_crs=l_profile["crs"],
+                    resampling=Resampling.nearest,
+                )
+
+        out_data = np.where(mask_data.astype(bool), np.nan, l_data)
+        l_profile.update(dtype="float32", nodata=np.nan)
+
+        with rasterio.open(out_path, "w", **l_profile) as dst:
+            dst.write(out_data, 1)
+        written += 1
+
+    print(f"Computed {written} snow-filtered likelihood raster(s).", flush=True)
+    return written
 
 
 def convert_to_cog(folder):
