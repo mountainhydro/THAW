@@ -134,8 +134,10 @@ Permissions: "Run as Administrator" may be required to register new scheduled ta
 
 ## Troubleshooting
 
-Logs: If the processing does not finish successfully, look at pipeline_log_[timestamp].txt is generated inside the specific date folder in /Outputs.
+**Slowdown**: If you used THAW intensively, or processed large areas repeatedly, you might run into the limit of your GEE quota, which is 540'000 EECU-seconds per month. Once this happens, the tasks are queuing unreasonably long. You can monitor you quota here: https://console.cloud.google.com/iam-admin/quotas/. You have to type "earthengine" under "Enter property name and value" next to "Filter", and select "monthly_eecu_usage_time". You have the option of lifting up your quota by moving your GEE project from *Community* tier to *Contributer* tier on GEE.
 
-Missing Credentials: Check the temp/ folder. If the GEE_credentials are missing, you will need to re-enter your Project ID and JSON path.
+**Logs**: If the processing does not finish successfully, look at pipeline_log_[timestamp].txt is generated inside the specific date folder in /Outputs.
 
-Task Errors: Reach out by creating an issue in case you cannot make sense of the error logs, or if you fail to restart the processing.
+**Missing Credentials**: Check the temp/ folder. If the GEE_credentials are missing, you will need to re-enter your Project ID and JSON path.
+
+**Task Errors**: Reach out by creating an issue or sending an Email in case you cannot make sense of the error logs, or if you fail to restart the processing.
