@@ -39,7 +39,7 @@
 
   - Mean Difference: Highlighting gain or loss of water surface area.
 
-- **Snow Filtering**: Detected clusters are automatically checked against a Sentinel-2 optical snow mask to flag likely false positives caused by snow or ice cover, see *Inspecting Results* below for details.
+- **Snow Filtering**: Detected clusters are automatically checked against a Sentinel-2 optical snow mask to flag likely false positives caused by wet snow, see *Inspecting Results* below for details.
 
 - **Task Monitoring**: For manual analysis, processing progress is displayed on the dashboard. An overview of scheduled tasks is presented including "Last Run" timestamps and Windows success/error on the *Scheduler* page. A time-stamped log file is written to the output folder with the print-outs and errors from each run.
 
@@ -82,7 +82,7 @@ In short, the following things are needed for running THAW:
   **Instantaneous run**:
   - Select a task name (e.g. "Purepu")
   - Select run date
-  - Select AOI (up to 60,000 km<sup>2</sup>)
+  - Select AOI (up to 30,000 km<sup>2</sup>)
   - Click **Run job now**
     
   **Scheduled task**: Additionally,
@@ -102,13 +102,19 @@ In short, the following things are needed for running THAW:
 
 - A ruler tool can be used to measure lake sizes directly on the map.
 
-- **Snow Filtering**: A Sentinel-2 snow mask (based on NDSI and NIR thresholds) is used to flag detected clusters that coincide with snow or ice cover and are therefore likely false positives rather than surface water bodies. Each cluster in the summary table is labeled with a "Snow" flag (Yes/No/N/A), and snow-flagged clusters are hidden by default (a checkbox lets you show them again). A dedicated snow-filtered Z-Score layer is also available on the map.
+- **Snow Filtering**: A Sentinel-2 snow mask (based on NDSI and NIR thresholds) is used to flag detected clusters that coincide with snow or ice cover and are therefore likely false positives rather than surface water bodies. Each cluster in the summary table is labeled with a "Snow" flag (Yes/No), and snow-flagged clusters are hidden by default (a checkbox lets you show them again). A dedicated snow-filtered Z-Score layer is also available on the map.
 
 ### Time tracking of lakes
 
-- In a secondary *tracking* step, select a focus-area within the AOI to track lakes back in time.
-- Pan through the time-tagged historical images to observe the lake's evolution.
+How to:
+- In a secondary *tracking* step, select a focus-area by drawing up another AOI box to track lakes back in time. AOI size limit is set to 100 km<sup>2</sup>.
+- Select *Days*, *Months* or *Years* to define the tracking interval. If you select *Years*, you can further narrow down to the seasonal window (or months of each year), for which the annual snapshots will be made. Maximum lengths of tracking are 180 days, 36 months, or 12 years, respectively.
+- You can do this multiple times and at different intervals. The results will be appended on the same page as *Tracking Results 1*, *Tracking Results 2*, etc.
+
+Inspecting the tracking results:
+- Pan through the time-tagged historical images to observe the lake's evolution using the slider.
 - A graph presenting lake area evolution over time is additionally presented.
+- You can export an html summary of the time tracking results.
 
 ## Project Structure
 

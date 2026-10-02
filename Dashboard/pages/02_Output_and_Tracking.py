@@ -520,6 +520,18 @@ os.makedirs(CONFIG_DIR, exist_ok=True)
 # in GEE/tracking_headless.py (which enforces it server-side too).
 MAX_FRAMES_HARD_CAP = 60
 
+# Hard cap on tracking AOI size — smaller than the Scheduler's MAX_AOI_AREA_KM2
+# (10,000 km2 in 01_Scheduler.py) since tracking repeats per-frame Sentinel-2/
+# glacier-thinning work up to MAX_FRAMES_HARD_CAP times per run.
+MAX_AOI_AREA_KM2 = 100
+
+def _bbox_area_km2(bbox):
+    """Approximate area (km2) of a [min_lon, min_lat, max_lon, max_lat] bbox."""
+    min_lon, min_lat, max_lon, max_lat = bbox
+    lat_km = 111.32
+    lon_km = 111.32 * math.cos(math.radians((min_lat + max_lat) / 2))
+    return abs((max_lon - min_lon) * lon_km) * abs((max_lat - min_lat) * lat_km)
+
 # Local tile server for lazily serving raster layers (only tiles visible in
 # the viewport are rendered/transferred, avoiding Streamlit's message-size cap)
 TILE_PORT = start_tile_server(OUTPUT_DIR)
@@ -938,6 +950,8 @@ if map_output and map_output.get("all_drawings"):
         lons, lats = [c[0] for c in coords], [c[1] for c in coords]
         drawn_aoi = [min(lons), min(lats), max(lons), max(lats)]
 
+over_area_cap = bool(drawn_aoi) and _bbox_area_km2(drawn_aoi) > MAX_AOI_AREA_KM2
+
 # --- 7. Data Sync & Table ---
 _all_cluster_csv_files = glob.glob(os.path.join(folder_path, "cluster_summary*.csv"))
 _standard_csv_files = [f for f in _all_cluster_csv_files if "_snowfilter" not in os.path.basename(f)]
@@ -1129,13 +1143,19 @@ else:
     )
 
 if drawn_aoi:
-    st.sidebar.success(f"AOI Defined: {len(selected_ids)} clusters selected.")
+    if over_area_cap:
+        st.sidebar.error(
+            f"AOI too large ({_bbox_area_km2(drawn_aoi):,.0f} km2). "
+            f"Maximum allowed area is {MAX_AOI_AREA_KM2:,} km2."
+        )
+    else:
+        st.sidebar.success(f"AOI Defined: {len(selected_ids)} clusters selected.")
 else:
     st.sidebar.info("Draw an area of interest on the map to select clusters for tracking.")
 if tracking_status == "running":
     st.sidebar.caption("A tracking analysis is already running.")
 if st.sidebar.button("Run Tracking Analysis",
-                     disabled=(tracking_status == "running" or not drawn_aoi or over_frame_cap)):
+                     disabled=(tracking_status == "running" or not drawn_aoi or over_frame_cap or over_area_cap)):
     try:
         cfg_p = write_timetrack_config(folder_path, drawn_aoi, calc_start,
                                        calc_end, selected_ids,
