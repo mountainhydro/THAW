@@ -1136,10 +1136,10 @@ if over_frame_cap:
         f"{MAX_FRAMES_HARD_CAP}. Reduce the look-back period to proceed."
     )
 else:
-    # 4 bands (true_color, VV_corrected, lake_likelihood, snow_mask) exported per frame
+    # 3 bands (true_color, VV_corrected, lake_likelihood) exported per frame
     st.sidebar.caption(
         f"Estimated frames to export: ~{estimated_frames} "
-        f"(~{estimated_frames * 4} download tasks at 4 bands/frame)"
+        f"(~{estimated_frames * 3} download tasks at 3 bands/frame)"
     )
 
 if drawn_aoi:

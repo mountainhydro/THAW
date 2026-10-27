@@ -631,9 +631,10 @@ def simple_threshold(image, threshold=-14):
 # ============================================================
 
 def get_sentinel2_mosaic(aoi, ref_date, lookback_days=14, extension_days=7,
-                          coverage_thres=0.8, cloud_prob_max=40, scale=20):
+                          coverage_thres=0.8, cloud_prob_max=40, scale=20,
+                          mask_clouds=True):
     """
-    Build a cloud-filtered Sentinel-2 median mosaic over the AOI.
+    Build a Sentinel-2 median mosaic over the AOI, cloud-filtered by default.
 
     A 14-day lookback window is used by default; if cloud-free coverage over
     the AOI is below coverage_thres, the window is extended once (14 -> 21
@@ -658,11 +659,14 @@ def get_sentinel2_mosaic(aoi, ref_date, lookback_days=14, extension_days=7,
         (default 40).
     scale : int, optional
         Scale in metres used for the coverage-fraction check (default 20).
+    mask_clouds : bool, optional
+        If False, pixels are not filtered by cloud probability (only pixels
+        without real data are masked). Default True.
 
     Returns
     -------
     ee.Image
-        Cloud-masked Sentinel-2 median mosaic (all bands), clipped to aoi.
+        Sentinel-2 median mosaic (all bands), clipped to aoi.
     """
     def build_mosaic(period_start):
         s2_sr = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
@@ -675,13 +679,15 @@ def get_sentinel2_mosaic(aoi, ref_date, lookback_days=14, extension_days=7,
             condition=ee.Filter.equals(leftField='system:index', rightField='system:index')
         ))
 
-        def mask_clouds(img):
+        def mask_scene(img):
+            is_real_data = img.select('B8A').mask().And(img.select('B9').mask())
+            if not mask_clouds:
+                return img.updateMask(is_real_data)
             cloud_prob = ee.Image(img.get('cloud_prob_img')).select('probability')
             is_clear = cloud_prob.lt(cloud_prob_max)
-            is_real_data = img.select('B8A').mask().And(img.select('B9').mask())
             return img.updateMask(is_clear.And(is_real_data))
 
-        return joined.map(mask_clouds).median().clip(aoi)
+        return joined.map(mask_scene).median().clip(aoi)
 
     def _coverage(mosaic):
         # median() of an empty S2 collection (e.g. pre-2015, before S2A launch)

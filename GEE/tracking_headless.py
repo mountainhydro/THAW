@@ -55,6 +55,10 @@ CHECKPOINT_FILE = "tracking_checkpoint.json"
 # with MAX_FRAMES_HARD_CAP in Dashboard/pages/02_Output_and_Tracking.py.
 MAX_FRAMES_HARD_CAP = 60
 
+# Sentinel-2 snow mask + local snow-filtered likelihood. Disabled: thin cloud/haze
+# over lakes is misclassified as snow and erases lake pixels.
+ENABLE_SNOW_FILTER = False
+
 def retry(fn, label, max_attempts=5, base_wait=30):
     import time as _time
     for attempt in range(1, max_attempts + 1):
@@ -160,7 +164,7 @@ def run_tracking_pipeline(config_path):
     if ckpt and "download" in ckpt.get("steps_complete", []):
         print(f"Resuming incomplete tracking pipeline from checkpoint.", flush=True)
         done = ckpt.get("steps_complete", [])
-        if "snowfilter" not in done:
+        if "snowfilter" not in done and ENABLE_SNOW_FILTER:
             print("Step 2/3: Computing local snow-filtered likelihood...", flush=True)
             retry(
                 lambda: compute_snow_filtered_likelihood(final_out_dir_str),
@@ -279,15 +283,15 @@ def run_tracking_pipeline(config_path):
 # ============================================================
 # SENTINEL-2 SNOW MASK + TRUE COLOR (per frame)
 # ============================================================
-    print("Building Sentinel-2 snow mask / true-color image per frame...", flush=True)
+    print("Building Sentinel-2 true-color image per frame...", flush=True)
     frame_list = export_collection.toList(frame_count)
     augmented_images = []
     for i in range(frame_count):
         img = ee.Image(frame_list.get(i))
         img_time = img.get('system:time_start').getInfo()
         frame_date = datetime.datetime.fromtimestamp(img_time / 1000, tz=datetime.timezone.utc).replace(tzinfo=None)
-        s2_mosaic = get_sentinel2_mosaic(aoi, frame_date)
-        if s2_mosaic.bandNames().size().getInfo() == 0:
+        tc_mosaic = get_sentinel2_mosaic(aoi, frame_date, mask_clouds=False)
+        if tc_mosaic.bandNames().size().getInfo() == 0:
             # No Sentinel-2 coverage (e.g. pre-2015 frames, before S2A launch) —
             # placeholder snow_mask/true_color instead of crashing on .select().
             print(f"  No Sentinel-2 coverage for {frame_date.date()} — using placeholders.", flush=True)
@@ -296,16 +300,22 @@ def run_tracking_pipeline(config_path):
                 ['true_color_R', 'true_color_G', 'true_color_B']
             )
         else:
-            snow_mask = get_snow_mask(aoi, frame_date, mosaic=s2_mosaic)
-            true_color = get_true_color_image(s2_mosaic).rename(
+            snow_mask = (
+                get_snow_mask(aoi, frame_date, mosaic=get_sentinel2_mosaic(aoi, frame_date))
+                if ENABLE_SNOW_FILTER else None
+            )
+            true_color = get_true_color_image(tc_mosaic).rename(
                 ['true_color_R', 'true_color_G', 'true_color_B']
             )
-        augmented_images.append(
-            img.addBands(snow_mask).addBands(true_color).set('system:time_start', img_time)
-        )
+        img = img.addBands(true_color).set('system:time_start', img_time)
+        if ENABLE_SNOW_FILTER:
+            img = img.addBands(snow_mask)
+        augmented_images.append(img)
     export_collection = ee.ImageCollection(augmented_images)
 
-    bands = ["true_color", "VV_corrected", "lake_likelihood", "snow_mask"]
+    bands = ["true_color", "VV_corrected", "lake_likelihood"]
+    if ENABLE_SNOW_FILTER:
+        bands.append("snow_mask")
     band_groups = {"true_color": ["true_color_R", "true_color_G", "true_color_B"]}
 
 
@@ -346,7 +356,7 @@ def run_tracking_pipeline(config_path):
 # ============================================================
 # LOCAL SNOW-FILTER COMBINATION
 # ============================================================
-    if "snowfilter" not in done:
+    if ENABLE_SNOW_FILTER and "snowfilter" not in done:
         print("Step 2/3: Computing local snow-filtered likelihood...", flush=True)
         retry(
             lambda: compute_snow_filtered_likelihood(final_out_dir_str),
@@ -356,7 +366,7 @@ def run_tracking_pipeline(config_path):
         )
         done.append("snowfilter")
         write_checkpoint(final_out_dir_str, steps_complete=done)
-    else:
+    elif ENABLE_SNOW_FILTER:
         print("Step 2/3: Local snow-filter already complete, skipping.", flush=True)
 
 

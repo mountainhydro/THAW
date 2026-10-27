@@ -163,10 +163,7 @@ def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
       mean_area_km2  — likelihood-weighted area within clusters (sum × pixel area)
       upper_area_km2 — pixels within clusters where likelihood >= upper threshold
 
-    Prefers the snow-filtered raster ('<prefix>_<date>_likelihood_snowfilter.tif',
-    see compute_snow_filtered_likelihood in drive_io.py) per date when present,
-    falling back to the raw '<prefix>_<date>_lake_likelihood.tif' otherwise
-    (e.g. no usable Sentinel-2 coverage for that date).
+    Uses the raw '<prefix>_<date>_lake_likelihood.tif' for each date.
 
     Parameters
     ----------
@@ -190,9 +187,7 @@ def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
         return f"{match2.group(1)}-{match2.group(2)}-{match2.group(3)}" if match2 else basename
 
     raw_files = glob.glob(os.path.join(out_dir, "*_lake_likelihood.tif"))
-    snowfilter_files = glob.glob(os.path.join(out_dir, "*_likelihood_snowfilter.tif"))
     by_date = {_date_key(p): p for p in raw_files}
-    by_date.update({_date_key(p): p for p in snowfilter_files})
     tif_files = [by_date[d] for d in sorted(by_date)]
 
     if not tif_files:
@@ -383,7 +378,7 @@ def generate_lake_metrics_report(
 # ============================================================
 
 PANEL_LABELS = {
-    'true_color':      'True Color (cloud masked)',
+    'true_color':      'True Color',
     'VV_corrected':    'Corrected VV (dB)',
     'lake_likelihood': 'Lake Likelihood',
 }

@@ -97,7 +97,7 @@ def _download_tiles_and_merge(drive_service, drive_files, local_path, file_prefi
 
     if exact:
         # Non-tiled: single file with the exact expected name
-        file_id = exact[0]["id"].strip().rstrip("-")
+        file_id = exact[0]["id"].strip()
         ok = _download_file_with_retry(drive_service, file_id, local_path,
                                        file_prefix=file_prefix)
         return ok, [file_id]
@@ -107,7 +107,7 @@ def _download_tiles_and_merge(drive_service, drive_files, local_path, file_prefi
     tile_paths = []
     tile_ids   = []
     for tf in tiles:
-        tid = tf["id"].strip().rstrip("-")
+        tid = tf["id"].strip()
         if not tid:
             continue
         tmp_path = os.path.join(tmp_dir, f"_tile_{tf['name']}")
@@ -167,7 +167,7 @@ def _download_file_with_retry(drive_service, file_id, local_path, max_attempts=8
                     if fresh_files:
                         exact = [f for f in fresh_files if f["name"] == f"{file_prefix}.tif"]
                         chosen = exact[0] if exact else fresh_files[0]
-                        new_id = chosen["id"].strip().rstrip("-")
+                        new_id = chosen["id"].strip()
                         if new_id == last_404_id:
                             # Same dead ID returned again — unrecoverable, stop immediately
                             print(f"Warning: file persistently not accessible on Drive, skipping: {os.path.basename(local_path)}", flush=True)
@@ -772,8 +772,7 @@ def compute_snow_filtered_likelihood(output_dir):
 
     Writes '<prefix>_<date>_likelihood_snowfilter.tif' (snow-flagged pixels
     set to NaN) next to the inputs. Frames missing either input are skipped
-    (already logged as a warning) — extract_cluster_area_timeseries() falls
-    back to the raw likelihood raster for those.
+    (already logged as a warning).
 
     Parameters
     ----------
