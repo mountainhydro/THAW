@@ -113,6 +113,46 @@ def _discover_frames(tracking_dir):
 
 # ── viewer section (paste into Output_Preview.py) ──────────────────────────
 
+def _interval_label(tracking_dir, dates):
+    """
+    'daily' / 'monthly' / 'yearly' for a tracking run, read from the run's log
+    ('interval_unit=...'); falls back to the median spacing of the frame dates
+    for older runs whose log doesn't record it. None if it can't be determined.
+    """
+    names = {"days": "daily", "months": "monthly", "years": "yearly"}
+    unit = None
+    for log in sorted(glob.glob(os.path.join(tracking_dir, "tracking_log_*.txt"))):
+        try:
+            with open(log, "r", encoding="utf-8", errors="replace") as fh:
+                m = re.findall(r"interval_unit=(days|months|years)", fh.read())
+        except OSError:
+            continue
+        if m:
+            unit = m[-1]
+    if unit:
+        return names[unit]
+
+    if len(dates) < 2:
+        return None
+    from datetime import datetime as _dt
+    days = sorted(
+        (_dt.strptime(b, "%Y-%m-%d") - _dt.strptime(a, "%Y-%m-%d")).days
+        for a, b in zip(dates, dates[1:])
+    )
+    median_gap = days[len(days) // 2]
+    return "yearly" if median_gap >= 300 else "monthly" if median_gap >= 25 else "daily"
+
+
+def _summary_suffix(tracking_dir, frames):
+    """'(interval, first to last date)' for the section title, or '' if no dated frames."""
+    dates = [f["date"] for f in frames if re.fullmatch(r"\d{4}-\d{2}-\d{2}", f["date"])]
+    if not dates:
+        return ""
+    period = dates[0] if len(dates) == 1 else f"{dates[0]} to {dates[-1]}"
+    interval = _interval_label(tracking_dir, dates)
+    return f"({interval}, {period})" if interval else f"({period})"
+
+
 def render_tracking_viewer(tracking_dir, title="Tracking Results Viewer"):
     """
     Render the three-panel image viewer and lake area chart for one tracking run.
@@ -123,10 +163,19 @@ def render_tracking_viewer(tracking_dir, title="Tracking Results Viewer"):
         Absolute path to a specific tracking results directory
         (e.g. `.../Outputs_2026-05-06_Khumbu/tracking_results_1/`).
     title : str, optional
-        Section header shown above the viewer.
+        Section header shown above the viewer, followed by the run's interval
+        and time period in brackets.
     """
     st.write("---")
-    st.subheader(title)
+    frames, panel_cfg = _discover_frames(tracking_dir) if os.path.isdir(tracking_dir) else ([], None)
+    suffix = _summary_suffix(tracking_dir, frames)
+    if suffix:
+        st.markdown(
+            f"### {title} <span style='font-weight:400'>{suffix}</span>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.subheader(title)
 
     # Constrain all widgets in this viewer to match TOTAL_WIDTH
     TOTAL_WIDTH = 900
@@ -143,8 +192,6 @@ def render_tracking_viewer(tracking_dir, title="Tracking Results Viewer"):
     if not os.path.isdir(tracking_dir):
         st.info("No tracking results found for this date. Run a tracking analysis first.")
         return
-
-    frames, panel_cfg = _discover_frames(tracking_dir)
 
     if not frames:
         st.warning("No time tracking results available. Please draw AOI and launch a tracking analysis.")

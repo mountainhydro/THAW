@@ -282,7 +282,8 @@ def preprocess_s1_collection(
     aoi, start_date, end_date,
     slope_rad, dem, aspect,
     glacier_geom, terrain_mask,
-    thinning_correction=0.0
+    thinning_correction=0.0,
+    dem_for_image=None
 ):
     """
     Load, correct, and optionally shift a Sentinel-1 DESCENDING collection.
@@ -311,6 +312,10 @@ def preprocess_s1_collection(
         Binary mask of valid terrain pixels.
     thinning_correction : float, optional
         Total surface lowering in metres relative to the DEM epoch (default 0).
+    dem_for_image : Callable, optional
+        Function mapping an image to (dem, terrain_mask), e.g. from
+        thinning.make_dem_for_image(), so each image uses a DEM adjusted to its
+        own acquisition year. If None, `dem` and `terrain_mask` are used as given.
 
     Returns
     -------
@@ -319,7 +324,7 @@ def preprocess_s1_collection(
     """
     thinning_correction = float(thinning_correction)
 
-    def process_image(image, dem):
+    def process_image(image, dem, terrain_mask):
         # Radar geometry
         theta_i = image.select('angle')
         phi_i = ee.Terrain.aspect(theta_i) \
@@ -373,7 +378,11 @@ def preprocess_s1_collection(
 
     def preprocess(image):
         image = image.select(['VV', 'angle']).rename(['VV_raw', 'angle'])
-        image = process_image(image, dem)
+        if dem_for_image is not None:
+            image_dem, image_terrain_mask = dem_for_image(image)
+        else:
+            image_dem, image_terrain_mask = dem, terrain_mask
+        image = process_image(image, image_dem, image_terrain_mask)
         if thinning_correction != 0.0:
             pi = ee.Number(math.pi)
             theta_i = ee.Number(image.get('mean_angle')).multiply(pi.divide(180))
@@ -504,7 +513,8 @@ def build_monthly_composites(s1_scored, start_date, end_date,
     -------
     ee.ImageCollection
         One image per non-empty calendar month, tagged with 'system:time_start'
-        set to the 1st of that month.
+            set to the 1st of that month, and 'period_start'/'period_end' (ms,
+            end exclusive) giving the month bounds.
     """
     start = ee.Date(start_date)
     end = ee.Date(end_date)
@@ -519,6 +529,8 @@ def build_monthly_composites(s1_scored, start_date, end_date,
         monthly = s1_scored.filterDate(month_start, month_end).select(list(bands))
         return monthly.median() \
             .set('system:time_start', month_start.millis()) \
+            .set('period_start', month_start.millis()) \
+            .set('period_end', month_end.millis()) \
             .set('_frame_count', monthly.size())
 
     composites = ee.ImageCollection(month_starts.map(_composite))
@@ -556,7 +568,8 @@ def build_yearly_snapshot_composites(s1_scored, start_date, end_date,
     -------
     ee.ImageCollection
         One image per year with imagery in its season window, tagged with
-        'system:time_start' set to that year's season-start date.
+        'system:time_start' set to that year's season-start date, and
+        'period_start'/'period_end' (ms, end exclusive) giving the season bounds.
     """
     start_year = ee.Date(start_date).get('year')
     end_year = ee.Date(end_date).get('year')
@@ -569,6 +582,8 @@ def build_yearly_snapshot_composites(s1_scored, start_date, end_date,
         yearly = s1_scored.filterDate(season_start, season_end).select(list(bands))
         return yearly.median() \
             .set('system:time_start', season_start.millis()) \
+            .set('period_start', season_start.millis()) \
+            .set('period_end', season_end.millis()) \
             .set('_frame_count', yearly.size())
 
     composites = ee.ImageCollection(years.map(_composite))
@@ -631,10 +646,9 @@ def simple_threshold(image, threshold=-14):
 # ============================================================
 
 def get_sentinel2_mosaic(aoi, ref_date, lookback_days=14, extension_days=7,
-                          coverage_thres=0.8, cloud_prob_max=40, scale=20,
-                          mask_clouds=True):
+                          coverage_thres=0.8, cloud_prob_max=40, scale=20):
     """
-    Build a Sentinel-2 median mosaic over the AOI, cloud-filtered by default.
+    Build a cloud-filtered Sentinel-2 median mosaic over the AOI.
 
     A 14-day lookback window is used by default; if cloud-free coverage over
     the AOI is below coverage_thres, the window is extended once (14 -> 21
@@ -659,14 +673,11 @@ def get_sentinel2_mosaic(aoi, ref_date, lookback_days=14, extension_days=7,
         (default 40).
     scale : int, optional
         Scale in metres used for the coverage-fraction check (default 20).
-    mask_clouds : bool, optional
-        If False, pixels are not filtered by cloud probability (only pixels
-        without real data are masked). Default True.
 
     Returns
     -------
     ee.Image
-        Sentinel-2 median mosaic (all bands), clipped to aoi.
+        Cloud-masked Sentinel-2 median mosaic (all bands), clipped to aoi.
     """
     def build_mosaic(period_start):
         s2_sr = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
@@ -679,15 +690,13 @@ def get_sentinel2_mosaic(aoi, ref_date, lookback_days=14, extension_days=7,
             condition=ee.Filter.equals(leftField='system:index', rightField='system:index')
         ))
 
-        def mask_scene(img):
-            is_real_data = img.select('B8A').mask().And(img.select('B9').mask())
-            if not mask_clouds:
-                return img.updateMask(is_real_data)
+        def mask_clouds(img):
             cloud_prob = ee.Image(img.get('cloud_prob_img')).select('probability')
             is_clear = cloud_prob.lt(cloud_prob_max)
+            is_real_data = img.select('B8A').mask().And(img.select('B9').mask())
             return img.updateMask(is_clear.And(is_real_data))
 
-        return joined.map(mask_scene).median().clip(aoi)
+        return joined.map(mask_clouds).median().clip(aoi)
 
     def _coverage(mosaic):
         # median() of an empty S2 collection (e.g. pre-2015, before S2A launch)
@@ -755,6 +764,125 @@ def get_snow_mask(aoi, ref_date, mosaic=None, ndsi_thres=0.4, nir_thres=0.15, **
     nir = mosaic.select('B8').divide(10000).rename('NIR')
     snow_mask = ndsi.gt(ndsi_thres).And(nir.gt(nir_thres))
     return snow_mask.unmask(0).rename('snow_mask')
+
+
+def get_closest_sentinel2_image(aoi, ref_date, window_days=5):
+    """
+    Get the Sentinel-2 acquisition closest in time to ref_date, regardless of
+    cloud cover.
+
+    The closest scene (before or after ref_date) within +/- window_days is
+    found, then all scenes from that same UTC day are mosaicked so the AOI is
+    covered across tile edges. Nothing is cloud-masked.
+
+    Parameters
+    ----------
+    aoi : ee.Geometry
+        Area of interest.
+    ref_date : datetime.datetime
+        Reference date (naive UTC), e.g. the Sentinel-1 acquisition time.
+    window_days : int, optional
+        Search window either side of ref_date (default 5).
+
+    Returns
+    -------
+    (ee.Image, datetime.date) or (None, None)
+        Mosaic clipped to aoi and the acquisition date used, or (None, None)
+        if no Sentinel-2 scene lies within the window.
+    """
+    ref_ms = int(ref_date.replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+    window = datetime.timedelta(days=window_days)
+    s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
+        .filterBounds(aoi).filterDate(ref_date - window, ref_date + window)
+
+    def add_diff(img):
+        return img.set('time_diff', ee.Number(img.get('system:time_start')).subtract(ref_ms).abs())
+
+    closest = s2.map(add_diff).sort('time_diff').first()
+    closest_ms = closest.get('system:time_start').getInfo() if s2.size().getInfo() else None
+    if closest_ms is None:
+        return None, None
+
+    closest_day = datetime.datetime.fromtimestamp(closest_ms / 1000, tz=datetime.timezone.utc) \
+        .replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    same_day = s2.filterDate(closest_day, closest_day + datetime.timedelta(days=1))
+    return same_day.mosaic().clip(aoi), closest_day.date()
+
+
+def get_clearest_central_sentinel2_image(aoi, period_start, period_end,
+                                         min_clear_fraction=0.9, scale=60):
+    """
+    Pick a cloud-free Sentinel-2 scene within a period, closest to its central date.
+
+    Used for monthly / seasonal tracking frames, where the true-color image may
+    come from anywhere inside the frame's period. Each scene is scored by the
+    fraction of the AOI that is both covered and clear (cloud probability < 40).
+    Among scenes with at least min_clear_fraction clear, the one closest to the
+    period midpoint wins. If no scene is clear enough, the clearest one is used.
+    All scenes of the chosen UTC day are mosaicked to cover tile edges.
+
+    Parameters
+    ----------
+    aoi : ee.Geometry
+        Area of interest.
+    period_start, period_end : datetime.datetime
+        Naive UTC period bounds (end exclusive).
+    min_clear_fraction : float, optional
+        Minimum clear fraction (0-1) of the AOI for a scene to count as
+        cloud-free (default 0.9).
+    scale : int, optional
+        Scale in metres for the clear-fraction estimate (default 60).
+
+    Returns
+    -------
+    (ee.Image, datetime.date, float) or (None, None, None)
+        Mosaic clipped to aoi, the acquisition date used and its clear
+        fraction, or (None, None, None) if the period has no Sentinel-2 scene.
+    """
+    def to_ms(d):
+        return int(d.replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+
+    center_ms = (to_ms(period_start) + to_ms(period_end)) / 2
+    s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
+        .filterBounds(aoi).filterDate(period_start, period_end)
+    s2_clouds = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY') \
+        .filterBounds(aoi).filterDate(period_start, period_end)
+    joined = ee.ImageCollection(ee.Join.saveFirst('cloud_prob_img').apply(
+        primary=s2,
+        secondary=s2_clouds,
+        condition=ee.Filter.equals(leftField='system:index', rightField='system:index')
+    ))
+
+    def add_clear_fraction(img):
+        cloud_prob = img.get('cloud_prob_img')
+        # Fall back to the scene-level metadata if no cloud probability image exists
+        scene_clear = ee.Number(1).subtract(ee.Number(img.get('CLOUDY_PIXEL_PERCENTAGE')).divide(100))
+        aoi_clear = ee.Image(ee.Algorithms.If(cloud_prob, cloud_prob, ee.Image.constant(0).rename('probability'))) \
+            .select('probability').lt(40).unmask(0).rename('clear') \
+            .reduceRegion(reducer=ee.Reducer.mean(), geometry=aoi, scale=scale,
+                          maxPixels=1e9, bestEffort=True).get('clear')
+        frac = ee.Algorithms.If(cloud_prob, aoi_clear, scene_clear)
+        return img.set('clear_fraction', ee.Number(ee.Algorithms.If(frac, frac, 0)))
+
+    scored = joined.map(add_clear_fraction)
+    info = ee.Dictionary({
+        't': scored.aggregate_array('system:time_start'),
+        'f': scored.aggregate_array('clear_fraction'),
+    }).getInfo()
+    scenes = list(zip(info['t'], info['f']))
+    if not scenes:
+        return None, None, None
+
+    clear_enough = [s for s in scenes if s[1] >= min_clear_fraction]
+    if clear_enough:
+        best_ms, best_frac = min(clear_enough, key=lambda s: abs(s[0] - center_ms))
+    else:
+        best_ms, best_frac = max(scenes, key=lambda s: s[1])
+
+    best_day = datetime.datetime.fromtimestamp(best_ms / 1000, tz=datetime.timezone.utc) \
+        .replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    same_day = s2.filterDate(best_day, best_day + datetime.timedelta(days=1))
+    return same_day.mosaic().clip(aoi), best_day.date(), best_frac
 
 
 def get_true_color_image(mosaic, min_refl=0, max_refl=3000, gamma=1.4):

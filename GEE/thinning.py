@@ -74,7 +74,33 @@ def load_aoi(aoi_input):
             "Unsupported AOI format. Must be a file path, GeoJSON string, or bounding box list."
         )
 
-def load_dem(aoi, dem_source='COPERNICUS/DEM/GLO30_2024_1'):
+DEM_EPOCH_YEAR = 2013  # GLO-30 is built from TanDEM-X acquisitions spanning 2011-2015
+TERRAIN_MASK_SCALE_M = 10  # matches the export resolution of the tracking pipeline
+
+
+def utm_crs_for_aoi(aoi):
+    """EPSG code string of the UTM zone containing the AOI's centre."""
+    coords = aoi.bounds().coordinates().get(0).getInfo()
+    lon = sum(pt[0] for pt in coords) / len(coords)
+    lat = sum(pt[1] for pt in coords) / len(coords)
+    zone = int((lon + 180) // 6) + 1
+    return f"EPSG:{(32600 if lat >= 0 else 32700) + zone}"
+
+
+def compute_terrain_mask(slope, crs, terrain_buffer_m=200, scale_m=TERRAIN_MASK_SCALE_M):
+    """Valid terrain = flat (<6 deg) pixels plus a buffer around them, so lakes that
+    have grown beyond the flat area of the (older) DEM are not masked out.
+
+    Evaluated on a fixed UTM grid at the export resolution, with the buffer in whole
+    pixels of that grid. A kernel in metres fails at export time ('non-standard
+    transform'), and one in pixels on the DEM's own projection would change with the
+    export resolution."""
+    radius_px = max(1, int(round(terrain_buffer_m / scale_m)))
+    return slope.reproject(ee.Projection(crs).atScale(scale_m)) \
+        .focal_min(radius_px, 'circle', 'pixels').lt(6)
+
+
+def load_dem(aoi, dem_source='COPERNICUS/DEM/GLO30_2024_1', terrain_buffer_m=200):
     # COPDEM GLO-30 is tiled as an ImageCollection (unlike the deprecated,
     # single-image JAXA/ALOS/AW3D30/V2_2 this replaces) — mosaic and
     # reproject to its native projection, matching the main lakedetection
@@ -84,8 +110,122 @@ def load_dem(aoi, dem_source='COPERNICUS/DEM/GLO30_2024_1'):
     dem = glo30.select('DEM').mosaic().setDefaultProjection(glo30_proj).clip(aoi)
     slope = ee.Terrain.slope(dem.focal_median(4))
     aspect = ee.Terrain.aspect(dem)
-    terrain_mask = slope.focal_min(8).lt(6)
+    terrain_mask = compute_terrain_mask(slope, utm_crs_for_aoi(aoi), terrain_buffer_m)
     return dem, slope, aspect, terrain_mask
+
+
+def load_thinning_rate_image(aoi, cache_dir="thinning_cache", grid_res=30,
+                             margin_m=300, max_cells=100000):
+    """
+    Build an ee.Image of the Hugonnet (2021) 2000-2020 surface elevation change
+    rate [m/yr] covering the AOI, for lowering the DEM pixel by pixel.
+
+    The cached rate tiles are resampled (bilinear) onto a regular UTM grid
+    matching the DEM resolution and embedded in the image as a constant array
+    that is looked up per pixel. Pixels without data (outside glaciers) are 0.
+
+    Parameters
+    ----------
+    aoi : ee.Geometry
+        Area covered by the DEM.
+    cache_dir : str
+        Directory with the cached Hugonnet tiles.
+    grid_res : float
+        Grid resolution in metres (default 30, the DEM resolution); coarsened
+        automatically if the grid would exceed max_cells.
+    margin_m : float
+        Margin added around the AOI bounds, in metres.
+    max_cells : int
+        Upper bound on the embedded array size.
+
+    Returns
+    -------
+    ee.Image or None
+        Single-band 'dhdt' image in m/yr, or None if there is no thinning data.
+    """
+    from rasterio.transform import from_origin
+    from rasterio.warp import reproject, Resampling, transform_bounds
+
+    os.makedirs(cache_dir, exist_ok=True)
+    coords = aoi.bounds().coordinates().get(0).getInfo()
+    xs = [pt[0] for pt in coords]
+    ys = [pt[1] for pt in coords]
+    zone = int((((min(xs) + max(xs)) / 2) + 180) // 6) + 1
+    epsg = (32600 if (min(ys) + max(ys)) / 2 >= 0 else 32700) + zone
+    crs = f"EPSG:{epsg}"
+
+    left, bottom, right, top = transform_bounds(
+        "EPSG:4326", crs, min(xs), min(ys), max(xs), max(ys)
+    )
+    left, bottom, right, top = left - margin_m, bottom - margin_m, right + margin_m, top + margin_m
+    res = float(grid_res)
+    while ((right - left) / res) * ((top - bottom) / res) > max_cells:
+        res *= 1.5
+    width = int(math.ceil((right - left) / res))
+    height = int(math.ceil((top - bottom) / res))
+    dst_transform = from_origin(left, top, res, res)
+
+    rate = np.full((height, width), np.nan, dtype="float32")
+    for tile_name in sorted(get_tile_names_for_geometry(aoi)):
+        tile_url = f"https://services-theia.sedoo.fr/glaciers/data/v1_0/downloadtif/2000-2020/{tile_name}"
+        local_tif = os.path.join(cache_dir, f"{tile_name}.tif")
+        download_tiff_tile(tile_url, local_tif)
+        tmp = np.full((height, width), np.nan, dtype="float32")
+        with rasterio.open(local_tif) as src:
+            reproject(
+                source=rasterio.band(src, 1), destination=tmp,
+                src_transform=src.transform, src_crs=src.crs,
+                src_nodata=src.nodata if src.nodata is not None else -9999,
+                dst_transform=dst_transform, dst_crs=crs, dst_nodata=np.nan,
+                resampling=Resampling.bilinear,
+            )
+        tmp[tmp <= -9999] = np.nan
+        rate = np.where(np.isfinite(tmp), tmp, rate)
+
+    if not np.isfinite(rate).any():
+        return None
+
+    rate = np.nan_to_num(rate, nan=0.0)
+
+    pix = ee.Image.pixelCoordinates(ee.Projection(crs, [res, 0, left, 0, -res, top]))
+    row = pix.select('y').floor().toInt().clamp(0, height - 1).toInt()
+    col = pix.select('x').floor().toInt().clamp(0, width - 1).toInt()
+    inside = pix.select('x').floor().gte(0).And(pix.select('x').floor().lt(width)) \
+        .And(pix.select('y').floor().gte(0)).And(pix.select('y').floor().lt(height))
+    return ee.Image(ee.Array(rate.tolist())) \
+        .arraySlice(0, row, row.add(1)).arraySlice(1, col, col.add(1)) \
+        .arrayGet([0, 0]).updateMask(inside).unmask(0).rename('dhdt')
+
+
+def load_dem_water_mask(aoi, dem_source='COPERNICUS/DEM/GLO30_2024_1'):
+    """Binary mask of pixels the DEM itself classifies as water (lakes, rivers; band WBM)."""
+    glo30 = ee.ImageCollection(dem_source)
+    return glo30.select('WBM').mosaic().setDefaultProjection(glo30.first().projection()) \
+        .clip(aoi).gt(0).unmask(0)
+
+
+def make_dem_for_image(dem, thinning_rate, aoi, water_mask=None, terrain_buffer_m=200,
+                       dem_epoch=DEM_EPOCH_YEAR):
+    """
+    Return a function mapping a Sentinel-1 image to (dem, terrain_mask) with the
+    DEM lowered by the Hugonnet rate for the years between the DEM epoch and the
+    image's acquisition year. The slope and terrain mask are recomputed on that
+    adjusted DEM.
+
+    Pixels in water_mask (the DEM's own flattened lake surfaces) are not lowered,
+    since a spatially varying lowering would tilt their flat surface and wreck
+    the flat-terrain footprint the mask is built from.
+    """
+    rate = thinning_rate if water_mask is None else thinning_rate.multiply(water_mask.Not())
+    crs = utm_crs_for_aoi(aoi)
+
+    def dem_for_image(image):
+        year = ee.Date(image.get('system:time_start')).get('year')
+        years = ee.Number(year).subtract(dem_epoch).max(0)
+        dem_i = dem.add(rate.multiply(years))
+        slope_i = ee.Terrain.slope(dem_i.focal_median(4))
+        return dem_i, compute_terrain_mask(slope_i, crs, terrain_buffer_m)
+    return dem_for_image
 
 
 def load_glacier_mask(aoi, buffer_m=200, output_dir="outputs"):
@@ -235,19 +375,14 @@ def download_tiff_tile(tile_url, download_path):
     """Download a GeoTIFF tile if not already cached or if the cached file is empty."""
     if os.path.exists(download_path):
         if os.path.getsize(download_path) > 0:
-            print(f"File {download_path} already cached, skipping download.")
             return download_path
-        else:
-            print(f"File {download_path} is empty, re-downloading...")
-            os.remove(download_path)
+        os.remove(download_path)
 
-    print(f"Downloading {tile_url} ...")
     r = requests.get(tile_url, stream=True)
     r.raise_for_status()
     with open(download_path, 'wb') as f:
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
-    print(f"Downloaded to {download_path}")
     return download_path
 
 
@@ -327,7 +462,6 @@ def get_glacier_thinning_correction(aoi_geom, sar_year, dem, dem_year=2000,
     os.makedirs(output_dir, exist_ok=True)
 
     tile_names = get_tile_names_for_geometry(aoi_geom)
-    print(f"Tiles intersecting AOI: {tile_names}")
 
     thinning_values = []
     pixel_counts = []
@@ -354,15 +488,10 @@ def get_glacier_thinning_correction(aoi_geom, sar_year, dem, dem_year=2000,
         print("No valid thinning data found in AOI.")
         return 0.0
 
-    mean_thinning = sum(thinning_values) / sum(pixel_counts)
-    print(f"Mean thinning rate (2000-2019) over AOI: {mean_thinning:.4f} m/yr")
-
     percentile_25 = np.percentile(valid_pixels, 25)
-    print(f"25th percentile thinning rate over AOI: {percentile_25:.4f} m/yr")
 
     n_years = sar_year - dem_year
     total_thinning = percentile_25 * n_years
-    print(f"Estimated total thinning from {dem_year} to {sar_year}: {total_thinning:.4f} m")
 
     return total_thinning
     

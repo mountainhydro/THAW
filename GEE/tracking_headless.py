@@ -31,6 +31,8 @@ from gee_core import (
     build_monthly_composites,
     build_yearly_snapshot_composites,
     get_sentinel2_mosaic,
+    get_closest_sentinel2_image,
+    get_clearest_central_sentinel2_image,
     get_snow_mask,
     get_true_color_image,
 )
@@ -38,6 +40,9 @@ from thinning import (
     load_aoi,
     load_glacier_mask,
     load_dem,
+    load_thinning_rate_image,
+    load_dem_water_mask,
+    make_dem_for_image,
     get_glacier_thinning_correction,
 )
 from reporting import generate_lake_metrics_report
@@ -199,6 +204,7 @@ def run_tracking_pipeline(config_path):
     aoi          = load_aoi(aoi_input)
     glacier_geom = load_glacier_mask(aoi, buffer_m=100, output_dir=final_out_dir_str)
     dem, slope_rad, aspect, terrain_mask = load_dem(aoi)
+    dem_for_image = None
 
     if glacier_geom is None:
         refined_aoi = aoi
@@ -218,7 +224,11 @@ def run_tracking_pipeline(config_path):
             cache_dir=str(thinning_cache_dir),
             output_dir=final_out_dir_str,
         ))
-        print(f"Glacier thinning correction (m): {thinning_correction:.3f}", flush=True)
+
+        # Lower the DEM with the Hugonnet rates, per image year, before slope/terrain masking
+        thinning_rate = load_thinning_rate_image(aoi, cache_dir=str(thinning_cache_dir))
+        if thinning_rate is not None:
+            dem_for_image = make_dem_for_image(dem, thinning_rate, aoi, load_dem_water_mask(aoi))
 
 
 
@@ -229,7 +239,7 @@ def run_tracking_pipeline(config_path):
     s1_preprocessed = preprocess_s1_collection(
         refined_aoi, start_date, end_date,
         slope_rad, dem, aspect, glacier_geom or refined_aoi,
-        terrain_mask, thinning_correction,
+        terrain_mask, thinning_correction, dem_for_image=dem_for_image,
     )
 
     img_count = s1_preprocessed.size().getInfo()
@@ -283,32 +293,44 @@ def run_tracking_pipeline(config_path):
 # ============================================================
 # SENTINEL-2 SNOW MASK + TRUE COLOR (per frame)
 # ============================================================
-    print("Building Sentinel-2 true-color image per frame...", flush=True)
     frame_list = export_collection.toList(frame_count)
     augmented_images = []
     for i in range(frame_count):
         img = ee.Image(frame_list.get(i))
         img_time = img.get('system:time_start').getInfo()
         frame_date = datetime.datetime.fromtimestamp(img_time / 1000, tz=datetime.timezone.utc).replace(tzinfo=None)
-        tc_mosaic = get_sentinel2_mosaic(aoi, frame_date, mask_clouds=False)
-        if tc_mosaic.bandNames().size().getInfo() == 0:
-            # No Sentinel-2 coverage (e.g. pre-2015 frames, before S2A launch) —
-            # placeholder snow_mask/true_color instead of crashing on .select().
-            print(f"  No Sentinel-2 coverage for {frame_date.date()} — using placeholders.", flush=True)
-            snow_mask = ee.Image.constant(0).rename('snow_mask')
+
+        # True color: daily frames use the Sentinel-2 scene closest in time to the SAR
+        # frame (cloudy or not); monthly/seasonal frames use the clearest scene in the
+        # frame's period, closest to the period's central date.
+        if interval_unit in ("months", "years"):
+            period = ee.Dictionary({
+                's': img.get('period_start'), 'e': img.get('period_end'),
+            }).getInfo()
+            tc_image = get_clearest_central_sentinel2_image(
+                aoi,
+                datetime.datetime.fromtimestamp(period['s'] / 1000, tz=datetime.timezone.utc).replace(tzinfo=None),
+                datetime.datetime.fromtimestamp(period['e'] / 1000, tz=datetime.timezone.utc).replace(tzinfo=None),
+            )[0]
+        else:
+            tc_image = get_closest_sentinel2_image(aoi, frame_date)[0]
+        if tc_image is None:
+            # No Sentinel-2 scene in the window (e.g. pre-2015 frames, before S2A launch)
             true_color = ee.Image.constant([128, 128, 128]).toByte().rename(
                 ['true_color_R', 'true_color_G', 'true_color_B']
             )
         else:
-            snow_mask = (
-                get_snow_mask(aoi, frame_date, mosaic=get_sentinel2_mosaic(aoi, frame_date))
-                if ENABLE_SNOW_FILTER else None
-            )
-            true_color = get_true_color_image(tc_mosaic).rename(
+            true_color = get_true_color_image(tc_image).rename(
                 ['true_color_R', 'true_color_G', 'true_color_B']
             )
         img = img.addBands(true_color).set('system:time_start', img_time)
+
         if ENABLE_SNOW_FILTER:
+            snow_mosaic = get_sentinel2_mosaic(aoi, frame_date)
+            if snow_mosaic.bandNames().size().getInfo() == 0:
+                snow_mask = ee.Image.constant(0).rename('snow_mask')
+            else:
+                snow_mask = get_snow_mask(aoi, frame_date, mosaic=snow_mosaic)
             img = img.addBands(snow_mask)
         augmented_images.append(img)
     export_collection = ee.ImageCollection(augmented_images)
