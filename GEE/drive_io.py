@@ -2,8 +2,8 @@
 """
 THAW - Google Drive I/O module
 
-Handles all GEE export → Drive → local download operations, COG conversion,
-and Drive cleanup.
+Handles all GEE export → Drive → local download operations, direct
+(task-free) downloads for small tracking AOIs, COG conversion, and Drive cleanup.
 
 GEE Processing code: Dr. Evan Miles
 Tool/Operationalization: Dr. Stefan Fugger
@@ -35,16 +35,18 @@ class CancelledError(RuntimeError):
 
 
 def _is_valid_tif(path):
-    """Return True only if path exists, is non-trivially sized, and rasterio can open it."""
-    if not os.path.exists(path):
-        return False
-    if os.path.getsize(path) < 1024:
+    """Return True only if path is a readable GeoTIFF."""
+    if not os.path.isfile(path):
         return False
     try:
-        with rasterio.open(path):
-            pass
+        with rasterio.open(path) as src:
+            if src.driver != "GTiff" or src.count < 1:
+                return False
+            src.read(1, window=((0, 1), (0, 1)))
+            src.read(1, window=((src.height - 1, src.height),
+                                (src.width - 1, src.width)))
         return True
-    except Exception:
+    except (OSError, rasterio.errors.RasterioError):
         return False
 
 
@@ -694,6 +696,135 @@ def export_images_via_drive(s1_collection, aoi_ee, token_path,
             raise
 
 
+def download_images_direct(s1_collection, aoi_ee, token_path,
+                           bands_to_export, output_dir="outputs",
+                           prefix="tracking", scale=10, crs=None,
+                           band_groups=None, max_workers=6,
+                           max_attempts=3, base_wait=10, drive_fallback=True):
+    """
+    Download each image × band straight from GEE via getDownloadURL, skipping
+    the Drive export-task queue. Suited to the small tracking AOIs (a request
+    is limited to ~32 MB and ~5 min of server-side compute). Files that still
+    fail after retries are handed to export_images_via_drive, which skips the
+    files already on disk.
+
+    Parameters match export_images_via_drive, plus:
+    crs : str, optional
+        Output CRS (e.g. 'EPSG:32643'); should be set explicitly since, unlike
+        Drive exports, direct downloads otherwise default to EPSG:4326.
+    max_workers : int
+        Number of parallel download requests.
+    max_attempts, base_wait :
+        Per-file retries with linear backoff (base_wait × attempt seconds).
+    drive_fallback : bool
+        Export files that failed every direct attempt via Drive instead.
+    """
+    import requests
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    if max_workers < 1 or max_attempts < 1:
+        raise ValueError("max_workers and max_attempts must be at least 1")
+
+    band_groups = band_groups or {}
+    os.makedirs(output_dir, exist_ok=True)
+
+    count = s1_collection.size().getInfo()
+    dates = s1_collection.aggregate_array('system:time_start').getInfo()
+    if len(dates) != count:
+        raise ValueError(f"Expected {count} frame timestamps, received {len(dates)}")
+    s1_list = s1_collection.toList(count)
+    region = aoi_ee.bounds()
+
+    jobs = []
+    for i, img_time in enumerate(dates):
+        img_date = datetime.datetime.fromtimestamp(
+            img_time / 1000, tz=datetime.timezone.utc).strftime('%Y-%m-%d')
+        img = ee.Image(s1_list.get(i))
+        for band in bands_to_export:
+            local_path = os.path.join(output_dir, f"{prefix}_{img_date}_{band}.tif")
+            if _is_valid_tif(local_path):
+                continue
+            jobs.append((i, img, band, local_path))
+
+    total = len(jobs)
+    already = count * len(bands_to_export) - total
+    if already:
+        print(f"{already} file(s) already on disk, skipping.", flush=True)
+    if not jobs:
+        print("All files accounted for — nothing to download.", flush=True)
+        return
+
+    print(f"Downloading {total} file(s) directly from GEE "
+          f"({max_workers} in parallel, crs={crs or 'default'})...", flush=True)
+    lock = threading.Lock()
+    done_count = [0]
+    failed = []
+
+    def _fetch(job):
+        index, img, band, local_path = job
+        select_bands = band_groups.get(band, [band])
+        band_image = img.select(select_bands).clip(aoi_ee)
+        if band not in band_groups:
+            band_image = band_image.toFloat()
+        params = {"region": region, "scale": scale, "format": "GEO_TIFF"}
+        if crs:
+            params["crs"] = crs
+        tmp_path = f"{local_path}.{index}.part"
+        last_err = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                url = band_image.getDownloadURL(params)
+                resp = requests.get(url, timeout=600)
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                with open(tmp_path, "wb") as f:
+                    f.write(resp.content)
+                if not _is_valid_tif(tmp_path):
+                    raise RuntimeError("downloaded file is not a valid GeoTIFF")
+                os.replace(tmp_path, local_path)
+                with lock:
+                    done_count[0] += 1
+                    print(f"Downloaded files: ({done_count[0]}/{total}) "
+                          f"{os.path.basename(local_path)}", flush=True)
+                return
+            except Exception as e:
+                last_err = e
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError as cleanup_error:
+                        print(f"Warning: could not remove {tmp_path}: {cleanup_error}",
+                              flush=True)
+                if attempt < max_attempts:
+                    print(f"Direct download failed for {os.path.basename(local_path)} "
+                          f"(attempt {attempt}/{max_attempts}): {e}. "
+                          f"Retrying in {base_wait * attempt}s.", flush=True)
+                    time.sleep(base_wait * attempt)
+        with lock:
+            failed.append(local_path)
+            print(f"Direct download failed for {os.path.basename(local_path)} "
+                  f"after {max_attempts} attempt(s): {last_err}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        list(pool.map(_fetch, jobs))
+
+    if not failed:
+        return
+    if not drive_fallback:
+        raise RuntimeError(f"{len(failed)} file(s) could not be downloaded directly.")
+    print(f"Falling back to Drive export for {len(failed)} file(s)...", flush=True)
+    export_images_via_drive(
+        s1_collection, aoi_ee, token_path,
+        bands_to_export=bands_to_export, output_dir=output_dir,
+        prefix=prefix, scale=scale, band_groups=band_groups,
+    )
+    still_missing = [path for path in failed if not _is_valid_tif(path)]
+    if still_missing:
+        names = ", ".join(os.path.basename(path) for path in still_missing)
+        raise RuntimeError(f"Drive fallback did not produce valid GeoTIFFs: {names}")
+
+
 # ============================================================
 # COG CONVERSION
 # ============================================================
@@ -771,8 +902,8 @@ def compute_snow_filtered_likelihood(output_dir):
     matching '<prefix>_<date>_lake_likelihood.tif' by filename.
 
     Writes '<prefix>_<date>_likelihood_snowfilter.tif' (snow-flagged pixels
-    set to NaN) next to the inputs. Frames missing either input are skipped
-    (already logged as a warning).
+    set to NaN) next to the inputs. Missing or unreadable inputs raise an error
+    unless the filtered output already exists and is valid.
 
     Parameters
     ----------
@@ -782,23 +913,29 @@ def compute_snow_filtered_likelihood(output_dir):
     -------
     int — number of snow-filtered rasters written (including ones already present)
     """
-    written = 0
-    for mask_path in sorted(glob.glob(os.path.join(output_dir, "*_snow_mask.tif"))):
-        likelihood_path = mask_path.replace("_snow_mask.tif", "_lake_likelihood.tif")
-        out_path = mask_path.replace("_snow_mask.tif", "_likelihood_snowfilter.tif")
+    likelihood_files = sorted(glob.glob(os.path.join(output_dir, "*_lake_likelihood.tif")))
+    if not likelihood_files:
+        raise ValueError(f"No lake likelihood rasters found in {output_dir}")
 
+    written = 0
+    for likelihood_path in likelihood_files:
+        mask_path = likelihood_path.replace("_lake_likelihood.tif", "_snow_mask.tif")
+        out_path = likelihood_path.replace("_lake_likelihood.tif", "_likelihood_snowfilter.tif")
         if _is_valid_tif(out_path):
             written += 1
             continue
         if not (_is_valid_tif(likelihood_path) and _is_valid_tif(mask_path)):
-            print(f"Skipping local snow-filter: missing input for {os.path.basename(mask_path)}", flush=True)
-            continue
+            raise RuntimeError(
+                f"Cannot snow-filter {os.path.basename(likelihood_path)}: "
+                f"likelihood or snow mask is missing or unreadable ({os.path.basename(mask_path)})"
+            )
 
         with rasterio.open(likelihood_path) as l_src:
-            l_data    = l_src.read(1).astype("float32")
+            l_data    = l_src.read(1, masked=True).astype("float32").filled(np.nan)
             l_profile = l_src.profile.copy()
 
         with rasterio.open(mask_path) as m_src:
+            source_mask = m_src.read(1, masked=True).filled(0)
             same_grid = (
                 m_src.transform == l_profile["transform"] and
                 m_src.width == l_profile["width"] and
@@ -806,18 +943,20 @@ def compute_snow_filtered_likelihood(output_dir):
                 m_src.crs == l_profile["crs"]
             )
             if same_grid:
-                mask_data = m_src.read(1)
+                mask_data = source_mask
             else:
                 mask_data = np.zeros((l_profile["height"], l_profile["width"]), dtype=m_src.dtypes[0])
                 reproject(
-                    source=rasterio.band(m_src, 1),
+                    source=source_mask,
                     destination=mask_data,
+                    src_transform=m_src.transform,
+                    src_crs=m_src.crs,
                     dst_transform=l_profile["transform"],
                     dst_crs=l_profile["crs"],
                     resampling=Resampling.nearest,
                 )
 
-        out_data = np.where(mask_data.astype(bool), np.nan, l_data)
+        out_data = np.where(mask_data > 0, np.nan, l_data)
         l_profile.update(dtype="float32", nodata=np.nan)
 
         with rasterio.open(out_path, "w", **l_profile) as dst:

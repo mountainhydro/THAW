@@ -9,7 +9,7 @@
   <img src="docs/logos/UZH.png" height="50" />
 </p>
 
-**THAW** is an automated pipeline and dashboard for monitoring surface water bodies over time using **Sentinel-1 Synthetic Aperture Radar (SAR)** and **Google Earth Engine (GEE)**. This version is designed to run locally via a portable Python environment, supporting both manual processing for specific dates and scheduled, recurring background tasks. Tracking of lakes back in time is also supported. Installation is straightforward, no coding-skills or only low-level GIS-skills needed.
+**THAW** is an automated pipeline and dashboard for monitoring surface water bodies over time using **Sentinel-1 Synthetic Aperture Radar (SAR)** and **Google Earth Engine (GEE)**. This version is designed to run locally via a portable Python environment, supporting both manual processing for specific dates and scheduled, recurring background tasks. Tracking of lakes back in time is also supported. No coding-skills or only low-level GIS-skills needed.
 
 *Note: Choose this version if you want to use the tool locally with your own google earth engine account and google drive storage, and if you want the result-images to download automatically to your local computer*
 
@@ -20,14 +20,14 @@
 ## Features Overview
 - **Surface Water Detection** from Synthetic Aperture Radar (Sentinel1-SAR) data given a user-define area of interest (AOI). Determination of the anomaly of the latest backscatter data to historic backscatter phenology in each pixel, expressed as a composite z-score for the ascending and descending orbits. Unlike optical satellites, Sentinel-1 radar penetrates clouds and delivers observations also during nighttimes, making it ideal for monitoring flooded areas or seasonal lake changes in mountainous regions.
 
-- **Scope**: Can be used over any mountain area globally, for areas up to 10,000 km<sup>2</sup> (currently), for any date within the timeframe of Sentinel1-SAR (2014 - present). *Event-level tracking is a work-in-progress feature*. 
+- **Scope**: Can be used over any mountain area globally, for areas currently capped to 30,000 km<sup>2</sup>, for any date within the timeframe of Sentinel1-SAR (2014 - present).
 
-- **Lake detection and tracking**: Water bodies appearing anomalous compared to the historical collection of images (10 years back), are automatically flagged and a summary is presented in the *Output and Tracking* window. A ruler can be used to measure lake sizes. In a secondary *tracking* step, the user can select a focus-area and track lakes back in time. The user can pan through the timetagged images and observe the lake evolution. A graph presenting lake area evolution over time is additionally presented.
+- **Lake detection and tracking**: Water bodies appearing anomalous compared to the historical collection of images, are automatically flagged and a summary is presented in the *Output and Tracking* window. A ruler can be used to measure lake sizes. In a secondary *tracking* step, the user can select a focus-area and track lakes back in time. The user can pan through the timetagged images and observe the lake evolution. A graph presenting lake area evolution over time is additionally presented.
 
 - **Scheduling** (Windows): Scheduled monitoring to run daily, weekly, or monthly and download automatically. The task is configured to trigger automatically as soon as your computer is powered on, in case it was turned off at the scheduled time.
 
 - **Output**: Visualize processed data with three specialized layers that can be turned on and off:
-  - Z-Score: Identifies anomalies relative to historical water extent.
+  - Z-Score: Identifies anomalies relative to historical water extent. The more negative the z-score, the higher the chance that the pixel has newly formed water.
 
     > $$z = \frac{x - \mu}{\sigma}$$
     >
@@ -37,11 +37,11 @@
 
   - Potential Water: Probabilistic water masks.
 
-  - Mean Difference: Highlighting gain or loss of water surface area.
-
 - **Snow Filtering**: Detected clusters are automatically checked against a Sentinel-2 optical snow mask to flag likely false positives caused by wet snow, see *Inspecting Results* below for details.
 
 - **Task Monitoring**: For manual analysis, processing progress is displayed on the dashboard. An overview of scheduled tasks is presented including "Last Run" timestamps and Windows success/error on the *Scheduler* page. A time-stamped log file is written to the output folder with the print-outs and errors from each run.
+
+- **Reports**: Export THAW results as a .html file for sharing them with colleagues.
 
  
 ## Getting Started
@@ -65,12 +65,13 @@
 
 
 ## Authentication
-A **step-by-step setup guide** for getting you credentials is available on the Dashboard login page!
+A **step-by-step setup guide** for getting your credentials is available on the Dashboard login page!
 
 In short, the following things are needed for running THAW:
 
-- Requires a GEE account and a registered GEE project
-- Authentication uses an OAuth 2.0 client secret (Desktop app type), downloaded from Google Cloud Console
+- A google account
+- A GEE account and a registered GEE project
+- A Windows computer *(cross-platform compatibility is work in progress)*
 
 
 ## Tool usage
@@ -80,9 +81,10 @@ In short, the following things are needed for running THAW:
 - Navigate to the **Scheduler** and costumize the task (scheduler or instantaneous run)
 
   **Instantaneous run**:
-  - Select a task name (e.g. "Purepu")
+  - Select a task name (e.g. "Khumbu")
   - Select run date
   - Select AOI (up to 30,000 km<sup>2</sup>)
+  - Follow the instructions in the sidebar
   - Click **Run job now**
     
   **Scheduled task**: Additionally,
@@ -96,22 +98,25 @@ In short, the following things are needed for running THAW:
 - Navigate to the **Output and Tracking** page to review a completed run. Three specialized layers can be turned on and off on the map:
   - Z-Score: Identifies anomalies relative to historical water extent.
 
-  - Potential Water: Probabilistic water masks.
+  - Z-Score (snow-filtered): A snow filter is applied based on Sentinel2 imagery in order to remove wet snow detections  - Potential Water: Probabilistic water masks.
 
-  - Mean Difference: Highlighting gain or loss of water surface area.
+  - Potential Water: Water probability from 0 to 1 
+  - All Clusters: Deliniates clusters of pixels that cross a z-score threshold of -2 and are likely to be new water bodies
+  - All Clusters (snow-filtered): Shows likely water bodies, but detections on snow covered areas are filtered awayof water surface area.
+
+- The map legend shows the color scale and range for each visible raster layer, updating as layers are switched on or off. Values outside a displayed range use the end colors; negative Potential Water values are transparent. The exported tracking report also includes a Z-Score legend on its map.
 
 - A ruler tool can be used to measure lake sizes directly on the map.
 
-- **Snow Filtering**: A Sentinel-2 snow mask (based on NDSI and NIR thresholds) is used to flag detected clusters that coincide with snow or ice cover and are therefore likely false positives rather than surface water bodies. Each cluster in the summary table is labeled with a "Snow" flag (Yes/No), and snow-flagged clusters are hidden by default (a checkbox lets you show them again). A dedicated snow-filtered Z-Score layer is also available on the map.
+- Note on **Snow Filtering**: A Sentinel-2 snow mask based on NDSI and NIR thresholds is used to flag detected clusters that coincide with snow or ice cover and are therefore likely false positives rather than surface water bodies. Each cluster in the summary table is labeled with a "Snow" flag (Yes/No). In some instances, thin cloud or haze can be mistaken for snow. Therefore both, filtered and non-filtered outputs are preserved. *(improving cloud/snow discrimination is work in progress)*
 
 ### Time tracking of lakes
 
 How to:
-- In a secondary *tracking* step, select a focus-area by drawing up another AOI box to track lakes back in time. AOI size limit is set to 100 km<sup>2</sup>.
+- In a secondary *tracking* step, select a focus-area by drawing up another AOI box to track lakes back in time. AOI size limit is set to 400 km<sup>2</sup>.
 - Select *Days*, *Months* or *Years* to define the tracking interval. If you select *Years*, you can further narrow down to the seasonal window (or months of each year), for which the annual snapshots will be made. Maximum lengths of tracking are 180 days, 36 months, or 12 years, respectively.
-- You can do this multiple times and at different intervals. The results will be appended on the same page as *Tracking Results 1*, *Tracking Results 2*, etc.
-
-Inspecting the tracking results:
+- Optionally enable **snow filter** (off by default). Snow-flagged pixels are excluded from the tracking likelihood, area chart, animation, and HTML report; unfiltered likelihood rasters are retained. The filter adds a Sentinel-2 mask download per frame and processing time. Missing clear Sentinel-2 coverage is treated as not snow.
+- You can track different focus AOIs at different intervals. The results will be appended on the same page as *Tracking Results 1*, *Tracking Results 2*, etc.
 - Pan through the time-tagged historical images to observe the lake's evolution using the slider.
 - A graph presenting lake area evolution over time is additionally presented.
 - You can export an html summary of the time tracking results.
@@ -136,6 +141,8 @@ OS: Windows 10/11 or higher (Required for schtasks and PowerShell scheduling log
 
 GEE: An active Google Earth Engine project.
 
+
+A google account
 Permissions: "Run as Administrator" may be required to register new scheduled tasks in Windows.
 
 ## Troubleshooting

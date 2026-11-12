@@ -13,6 +13,7 @@ import subprocess
 import sys
 import pandas as pd
 from datetime import datetime, timedelta
+from functools import lru_cache
 from io import BytesIO
 import rasterio
 from rasterio.warp import transform_bounds
@@ -29,6 +30,132 @@ import time as _time
 
 from logo_header import render_logo_header
 from tile_server import start_tile_server, single_band_tile_url, rgb_tile_url
+
+VIS_BY_LAYER = {
+    "z_score": {
+        "min": -2, "max": 2, "palette": "RdYlGn",
+        "legend_title": "Z-Score",
+    },
+    "zscore_snowfilter": {
+        "min": -2, "max": 2, "palette": "RdYlGn",
+        "legend_title": "Z-Score (Snow-filtered)",
+    },
+    "potential_water": {
+        "min": 0, "max": 1, "palette": "Blues",
+        "legend_title": "Potential Water",
+    },
+    "mean_diff": {
+        "min": -5, "max": 5, "palette": "RdBu",
+        "legend_title": "Mean Difference", "unit": " dB",
+    },
+}
+
+
+def get_vis_params(filename):
+    for key, vis in VIS_BY_LAYER.items():
+        if key in filename:
+            return vis
+    return {"min": -30, "max": 0, "palette": "gray"}
+
+
+@lru_cache(maxsize=32)
+def _gradient_data_url(palette):
+    cmap = plt.get_cmap(palette)
+    colors = bytes(
+        int(channel * 255)
+        for i in range(256)
+        for channel in cmap(i / 255)[:3]
+    )
+    image = Image.frombytes("RGB", (256, 1), colors)
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+class RasterLegend(MacroElement):
+    _template = Template("""
+        {% macro script(this, kwargs) %}
+        (function() {
+            var map = {{ this._parent.get_name() }};
+            var layers = [
+                {% for entry in this.layers %}
+                {
+                    layer: {{ entry.layer.get_name() }},
+                    title: {{ entry.title | tojson }},
+                    gradient: {{ entry.gradient | tojson }},
+                    labels: {{ entry.labels | tojson }}
+                },
+                {% endfor %}
+            ];
+            var control = L.control({position: "bottomleft"});
+            control.onAdd = function() {
+                var container = L.DomUtil.create("div", "thaw-raster-legend");
+                container.setAttribute("role", "group");
+                container.setAttribute("aria-label", "Map legend");
+                container.style.cssText =
+                    "background:rgba(255,255,255,0.94);border:1px solid #bbb;" +
+                    "border-radius:8px;padding:10px 12px;color:#222;" +
+                    "font:12px Arial,sans-serif;max-height:45vh;overflow-y:auto;" +
+                    "box-shadow:0 1px 5px rgba(0,0,0,0.3);";
+                var heading = L.DomUtil.create("div", "", container);
+                heading.textContent = "Legend";
+                heading.style.cssText =
+                    "font-weight:bold;font-size:13px;border-bottom:1px solid #ccc;" +
+                    "padding-bottom:4px;margin-bottom:8px;";
+                layers.forEach(function(entry) {
+                    var block = L.DomUtil.create("div", "", container);
+                    block.style.marginBottom = "8px";
+                    var title = L.DomUtil.create("div", "", block);
+                    title.textContent = entry.title;
+                    title.style.cssText =
+                        "font-weight:bold;margin-bottom:3px;max-width:160px;overflow-wrap:anywhere;";
+                    var gradient = L.DomUtil.create("img", "", block);
+                    gradient.src = entry.gradient;
+                    gradient.alt = "";
+                    gradient.style.cssText =
+                        "display:block;width:160px;height:12px;border:1px solid #aaa;border-radius:2px;";
+                    var labels = L.DomUtil.create("div", "", block);
+                    labels.style.cssText =
+                        "display:flex;justify-content:space-between;width:162px;font-size:10px;";
+                    entry.labels.forEach(function(value) {
+                        var label = L.DomUtil.create("span", "", labels);
+                        label.textContent = value;
+                    });
+                    entry.block = block;
+                });
+                L.DomEvent.disableClickPropagation(container);
+                L.DomEvent.disableScrollPropagation(container);
+                return container;
+            };
+            control.addTo(map);
+            function updateLegend() {
+                var anyVisible = false;
+                layers.forEach(function(entry) {
+                    var visible = map.hasLayer(entry.layer);
+                    entry.block.style.display = visible ? "" : "none";
+                    anyVisible = anyVisible || visible;
+                });
+                control.getContainer().style.display = anyVisible ? "" : "none";
+            }
+            map.on("layeradd layerremove", updateLegend);
+            updateLegend();
+        })();
+        {% endmacro %}
+    """)
+
+    def __init__(self, layers):
+        super().__init__()
+        self._name = "RasterLegend"
+        self.layers = []
+        for layer, vis, fallback_title in layers:
+            lower, upper = vis["min"], vis["max"]
+            unit = vis.get("unit", "")
+            self.layers.append({
+                "layer": layer,
+                "title": vis.get("legend_title", fallback_title),
+                "gradient": _gradient_data_url(vis["palette"]),
+                "labels": [f"{value:g}{unit}" for value in (lower, (lower + upper) / 2, upper)],
+            })
 
 # --- 1. Function Definitions ---
 
@@ -50,12 +177,6 @@ def load_gee_creds():
             if len(lines) >= 2:
                 return lines[0], lines[1]
     return None, None
-
-def get_vis_params(filename):
-    for key, vis in VIS_BY_LAYER.items():
-        if key in filename:
-            return vis
-    return {'min': -30, 'max': 0, 'palette': 'gray'}
 
 def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=None):
     """
@@ -258,7 +379,7 @@ def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=Non
                     "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                     name="Satellite", attr="Esri"
                 ).add_to(fm)
-                folium.raster_layers.ImageOverlay(
+                z_layer = folium.raster_layers.ImageOverlay(
                     image=f"data:image/png;base64,{z_b64}",
                     bounds=[[south, west], [north, east]],
                     name="Z-Score", opacity=0.7, interactive=False
@@ -278,6 +399,7 @@ def generate_tracking_report(tracking_dir, task_date, task_name, folder_path=Non
                     except Exception:
                         pass
                 folium.LayerControl(collapsed=False).add_to(fm)
+                RasterLegend([(z_layer, VIS, "Z-Score")]).add_to(fm)
                 map_html = fm.get_root().render()
                 map_html_esc = map_html.replace("&", "&amp;").replace('"', "&quot;")
                 map_iframe = (
@@ -369,58 +491,9 @@ window.addEventListener("load", function() {{ drawChartIndicator(0); }});
     filename  = f"THAW_tracking_{task_date}_{safe_name}.html"
     return html.encode("utf-8"), filename
 
-def make_combined_legend(layers_present, vis_by_layer):
-    """Single semi-transparent box with one gradient bar per visible layer."""
-    LAYER_META = {
-        "z_score":         dict(title="Z-Score",        unit=""),
-        "zscore_snowfilter": dict(title="Z-Score (Snow-filtered)", unit=""),
-        "potential_water": dict(title="Potential Water", unit=""),
-        "mean_diff":       dict(title="Mean Diff",       unit=" dB"),
-    }
-    steps = 5
-    blocks = ""
-    for key, meta in LAYER_META.items():
-        if key not in layers_present:
-            continue
-        vis  = vis_by_layer[key]
-        cmap = plt.get_cmap(vis["palette"])
-        stops = ", ".join(
-            "#{:02x}{:02x}{:02x}".format(
-                int(cmap(k/steps)[0]*255),
-                int(cmap(k/steps)[1]*255),
-                int(cmap(k/steps)[2]*255),
-            )
-            for k in range(steps + 1)
-        )
-        blocks += (
-            '<div style="margin-bottom:10px;">'
-            f'<div style="font-size:12px;font-weight:bold;margin-bottom:3px;color:#222;">{meta["title"]}</div>'
-            f'<div style="height:12px;width:160px;background:linear-gradient(to right,{stops});'
-            'border:1px solid #aaa;border-radius:2px;"></div>'
-            '<div style="display:flex;justify-content:space-between;width:160px;">'
-            f'<span style="font-size:10px;color:#222;">{vis["min"]}{meta["unit"]}</span>'
-            f'<span style="font-size:10px;color:#222;">{(vis["min"]+vis["max"])/2:.1f}{meta["unit"]}</span>'
-            f'<span style="font-size:10px;color:#222;">{vis["max"]}{meta["unit"]}</span>'
-            '</div></div>'
-        )
-    if not blocks:
-        return None
-    html = (
-        '<div style="position:fixed;bottom:40px;left:50px;z-index:9999;'
-        'background:rgba(255,255,255,0.92);border:1px solid #bbb;'
-        'border-radius:8px;padding:10px 14px;font-family:Arial,sans-serif;'
-        'pointer-events:none;min-width:190px;color:#222;">'
-        '<div style="font-size:13px;font-weight:bold;margin-bottom:8px;'
-        'border-bottom:1px solid #ccc;padding-bottom:4px;color:#222;">Legend</div>'
-        + blocks +
-        '</div>'
-    )
-    return folium.Element(html)
-
-
 def write_timetrack_config(folder_path, aoi, start_date, end_date, selected_ids, proj_id,
                            drive_token_path, interval_unit="days", interval_value=None,
-                           season_window=None):
+                           season_window=None, enable_snow_filter=False):
     """
     Saves config using relative paths and GEE auth info to ensure transferability.
     """
@@ -446,6 +519,7 @@ def write_timetrack_config(folder_path, aoi, start_date, end_date, selected_ids,
         "interval_unit": interval_unit,
         "interval_value": interval_value,
         "season_window": season_window,
+        "enable_snow_filter": enable_snow_filter,
         "processed_at": datetime.now().isoformat()
     }
     
@@ -523,7 +597,7 @@ MAX_FRAMES_HARD_CAP = 60
 # Hard cap on tracking AOI size — smaller than the Scheduler's MAX_AOI_AREA_KM2
 # (10,000 km2 in 01_Scheduler.py) since tracking repeats per-frame Sentinel-2/
 # glacier-thinning work up to MAX_FRAMES_HARD_CAP times per run.
-MAX_AOI_AREA_KM2 = 100
+MAX_AOI_AREA_KM2 = 400
 
 def _bbox_area_km2(bbox):
     """Approximate area (km2) of a [min_lon, min_lat, max_lon, max_lat] bbox."""
@@ -565,13 +639,6 @@ st.markdown(
 )
 
 # --- 4. Visualization & Data Discovery ---
-VIS_BY_LAYER = {
-    "z_score": {"min": -2, "max": 2, "palette": "RdYlGn"},
-    "zscore_snowfilter": {"min": -2, "max": 2, "palette": "RdYlGn"},
-    "potential_water": {"min": 0, "max": 1, "palette": "Blues"},
-    "mean_diff": {"min": -5, "max": 5, "palette": "RdBu"},
-}
-
 output_folders = glob.glob(os.path.join(OUTPUT_DIR, "Outputs_*"))
 _DATE_RE = _re.compile(r"(\d{4}-\d{2}-\d{2})")
 dated_folders = []
@@ -768,12 +835,15 @@ _PersistLayerVisibility().add_to(m)
 # (Dashboard/tile_server.py), so only tiles visible in the viewport are ever
 # rendered/transferred instead of embedding one full-resolution PNG.
 _z_score_layer = None
+_z_score_legend = None
+_raster_legend_layers = []
 if tif_files:
     # Z Score is deferred and added at the very bottom of the layer list,
     # unchecked by default (Potential Water / snow-filtered results are the
     # primary view now).
     for tif in tif_files:
         basename = os.path.basename(tif)
+        vis = None
         if "true_color" in basename:
             layer_label = "True Color (cloud masked)"
             tile_url = rgb_tile_url(TILE_PORT, tif)
@@ -787,24 +857,20 @@ if tif_files:
                 mask_below_zero='potential_water' in basename,
             )
             opacity = 0.7
-        if layer_label == "Z Score":
-            _z_score_layer = folium.TileLayer(
-                tiles=tile_url, name=layer_label, attr="THAW", overlay=True,
-                control=True, opacity=opacity, show=False,
-            )
-            continue
-        folium.TileLayer(
+        raster_layer = folium.TileLayer(
             tiles=tile_url, name=layer_label, attr="THAW", overlay=True,
-            control=True, opacity=opacity,
-        ).add_to(m)
+            control=True, opacity=opacity, show=layer_label != "Z Score",
+        )
+        legend_layer = (raster_layer, vis, layer_label) if vis is not None else None
+        if layer_label == "Z Score":
+            _z_score_layer = raster_layer
+            _z_score_legend = legend_layer
+            continue
+        raster_layer.add_to(m)
+        if legend_layer is not None:
+            _raster_legend_layers.append(legend_layer)
     if fit_bounds:
         m.fit_bounds(fit_bounds)
-
-# Combined colour legend
-layers_present = [k for k in VIS_BY_LAYER if any(k in os.path.basename(t) for t in tif_files)]
-leg = make_combined_legend(layers_present, VIS_BY_LAYER)
-if leg:
-    m.get_root().html.add_child(leg)
 
 # One dashed bounding box per tracking run, individually named in the LayerControl
 for _bb_label, _bb_dir in _all_runs:
@@ -907,6 +973,8 @@ _add_cluster_layer(m, _snowfilter_geojson_files, "All Clusters (Snow-filtered)",
 # always-visible overlay (see _add_cluster_layer), independent of this.
 if _z_score_layer is not None:
     _z_score_layer.add_to(m)
+    if _z_score_legend is not None:
+        _raster_legend_layers.append(_z_score_legend)
 _add_cluster_layer(m, _standard_geojson_files, "All Clusters", "red", _selected_cluster_id, show=False)
 
 Fullscreen(
@@ -916,6 +984,8 @@ Fullscreen(
     force_separate_button=True,
 ).add_to(m)
 folium.LayerControl(collapsed=False).add_to(m)
+if _raster_legend_layers:
+    RasterLegend(_raster_legend_layers).add_to(m)
 # Cluster selection is table -> map only (see _add_cluster_layer), so no
 # click-related returned_objects are needed here; the map's view and each
 # layer's checked/unchecked state stay exactly as the user left them.
@@ -1104,6 +1174,15 @@ interval_value = st.sidebar.slider(
     f"Look-back period ({interval_unit_label.lower()})",
     _lo, _hi, _default,
 )
+enable_snow_filter = st.sidebar.toggle(
+    "Enable snow filter",
+    value=False,
+    help=(
+        "Exclude snow-covered pixels from tracking results using Sentinel-2. "
+        "Thin cloud or haze may be mistaken for snow. Pixels without clear "
+        "Sentinel-2 coverage are left unfiltered."
+    ),
+)
 
 season_window = None
 if interval_unit_label == "Years":
@@ -1136,10 +1215,11 @@ if over_frame_cap:
         f"{MAX_FRAMES_HARD_CAP}. Reduce the look-back period to proceed."
     )
 else:
-    # 3 bands (true_color, VV_corrected, lake_likelihood) exported per frame
+    downloads_per_frame = 4 if enable_snow_filter else 3
     st.sidebar.caption(
         f"Estimated frames to export: ~{estimated_frames} "
-        f"(~{estimated_frames * 3} download tasks at 3 bands/frame)"
+        f"(~{estimated_frames * downloads_per_frame} downloads at "
+        f"{downloads_per_frame} bands/frame)"
     )
 
 if drawn_aoi:
@@ -1162,7 +1242,8 @@ if st.sidebar.button("Run Tracking Analysis",
                                        project_id, DRIVE_TOKEN_FILE,
                                        interval_unit=interval_unit_label.lower(),
                                        interval_value=interval_value,
-                                       season_window=season_window)
+                                       season_window=season_window,
+                                       enable_snow_filter=enable_snow_filter)
         script_rel_path = os.path.join("GEE", "tracking_headless.py")
         subprocess.Popen(
             [sys.executable, "-u", script_rel_path, cfg_p],
@@ -1254,24 +1335,27 @@ for _run_label, _run_dir in _all_runs:
         if os.path.isdir(_run_dir):
             st.write("---")
             if st.button("Export Tracking Report (.html)", key=f"export_{_key}"):
-                with st.spinner("Generating report..."):
-                    _task_name = f"{_location}_{_run_label.replace(' ', '_')}" if _run_label else _location
-                    _html_bytes, _filename = generate_tracking_report(
-                        _run_dir,
-                        task_date=selected_folder_date,
-                        task_name=_task_name,
-                        folder_path=folder_path,
-                    )
-                if _html_bytes:
-                    st.download_button(
-                        label="Download Report",
-                        data=_html_bytes,
-                        file_name=_filename,
-                        mime="text/html",
-                        key=f"dl_{_key}",
-                    )
-                else:
-                    st.warning("No tracking results found to export.")
+                try:
+                    with st.spinner("Generating report..."):
+                        _task_name = f"{_location}_{_run_label.replace(' ', '_')}" if _run_label else _location
+                        _html_bytes, _filename = generate_tracking_report(
+                            _run_dir,
+                            task_date=selected_folder_date,
+                            task_name=_task_name,
+                            folder_path=folder_path,
+                        )
+                    if _html_bytes:
+                        st.download_button(
+                            label="Download Report",
+                            data=_html_bytes,
+                            file_name=_filename,
+                            mime="text/html",
+                            key=f"dl_{_key}",
+                        )
+                    else:
+                        st.warning("No tracking results found to export.")
+                except (OSError, ValueError) as e:
+                    st.error(f"Could not generate tracking report: {e}")
 
 if st.session_state.get("tracking_just_launched"):
     _time.sleep(3)

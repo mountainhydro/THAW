@@ -7,6 +7,7 @@ THAW - Tracking Results Viewer
 import os
 import re
 import glob
+import json
 import numpy as np
 import rasterio
 import matplotlib.pyplot as plt
@@ -87,6 +88,19 @@ def _panel_cfg_for_dir(tracking_dir):
         return LEGACY_PANEL_CFG
     return PANEL_CFG
 
+def _snow_filter_enabled(tracking_dir):
+    config_path = os.path.join(tracking_dir, "launch_config.json")
+    if not os.path.isfile(config_path):
+        return False
+    with open(config_path, encoding="utf-8") as f:
+        config = json.load(f)
+    if not isinstance(config, dict):
+        raise ValueError(f"Invalid tracking configuration in {config_path}")
+    enabled = config.get("enable_snow_filter", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"Invalid snow filter setting in {config_path}")
+    return enabled
+
 def _discover_frames(tracking_dir):
     """
     Returns (frames, panel_cfg):
@@ -95,10 +109,34 @@ def _discover_frames(tracking_dir):
         panel_cfg  — the PANEL_CFG/LEGACY_PANEL_CFG matching this folder's files
     Only includes timesteps where ALL bands in panel_cfg are present.
     """
+    snow_filtered = _snow_filter_enabled(tracking_dir)
+    if snow_filtered:
+        raw_files = glob.glob(os.path.join(tracking_dir, "*_lake_likelihood.tif"))
+        missing = [
+            os.path.basename(path)
+            for path in raw_files
+            if not os.path.isfile(
+                path[:-len("_lake_likelihood.tif")] + "_likelihood_snowfilter.tif"
+            )
+        ]
+        if missing:
+            raise FileNotFoundError(
+                "Snow-filtered likelihood is missing for: " + ", ".join(sorted(missing))
+            )
     panel_cfg = _panel_cfg_for_dir(tracking_dir)
+    if snow_filtered:
+        panel_cfg = {
+            band: {**cfg, "label": "Lake Likelihood (Snow-filtered)"}
+            if band == "lake_likelihood" else cfg
+            for band, cfg in panel_cfg.items()
+        }
     frames = {}
     for band in panel_cfg:
-        for path in sorted(glob.glob(os.path.join(tracking_dir, f"*{band}*.tif"))):
+        pattern = (
+            "*_likelihood_snowfilter.tif"
+            if snow_filtered and band == "lake_likelihood" else f"*{band}*.tif"
+        )
+        for path in sorted(glob.glob(os.path.join(tracking_dir, pattern))):
             date = _extract_date(os.path.basename(path))
             frames.setdefault(date, {})[band] = path
 
@@ -167,7 +205,11 @@ def render_tracking_viewer(tracking_dir, title="Tracking Results Viewer"):
         and time period in brackets.
     """
     st.write("---")
-    frames, panel_cfg = _discover_frames(tracking_dir) if os.path.isdir(tracking_dir) else ([], None)
+    try:
+        frames, panel_cfg = _discover_frames(tracking_dir) if os.path.isdir(tracking_dir) else ([], None)
+    except (OSError, ValueError) as e:
+        st.error(f"Could not load tracking results: {e}")
+        return
     suffix = _summary_suffix(tracking_dir, frames)
     if suffix:
         st.markdown(

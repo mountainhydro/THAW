@@ -293,10 +293,10 @@ if draw_data and draw_data.get("all_drawings"):
         aoi_geojson = None
     else:
         coords = aoi_geojson.get("coordinates", [[]])[0]
-        flat_coords = [f"{lon:.5f}, {lat:.5f}" for lon, lat in coords[:3]]
+        flat_coords = [f"{lon:.5f}, {lat:.5f}" for lon, lat in coords]
         st.sidebar.info(
             f"AOI selected ({aoi_area:,.0f} km2): "
-            + " | ".join(flat_coords) + "..."
+            + " | ".join(flat_coords)
         )
 
 # Shared Task Name 

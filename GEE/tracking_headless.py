@@ -38,6 +38,7 @@ from gee_core import (
 )
 from thinning import (
     load_aoi,
+    utm_crs_for_aoi,
     load_glacier_mask,
     load_dem,
     load_thinning_rate_image,
@@ -46,8 +47,8 @@ from thinning import (
     get_glacier_thinning_correction,
 )
 from reporting import generate_lake_metrics_report
-from drive_io import Logger, export_images_via_drive, compute_snow_filtered_likelihood, CancelledError
-from gee_auth import initialize_ee, build_drive_service
+from drive_io import Logger, download_images_direct, compute_snow_filtered_likelihood, CancelledError
+from gee_auth import initialize_ee
 
 
 # ============================================================
@@ -59,10 +60,6 @@ CHECKPOINT_FILE = "tracking_checkpoint.json"
 # Server-side safety net against runaway export/download counts — keep in sync
 # with MAX_FRAMES_HARD_CAP in Dashboard/pages/02_Output_and_Tracking.py.
 MAX_FRAMES_HARD_CAP = 60
-
-# Sentinel-2 snow mask + local snow-filtered likelihood. Disabled: thin cloud/haze
-# over lakes is misclassified as snow and erases lake pixels.
-ENABLE_SNOW_FILTER = False
 
 def retry(fn, label, max_attempts=5, base_wait=30):
     import time as _time
@@ -118,6 +115,9 @@ def run_tracking_pipeline(config_path):
     project_id  = cfg.get("project_id")
     rel_out_dir = cfg.get("rel_output_dir")
     task_name   = cfg.get("task_name", "tracking")
+    enable_snow_filter = cfg.get("enable_snow_filter", False)
+    if not isinstance(enable_snow_filter, bool):
+        raise ValueError("enable_snow_filter must be a boolean")
 
     # Multi-scale tracking: "days" (default) exports every raw scene, unchanged;
     # "months"/"years" composite scenes per period to bound the export count.
@@ -158,10 +158,16 @@ def run_tracking_pipeline(config_path):
     pid_file = final_out_dir / "pipeline.pid"
     pid_file.write_text(str(os.getpid()))
 
+    snapshot = dict(cfg)
+    snapshot["enable_snow_filter"] = enable_snow_filter
+    with open(final_out_dir / "launch_config.json", "w", encoding="utf-8") as f:
+        json.dump(snapshot, f, indent=2)
+
     print("--- THAW Tracking Analysis Started ---", flush=True)
     print(f"Time Range:   {start_date} to {end_date}", flush=True)
     print(f"AOI BBox:     {aoi_input}", flush=True)
     print(f"Output dir:   {final_out_dir_str}", flush=True)
+    print(f"Snow filter:  {'enabled' if enable_snow_filter else 'disabled'}", flush=True)
     print("---------------------------------------", flush=True)
 
     # ── Resume detection ────────────────────────────────────────────────────
@@ -169,7 +175,7 @@ def run_tracking_pipeline(config_path):
     if ckpt and "download" in ckpt.get("steps_complete", []):
         print(f"Resuming incomplete tracking pipeline from checkpoint.", flush=True)
         done = ckpt.get("steps_complete", [])
-        if "snowfilter" not in done and ENABLE_SNOW_FILTER:
+        if "snowfilter" not in done and enable_snow_filter:
             print("Step 2/3: Computing local snow-filtered likelihood...", flush=True)
             retry(
                 lambda: compute_snow_filtered_likelihood(final_out_dir_str),
@@ -180,7 +186,9 @@ def run_tracking_pipeline(config_path):
         if "reporting" not in done:
             print("Step 3/3: Generating lake metrics report...", flush=True)
             retry(
-                lambda: generate_lake_metrics_report(output_dir=final_out_dir_str),
+                lambda: generate_lake_metrics_report(
+                    output_dir=final_out_dir_str, snow_filtered=enable_snow_filter
+                ),
                 label="Reporting", max_attempts=3, base_wait=10,
             )
             done.append("reporting")
@@ -194,7 +202,6 @@ def run_tracking_pipeline(config_path):
     # ────────────────────────────────────────────────────────────────────────
 
     initialize_ee(cfg.get("drive_token_path"), project_id)
-    drive_service = build_drive_service(cfg.get("drive_token_path"))
     print(f"GEE initialised (project: {project_id})", flush=True)
 
 
@@ -325,9 +332,12 @@ def run_tracking_pipeline(config_path):
             )
         img = img.addBands(true_color).set('system:time_start', img_time)
 
-        if ENABLE_SNOW_FILTER:
+        if enable_snow_filter:
             snow_mosaic = get_sentinel2_mosaic(aoi, frame_date)
             if snow_mosaic.bandNames().size().getInfo() == 0:
+                print(f"Warning: no Sentinel-2 imagery for snow filtering on "
+                      f"{frame_date.date()}; treating missing coverage as not snow.",
+                      flush=True)
                 snow_mask = ee.Image.constant(0).rename('snow_mask')
             else:
                 snow_mask = get_snow_mask(aoi, frame_date, mosaic=snow_mosaic)
@@ -336,7 +346,7 @@ def run_tracking_pipeline(config_path):
     export_collection = ee.ImageCollection(augmented_images)
 
     bands = ["true_color", "VV_corrected", "lake_likelihood"]
-    if ENABLE_SNOW_FILTER:
+    if enable_snow_filter:
         bands.append("snow_mask")
     band_groups = {"true_color": ["true_color_R", "true_color_G", "true_color_B"]}
 
@@ -351,14 +361,15 @@ def run_tracking_pipeline(config_path):
     done = ckpt.get("steps_complete", [])
 
     if "download" not in done:
-        print("Step 1/3: Launching GEE Drive export tasks...", flush=True)
+        print("Step 1/3: Downloading frames directly from GEE...", flush=True)
         submission_date = datetime.datetime.now().strftime("%Y%m%d")
         _center_lon = (aoi_input[0] + aoi_input[2]) / 2
         _center_lat = (aoi_input[1] + aoi_input[3]) / 2
         coord_tag = f"{int(round(_center_lat * 1000))}_{int(round(_center_lon * 1000))}"
         prefix = f"{task_name}_{submission_date}_{coord_tag}"
+        out_crs = utm_crs_for_aoi(aoi)
         retry(
-            lambda: export_images_via_drive(
+            lambda: download_images_direct(
                 export_collection,
                 aoi,
                 token_path=cfg.get("drive_token_path"),
@@ -366,6 +377,7 @@ def run_tracking_pipeline(config_path):
                 band_groups=band_groups,
                 output_dir=final_out_dir_str,
                 prefix=prefix,
+                crs=out_crs,
             ),
             label="Download",
         )
@@ -378,7 +390,7 @@ def run_tracking_pipeline(config_path):
 # ============================================================
 # LOCAL SNOW-FILTER COMBINATION
 # ============================================================
-    if ENABLE_SNOW_FILTER and "snowfilter" not in done:
+    if enable_snow_filter and "snowfilter" not in done:
         print("Step 2/3: Computing local snow-filtered likelihood...", flush=True)
         retry(
             lambda: compute_snow_filtered_likelihood(final_out_dir_str),
@@ -388,7 +400,7 @@ def run_tracking_pipeline(config_path):
         )
         done.append("snowfilter")
         write_checkpoint(final_out_dir_str, steps_complete=done)
-    elif ENABLE_SNOW_FILTER:
+    elif enable_snow_filter:
         print("Step 2/3: Local snow-filter already complete, skipping.", flush=True)
 
 
@@ -398,7 +410,9 @@ def run_tracking_pipeline(config_path):
     if "reporting" not in done:
         print("Step 3/3: Generating lake metrics report...", flush=True)
         retry(
-            lambda: generate_lake_metrics_report(output_dir=final_out_dir_str),
+            lambda: generate_lake_metrics_report(
+                output_dir=final_out_dir_str, snow_filtered=enable_snow_filter
+            ),
             label="Reporting",
             max_attempts=3,
             base_wait=10,

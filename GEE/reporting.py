@@ -153,7 +153,7 @@ def cluster_processing(tif_path, timestamp, z_thres=-2, min_size_cluster=20, pix
 # ============================================================
 
 def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
-                                     min_size_cluster=20, pix=6):
+                                     min_size_cluster=20, pix=6, snow_filtered=False):
     """
     Compute lake area time series from locally downloaded lake_likelihood TIFs.
 
@@ -163,7 +163,7 @@ def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
       mean_area_km2  — likelihood-weighted area within clusters (sum × pixel area)
       upper_area_km2 — pixels within clusters where likelihood >= upper threshold
 
-    Uses the raw '<prefix>_<date>_lake_likelihood.tif' for each date.
+    Uses raw likelihood rasters by default, or snow-filtered rasters when enabled.
 
     Parameters
     ----------
@@ -171,6 +171,7 @@ def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
     thresholds       : tuple — (lower, mid, upper) likelihood thresholds
     min_size_cluster : int   — DBSCAN min_samples
     pix              : int   — DBSCAN eps (pixels)
+    snow_filtered    : bool  — use snow-filtered likelihood rasters
 
     Returns
     -------
@@ -186,12 +187,14 @@ def extract_cluster_area_timeseries(out_dir, thresholds=(0.1, 0.5, 0.9),
         match2 = re.search(r'(\d{4})(\d{2})(\d{2})T\d{6}', basename)
         return f"{match2.group(1)}-{match2.group(2)}-{match2.group(3)}" if match2 else basename
 
-    raw_files = glob.glob(os.path.join(out_dir, "*_lake_likelihood.tif"))
-    by_date = {_date_key(p): p for p in raw_files}
+    suffix = "_likelihood_snowfilter.tif" if snow_filtered else "_lake_likelihood.tif"
+    likelihood_files = glob.glob(os.path.join(out_dir, f"*{suffix}"))
+    by_date = {_date_key(p): p for p in likelihood_files}
     tif_files = [by_date[d] for d in sorted(by_date)]
 
     if not tif_files:
-        raise ValueError(f"No lake_likelihood TIF files found in {out_dir}")
+        label = "snow-filtered likelihood" if snow_filtered else "lake_likelihood"
+        raise ValueError(f"No {label} TIF files found in {out_dir}")
 
     dates = []
     areas_mean = []
@@ -331,6 +334,7 @@ def generate_lake_metrics_report(
     csv_filename=None,
     png_filename=None,
     thresholds=(0.1, 0.5, 0.9),
+    snow_filtered=False,
 ):
     """
     Compute cluster-based lake area metrics from downloaded likelihood TIFs,
@@ -338,11 +342,12 @@ def generate_lake_metrics_report(
 
     Parameters
     ----------
-    output_dir      : str   — directory containing downloaded *lake_likelihood*.tif files
+    output_dir      : str   — directory containing tracking likelihood rasters
     gif_output_path : str   — path for the GIF (default: output_dir/lake_monitoring.gif)
     csv_filename    : str   — output CSV path (default: output_dir/lake_metrics.csv)
     png_filename    : str   — output plot path (default: output_dir/lake_metrics_plot.png)
     thresholds      : tuple — (lower, mid, upper) likelihood thresholds
+    snow_filtered   : bool  — use snow-filtered likelihood for metrics and GIF
     """
     os.makedirs(output_dir, exist_ok=True)
     if csv_filename is None:
@@ -354,7 +359,9 @@ def generate_lake_metrics_report(
 
     # 1. Compute cluster-based area time series from local TIFs
     print("Computing cluster-based lake metrics...", flush=True)
-    metrics_df = extract_cluster_area_timeseries(output_dir, thresholds=thresholds)
+    metrics_df = extract_cluster_area_timeseries(
+        output_dir, thresholds=thresholds, snow_filtered=snow_filtered
+    )
 
 
     # 2. Save CSV and plot
@@ -370,6 +377,7 @@ def generate_lake_metrics_report(
         dates=metrics_df['date'].tolist(),
         areas_km2=metrics_df['mean_area_km2'].tolist(),
         gif_filename=gif_output_path,
+        snow_filtered=snow_filtered,
     )
 
 
@@ -421,7 +429,8 @@ def build_lake_monitoring_gif(out_dir, dates, areas_km2,
                                target_size=(1800, 600),
                                gif_filename=None,
                                duration=600,
-                               font_path=None):
+                               font_path=None,
+                               snow_filtered=False):
     """
     Build a lake monitoring GIF from exported TIF files.
     Panels: True Color | Corrected VV | Lake Likelihood, with date and area overlay.
@@ -432,7 +441,11 @@ def build_lake_monitoring_gif(out_dir, dates, areas_km2,
     # Build date → {band: path} so missing files for one date don't misalign other bands
     date_band_files = {}
     for band in bands:
-        for path in glob.glob(os.path.join(out_dir, f"*{band}*.tif")):
+        pattern = (
+            "*_likelihood_snowfilter.tif"
+            if snow_filtered and band == "lake_likelihood" else f"*{band}*.tif"
+        )
+        for path in glob.glob(os.path.join(out_dir, pattern)):
             m = re.search(r'(\d{4}-\d{2}-\d{2})', os.path.basename(path))
             if m:
                 date_band_files.setdefault(m.group(1), {})[band] = path
@@ -484,7 +497,9 @@ def build_lake_monitoring_gif(out_dir, dates, areas_km2,
         panel_w = combined.width // 3
 
         for j, band in enumerate(bands):
-            label = PANEL_LABELS.get(band, band)
+            label = ("Lake Likelihood (Snow-filtered)"
+                     if snow_filtered and band == "lake_likelihood"
+                     else PANEL_LABELS.get(band, band))
             bbox  = draw.textbbox((0, 0), label, font=font_small)
             lw    = bbox[2] - bbox[0]
             x     = j * panel_w + (panel_w - lw) // 2
