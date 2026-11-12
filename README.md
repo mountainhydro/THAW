@@ -137,13 +137,10 @@ THAW/
 ![THAW Flowchart](docs/THAW_flowchart.png)
 
 ## Requirements
-OS: Windows 10/11 or higher (Required for schtasks and PowerShell scheduling logic).
-
-GEE: An active Google Earth Engine project.
-
-
-A google account
-Permissions: "Run as Administrator" may be required to register new scheduled tasks in Windows.
+- OS: Windows 10/11 or higher
+- A google account
+- A google earth engine (GEE) account and active GEE project.
+- Permissions: "Run as Administrator" may be required to register new scheduled tasks in Windows.
 
 ## Troubleshooting
 
