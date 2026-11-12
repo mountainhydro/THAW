@@ -102,7 +102,7 @@ In short, the following things are needed for running THAW:
 
   - Potential Water: Water probability from 0 to 1 
   - All Clusters: Deliniates clusters of pixels that cross a z-score threshold of -2 and are likely to be new water bodies
-  - All Clusters (snow-filtered): Shows likely water bodies, but detections on snow covered areas are filtered awayof water surface area.
+  - All Clusters (snow-filtered): Shows likely water bodies, but detections on snow covered areas are filtered away.
 
 - The map legend shows the color scale and range for each visible raster layer, updating as layers are switched on or off. Values outside a displayed range use the end colors; negative Potential Water values are transparent. The exported tracking report also includes a Z-Score legend on its map.
 
@@ -114,7 +114,7 @@ In short, the following things are needed for running THAW:
 
 How to:
 - In a secondary *tracking* step, select a focus-area by drawing up another AOI box to track lakes back in time. AOI size limit is set to 400 km<sup>2</sup>.
-- Select *Days*, *Months* or *Years* to define the tracking interval. If you select *Years*, you can further narrow down to the seasonal window (or months of each year), for which the annual snapshots will be made. Maximum lengths of tracking are 180 days, 36 months, or 12 years, respectively.
+- Select *Days*, *Months* or *Years* to define the tracking interval. If you select *Years*, you can further narrow down to the seasonal window (or months of each year), for which the annual snapshots will be made. Maximum lengths of backward tracking are 180 days, 36 months, or 12 years, respectively.
 - Optionally enable **snow filter** (off by default). Snow-flagged pixels are excluded from the tracking likelihood, area chart, animation, and HTML report; unfiltered likelihood rasters are retained. The filter adds a Sentinel-2 mask download per frame and processing time. Missing clear Sentinel-2 coverage is treated as not snow.
 - You can track different focus AOIs at different intervals. The results will be appended on the same page as *Tracking Results 1*, *Tracking Results 2*, etc.
 - Pan through the time-tagged historical images to observe the lake's evolution using the slider.

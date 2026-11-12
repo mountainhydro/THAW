@@ -794,7 +794,7 @@ class _PersistLayerVisibility(MacroElement):
             // Bump the trailing version suffix whenever Python-side default
             // visibility changes, so stale stored toggles from before that
             // change don't silently keep overriding the new defaults.
-            var STORAGE_KEY = 'thaw_layer_visibility_v2';
+            var STORAGE_KEY = 'thaw_layer_visibility_v3';
             function getStored() {
                 try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch (e) { return {}; }
             }
@@ -813,7 +813,7 @@ class _PersistLayerVisibility(MacroElement):
                     var span = label.querySelector('span');
                     if (!input || !span || input.dataset.thawBound) return;
                     var layerName = span.textContent.trim();
-                    if (stored[layerName] === false && input.checked) {
+                    if (typeof stored[layerName] === 'boolean' && stored[layerName] !== input.checked) {
                         input.click();
                     }
                     input.dataset.thawBound = '1';
@@ -838,9 +838,7 @@ _z_score_layer = None
 _z_score_legend = None
 _raster_legend_layers = []
 if tif_files:
-    # Z Score is deferred and added at the very bottom of the layer list,
-    # unchecked by default (Potential Water / snow-filtered results are the
-    # primary view now).
+    # Z Score is deferred and added unchecked at the bottom of the layer list.
     for tif in tif_files:
         basename = os.path.basename(tif)
         vis = None
@@ -852,6 +850,8 @@ if tif_files:
             vis = get_vis_params(basename)
             # Use readable label from VIS_BY_LAYER instead of raw filename
             layer_label = next((k.replace("_", " ").title() for k in VIS_BY_LAYER if k in basename), basename)
+            if "zscore_snowfilter" in basename:
+                layer_label = vis["legend_title"]
             tile_url = single_band_tile_url(
                 TILE_PORT, tif, vis['min'], vis['max'], vis['palette'],
                 mask_below_zero='potential_water' in basename,
@@ -859,7 +859,8 @@ if tif_files:
             opacity = 0.7
         raster_layer = folium.TileLayer(
             tiles=tile_url, name=layer_label, attr="THAW", overlay=True,
-            control=True, opacity=opacity, show=layer_label != "Z Score",
+            control=True, opacity=opacity,
+            show=layer_label not in ("Z Score", "Potential Water"),
         )
         legend_layer = (raster_layer, vis, layer_label) if vis is not None else None
         if layer_label == "Z Score":

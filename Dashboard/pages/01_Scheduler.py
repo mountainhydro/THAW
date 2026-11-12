@@ -420,7 +420,8 @@ if schedule_clicked:
 
     if os.system(sch_cmd) == 0:
         powershell_fix = (
-            f'powershell -Command "$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable; '
+            f'powershell -Command "$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable '
+            f'-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; '
             f'Set-ScheduledTask -TaskName \\"{task_name}\\" -Settings $settings"'
         )
         
@@ -429,9 +430,32 @@ if schedule_clicked:
             _time.sleep(60)
             st.rerun()     
         else:
-            st.sidebar.warning("Task created, but 'Start When Available' setting failed. Check admin rights.")
+            st.sidebar.warning("Task created, but its start-when-available or battery setting failed. Check admin rights.")
     else:
         st.sidebar.error("Failed to schedule task.")
+
+
+def _pipeline_result_for_task(task_name, last_run_raw):
+    last_run_date = None
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%m/%d/%Y %I:%M:%S %p", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            last_run_date = datetime.strptime(last_run_raw.strip(), fmt).date()
+            break
+        except ValueError:
+            continue
+    if last_run_date is None:
+        return None
+
+    for folder, folder_date in dated_folders:
+        if folder_date.date() != last_run_date:
+            continue
+        if not os.path.basename(folder).endswith(f"_{task_name}"):
+            continue
+        log_files = sorted(glob.glob(os.path.join(folder, "pipeline_log_*.txt")))
+        if log_files:
+            return _get_log_status(log_files[-1])[0]
+    return None
+
 
 # 10. Pipeline Logs
 st.divider()
@@ -608,6 +632,12 @@ try:
             else:
                 last_run_display = last_run_raw
                 result_display   = "Success (0)" if result_code == '0' else f"Error ({result_code})"
+
+                task_parts = clean_name.split("_", 2)
+                if len(task_parts) == 3:
+                    pipeline_result = _pipeline_result_for_task(task_parts[2], last_run_raw)
+                    if pipeline_result:
+                        result_display += f" · Pipeline {pipeline_result.title()}"
 
             with st.expander(f"Task: {clean_name}"):
                 col1, col2 = st.columns(2)
