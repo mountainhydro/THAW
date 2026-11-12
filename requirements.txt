@@ -18,7 +18,7 @@ geojson
 # Visualization & Internal Streamlit Checks
 matplotlib
 pandas
-pyarrow
+pyarrow==23.0.1
 Pillow
 Jinja2
 
