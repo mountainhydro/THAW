@@ -56,7 +56,7 @@
 - **Clone the Repository** (git users) using:
    
    ```bash
-   git clone [https://github.com/mountainhydro/THAW.git](https://github.com/your-username/THAW.git)
+   git clone https://github.com/mountainhydro/THAW.git
    cd THAW
    ```
   
